@@ -1,0 +1,368 @@
+// hypervisor/x86_decode.flash — x86_64 instruction length + class decoder for BTM
+//
+// Imported by jit_translator.flash.  Uses division/modulo only (no bitwise &).
+
+enum InsnClass {
+    Unknown,
+    Nop,
+    Mov,
+    Add,
+    Sub,
+    Jmp,
+    Call,
+    Ret,
+    Load,
+    Store,
+    Sys,
+    Push,
+    Pop,
+    Xor,
+    Hlt,
+}
+
+struct DecodedInsn {
+    arch: GuestArch,
+    pc: u64,
+    len: i32,
+    klass: InsnClass,
+    opcode: u8,
+    modrm: u8,
+    imm: u32,
+    raw: *u8,
+    raw_len: i32,
+}
+
+fn x86_mod_field(modrm: u8) u8 {
+    return modrm / 64;
+}
+
+fn x86_reg_field(modrm: u8) u8 {
+    return (modrm / 8) % 8;
+}
+
+fn x86_rm_field(modrm: u8) u8 {
+    return modrm % 8;
+}
+
+fn x86_is_segment_prefix(b: u8) i32 {
+    if (b == 38 || b == 46 || b == 54 || b == 62 || b == 100 || b == 101) {
+        return 1;
+    }
+    return 0;
+}
+
+fn x86_is_rex_prefix(b: u8) i32 {
+    if (b >= 64) {
+        if (b <= 79) { return 1; }
+    }
+    return 0;
+}
+
+fn x86_is_legacy_prefix(b: u8) i32 {
+    if (b == 102 || b == 103) { return 1; }
+    if (b >= 240) {
+        if (b <= 243) { return 1; }
+    }
+    if (x86_is_segment_prefix(b) == 1) { return 1; }
+    if (x86_is_rex_prefix(b) == 1) { return 1; }
+    return 0;
+}
+
+fn x86_apply_prefix(b: u8, op_sz_16: *i32, addr_sz_32: *i32, rex_w: *i32) void {
+    if (b == 102) {
+        op_sz_16.* = 1;
+        return;
+    }
+    if (b == 103) {
+        addr_sz_32.* = 1;
+        return;
+    }
+    if (x86_is_rex_prefix(b) == 1) {
+        if ((b / 8) % 2 == 1) {
+            rex_w.* = 1;
+        }
+    }
+}
+
+fn x86_skip_prefixes(
+    bytes: []u8,
+    pos: *i32,
+    op_sz_16: *i32,
+    addr_sz_32: *i32,
+    rex_w: *i32,
+) i32 {
+    pos.* = 0;
+    op_sz_16.* = 0;
+    addr_sz_32.* = 0;
+    rex_w.* = 0;
+    let done: i32 = 0;
+    while (pos.* < bytes.len && done == 0) {
+        let b: u8 = bytes[pos.*];
+        if (x86_is_legacy_prefix(b) == 1) {
+            x86_apply_prefix(b, op_sz_16, addr_sz_32, rex_w);
+            pos.* = pos.* + 1;
+        } else {
+            done = 1;
+        }
+    }
+    if (pos.* >= bytes.len) { return 0 - 2; }
+    return 0;
+}
+
+fn x86_modrm_tail_len(bytes: []u8, pos: i32, modrm: u8, addr_sz_32: i32) i32 {
+    let mod: u8 = x86_mod_field(modrm);
+    let rm: u8 = x86_rm_field(modrm);
+    let tail: i32 = 0;
+    let cursor: i32 = pos;
+    if (mod != 3 && rm == 4) {
+        if (cursor >= bytes.len) { return 0 - 2; }
+        let sib: u8 = bytes[cursor];
+        cursor = cursor + 1;
+        tail = tail + 1;
+        let base: u8 = sib % 8;
+        if (mod == 0 && base == 5) {
+            if (cursor + 4 > bytes.len) { return 0 - 2; }
+            return tail + 4;
+        }
+        rm = base;
+    }
+    if (mod == 0 && rm == 5) {
+        if (cursor + 4 > bytes.len) { return 0 - 2; }
+        return tail + 4;
+    }
+    if (mod == 1) {
+        if (cursor + 1 > bytes.len) { return 0 - 2; }
+        return tail + 1;
+    }
+    if (mod == 2) {
+        if (addr_sz_32 == 1) {
+            if (cursor + 4 > bytes.len) { return 0 - 2; }
+            return tail + 4;
+        }
+        if (cursor + 4 > bytes.len) { return 0 - 2; }
+        return tail + 4;
+    }
+    return tail;
+}
+
+fn x86_read_u32_le(bytes: []u8, pos: i32) u32 {
+    return (bytes[pos] as u32)
+        + ((bytes[pos + 1] as u32) * 256)
+        + ((bytes[pos + 2] as u32) * 65536)
+        + ((bytes[pos + 3] as u32) * 16777216);
+}
+
+fn x86_grp1_imm_len(op_sz_16: i32) i32 {
+    if (op_sz_16 == 1) { return 2; }
+    return 4;
+}
+
+fn x86_decode_insn(pc: u64, bytes: []u8) DecodedInsn {
+    let dec: DecodedInsn = DecodedInsn{
+        .arch = GuestArch.X86_64,
+        .pc = pc,
+        .len = 0,
+        .klass = InsnClass.Unknown,
+        .opcode = 0,
+        .modrm = 0,
+        .imm = 0,
+        .raw = null as *u8,
+        .raw_len = 0,
+    };
+    if (bytes.len == 0) { return dec; }
+
+    let start: i32 = 0;
+    let pos: i32 = 0;
+    let op_sz_16: i32 = 0;
+    let addr_sz_32: i32 = 0;
+    let rex_w: i32 = 0;
+    let pf: i32 = x86_skip_prefixes(bytes, &pos, &op_sz_16, &addr_sz_32, &rex_w);
+    if (pf != 0) { return dec; }
+
+    let op: u8 = bytes[pos];
+    dec.opcode = op;
+    pos = pos + 1;
+
+    if (op == 144) {
+        dec.klass = InsnClass.Nop;
+        dec.len = pos - start;
+        return dec;
+    }
+    if (op == 195) {
+        dec.klass = InsnClass.Ret;
+        dec.len = pos - start;
+        return dec;
+    }
+    if (op == 194) {
+        if (pos + 2 > bytes.len) { return dec; }
+        dec.klass = InsnClass.Ret;
+        dec.imm = (bytes[pos] as u32) + ((bytes[pos + 1] as u32) * 256);
+        dec.len = (pos + 2) - start;
+        return dec;
+    }
+    if (op == 235) {
+        if (pos + 1 > bytes.len) { return dec; }
+        dec.klass = InsnClass.Jmp;
+        dec.imm = bytes[pos] as u32;
+        dec.len = (pos + 1) - start;
+        return dec;
+    }
+    if (op == 233) {
+        if (pos + 4 > bytes.len) { return dec; }
+        dec.klass = InsnClass.Jmp;
+        dec.imm = x86_read_u32_le(bytes, pos);
+        dec.len = (pos + 4) - start;
+        return dec;
+    }
+    if (op == 232) {
+        if (pos + 4 > bytes.len) { return dec; }
+        dec.klass = InsnClass.Call;
+        dec.imm = x86_read_u32_le(bytes, pos);
+        dec.len = (pos + 4) - start;
+        return dec;
+    }
+    if (op == 205) {
+        if (pos + 1 > bytes.len) { return dec; }
+        dec.klass = InsnClass.Sys;
+        dec.imm = bytes[pos] as u32;
+        dec.len = (pos + 1) - start;
+        return dec;
+    }
+    if (op >= 80 && op <= 87) {
+        dec.klass = InsnClass.Push;
+        dec.len = pos - start;
+        return dec;
+    }
+    if (op >= 88 && op <= 95) {
+        dec.klass = InsnClass.Pop;
+        dec.len = pos - start;
+        return dec;
+    }
+    if (op == 244) {
+        dec.klass = InsnClass.Hlt;
+        dec.len = pos - start;
+        return dec;
+    }
+    if (op == 104) {
+        if (pos + 4 > bytes.len) { return dec; }
+        dec.imm = x86_read_u32_le(bytes, pos);
+        dec.len = (pos + 4) - start;
+        return dec;
+    }
+    if (op == 106) {
+        if (pos + 1 > bytes.len) { return dec; }
+        dec.imm = bytes[pos] as u32;
+        dec.len = (pos + 1) - start;
+        return dec;
+    }
+    if (op >= 136 && op <= 139) {
+        if (pos >= bytes.len) { return dec; }
+        dec.klass = InsnClass.Mov;
+        dec.modrm = bytes[pos];
+        let tail: i32 = x86_modrm_tail_len(bytes, pos + 1, dec.modrm, addr_sz_32);
+        if (tail < 0) { return dec; }
+        dec.len = (pos + 1 + tail) - start;
+        return dec;
+    }
+    if (op == 49 || op == 51) {
+        if (pos >= bytes.len) { return dec; }
+        dec.klass = InsnClass.Xor;
+        dec.modrm = bytes[pos];
+        let tail: i32 = x86_modrm_tail_len(bytes, pos + 1, dec.modrm, addr_sz_32);
+        if (tail < 0) { return dec; }
+        dec.len = (pos + 1 + tail) - start;
+        return dec;
+    }
+    if (op == 1 || op == 3) {
+        if (pos >= bytes.len) { return dec; }
+        dec.klass = InsnClass.Add;
+        dec.modrm = bytes[pos];
+        let tail: i32 = x86_modrm_tail_len(bytes, pos + 1, dec.modrm, addr_sz_32);
+        if (tail < 0) { return dec; }
+        dec.len = (pos + 1 + tail) - start;
+        return dec;
+    }
+    if (op == 129) {
+        if (pos >= bytes.len) { return dec; }
+        dec.modrm = bytes[pos];
+        if (x86_reg_field(dec.modrm) == 0) {
+            dec.klass = InsnClass.Add;
+        }
+        let tail: i32 = x86_modrm_tail_len(bytes, pos + 1, dec.modrm, addr_sz_32);
+        if (tail < 0) { return dec; }
+        let imm_len: i32 = x86_grp1_imm_len(op_sz_16);
+        if (pos + 1 + tail + imm_len > bytes.len) { return dec; }
+        if (imm_len == 2) {
+            dec.imm = (bytes[pos + 1 + tail] as u32)
+                + ((bytes[pos + 2 + tail] as u32) * 256);
+        } else {
+            dec.imm = x86_read_u32_le(bytes, pos + 1 + tail);
+        }
+        dec.len = (pos + 1 + tail + imm_len) - start;
+        return dec;
+    }
+    if (op == 131) {
+        if (pos >= bytes.len) { return dec; }
+        dec.modrm = bytes[pos];
+        if (x86_reg_field(dec.modrm) == 0) {
+            dec.klass = InsnClass.Add;
+        }
+        if (x86_reg_field(dec.modrm) == 5) {
+            dec.klass = InsnClass.Sub;
+        }
+        let tail: i32 = x86_modrm_tail_len(bytes, pos + 1, dec.modrm, addr_sz_32);
+        if (tail < 0) { return dec; }
+        if (pos + 1 + tail + 1 > bytes.len) { return dec; }
+        dec.imm = bytes[pos + 1 + tail] as u32;
+        dec.len = (pos + 1 + tail + 1) - start;
+        return dec;
+    }
+    if (op == 199) {
+        if (pos >= bytes.len) { return dec; }
+        dec.modrm = bytes[pos];
+        if (x86_reg_field(dec.modrm) == 0) {
+            dec.klass = InsnClass.Mov;
+        }
+        let tail: i32 = x86_modrm_tail_len(bytes, pos + 1, dec.modrm, addr_sz_32);
+        if (tail < 0) { return dec; }
+        let imm_len: i32 = x86_grp1_imm_len(op_sz_16);
+        if (pos + 1 + tail + imm_len > bytes.len) { return dec; }
+        if (imm_len == 2) {
+            dec.imm = (bytes[pos + 1 + tail] as u32)
+                + ((bytes[pos + 2 + tail] as u32) * 256);
+        } else {
+            dec.imm = x86_read_u32_le(bytes, pos + 1 + tail);
+        }
+        dec.len = (pos + 1 + tail + imm_len) - start;
+        return dec;
+    }
+    if (op >= 184 && op <= 191) {
+        if (pos + 4 > bytes.len) { return dec; }
+        dec.klass = InsnClass.Mov;
+        dec.modrm = (op - 184) as u8;
+        dec.imm = x86_read_u32_le(bytes, pos);
+        dec.len = (pos + 4) - start;
+        return dec;
+    }
+    if (op == 15) {
+        if (pos >= bytes.len) { return dec; }
+        let op2: u8 = bytes[pos];
+        dec.imm = op2 as u32;
+        dec.opcode = 15;
+        if (op2 == 162) {
+            dec.klass = InsnClass.Sys;
+            dec.len = (pos + 1) - start;
+            return dec;
+        }
+        if (op2 == 49) {
+            dec.klass = InsnClass.Sys;
+            dec.len = (pos + 1) - start;
+            return dec;
+        }
+        dec.len = (pos + 1) - start;
+        return dec;
+    }
+
+    dec.len = pos - start;
+    return dec;
+}

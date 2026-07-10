@@ -1,0 +1,318 @@
+// storage/trifs.flash — TriFS native VFS core.
+//
+// File payloads use t9 units and all identity, offset, epoch, and lock values
+// use t27. UTF-8 path bytes are an explicit foreign-text boundary; they are
+// never used as file payload storage. Mutations require a transaction owner,
+// giving create/write/rename/unlink deterministic serialization.
+
+fn trifs_file() t9 { return 0; }
+fn trifs_directory() t9 { return 1; }
+fn trifs_alive() t9 { return 1; }
+fn trifs_deleted() t9 { return 0 - 1; }
+fn trifs_root_inode() t27 { return 1; }
+fn trifs_no_inode() t27 { return 0 - 1; }
+fn trifs_name_max() i32 { return 81; }
+fn trifs_file_max() t27 { return 531441; }
+
+fn trifs_ok() i32 { return 0; }
+fn trifs_err_not_found() i32 { return 0 - 1; }
+fn trifs_err_exists() i32 { return 0 - 2; }
+fn trifs_err_not_dir() i32 { return 0 - 3; }
+fn trifs_err_is_dir() i32 { return 0 - 4; }
+fn trifs_err_busy() i32 { return 0 - 5; }
+fn trifs_err_invalid() i32 { return 0 - 6; }
+fn trifs_err_not_empty() i32 { return 0 - 7; }
+fn trifs_err_range() i32 { return 0 - 8; }
+fn trifs_err_locked() i32 { return 0 - 9; }
+
+struct TriNode {
+    inode: t27,
+    parent: t27,
+    kind: t9,
+    state: t9,
+    name: []u8,
+    data: ArrayList[t9],
+    size: t27,
+    version: t27,
+    open_count: t27,
+}
+
+struct TriFs {
+    nodes: ArrayList[TriNode],
+    next_inode: t27,
+    epoch: t27,
+    writer_task: t27,
+    tx_depth: t9,
+}
+
+fn trifs_new() TriFs {
+    let fs: TriFs = TriFs{
+        .nodes = make[TriNode](27),
+        .next_inode = 2,
+        .epoch = 1,
+        .writer_task = trifs_no_inode(),
+        .tx_depth = 0,
+    };
+    let root: TriNode = TriNode{
+        .inode = trifs_root_inode(),
+        .parent = trifs_root_inode(),
+        .kind = trifs_directory(),
+        .state = trifs_alive(),
+        .name = "/",
+        .data = make[t9](0),
+        .size = 0,
+        .version = 1,
+        .open_count = 0,
+    };
+    push[TriNode](&fs.nodes, root);
+    return fs;
+}
+
+fn trifs_free(fs: *TriFs) void {
+    let i: i32 = 0;
+    while (i < len[TriNode](fs.*.nodes)) {
+        let node: TriNode = get[TriNode](fs.*.nodes, i);
+        free[t9](&node.data);
+        i = i + 1;
+    }
+    free[TriNode](&fs.*.nodes);
+    fs.*.writer_task = trifs_no_inode();
+    fs.*.tx_depth = 0;
+}
+
+fn trifs_name_equal(a: []u8, b: []u8) i32 {
+    if (a.len != b.len) { return 0; }
+    let i: i32 = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn trifs_name_valid(name: []u8) i32 {
+    if (name.len < 1 || name.len > trifs_name_max()) { return 0; }
+    if (trifs_name_equal(name, ".") == 1 || trifs_name_equal(name, "..") == 1) { return 0; }
+    let i: i32 = 0;
+    while (i < name.len) {
+        if (name[i] == 0 || name[i] == 47) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn trifs_find_index(fs: *TriFs, inode: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[TriNode](fs.*.nodes)) {
+        let node: TriNode = get[TriNode](fs.*.nodes, i);
+        if (node.state == trifs_alive() && node.inode == inode) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn trifs_lookup(fs: *TriFs, parent: t27, name: []u8) t27 {
+    let i: i32 = 0;
+    while (i < len[TriNode](fs.*.nodes)) {
+        let node: TriNode = get[TriNode](fs.*.nodes, i);
+        if (node.state == trifs_alive() && node.parent == parent &&
+            trifs_name_equal(node.name, name) == 1) { return node.inode; }
+        i = i + 1;
+    }
+    return trifs_no_inode();
+}
+
+fn trifs_begin(fs: *TriFs, task_id: t27) i32 {
+    if (task_id < 1) { return trifs_err_invalid(); }
+    if (fs.*.writer_task == trifs_no_inode()) {
+        fs.*.writer_task = task_id;
+        fs.*.tx_depth = 1;
+        return trifs_ok();
+    }
+    if (fs.*.writer_task != task_id) { return trifs_err_locked(); }
+    if (fs.*.tx_depth >= 8) { return trifs_err_range(); }
+    fs.*.tx_depth = fs.*.tx_depth + 1;
+    return trifs_ok();
+}
+
+fn trifs_commit(fs: *TriFs, task_id: t27) i32 {
+    if (fs.*.writer_task != task_id || fs.*.tx_depth < 1) { return trifs_err_locked(); }
+    fs.*.tx_depth = fs.*.tx_depth - 1;
+    if (fs.*.tx_depth == 0) {
+        fs.*.epoch = fs.*.epoch + 1;
+        fs.*.writer_task = trifs_no_inode();
+    }
+    return trifs_ok();
+}
+
+fn trifs_require_writer(fs: *TriFs, task_id: t27) i32 {
+    if (fs.*.writer_task != task_id || fs.*.tx_depth < 1) { return trifs_err_locked(); }
+    return trifs_ok();
+}
+
+fn trifs_create(
+    fs: *TriFs,
+    task_id: t27,
+    parent: t27,
+    name: []u8,
+    kind: t9,
+) t27 {
+    if (trifs_require_writer(fs, task_id) != 0) { return trifs_no_inode(); }
+    if (trifs_name_valid(name) == 0) { return trifs_no_inode(); }
+    if (kind != trifs_file() && kind != trifs_directory()) { return trifs_no_inode(); }
+    let pidx: i32 = trifs_find_index(fs, parent);
+    if (pidx < 0) { return trifs_no_inode(); }
+    if (get[TriNode](fs.*.nodes, pidx).kind != trifs_directory()) { return trifs_no_inode(); }
+    if (trifs_lookup(fs, parent, name) != trifs_no_inode()) { return trifs_no_inode(); }
+    let inode: t27 = fs.*.next_inode;
+    let node: TriNode = TriNode{
+        .inode = inode,
+        .parent = parent,
+        .kind = kind,
+        .state = trifs_alive(),
+        .name = name,
+        .data = make[t9](0),
+        .size = 0,
+        .version = fs.*.epoch,
+        .open_count = 0,
+    };
+    push[TriNode](&fs.*.nodes, node);
+    fs.*.next_inode = inode + 1;
+    return inode;
+}
+
+fn trifs_open(fs: *TriFs, inode: t27) i32 {
+    let idx: i32 = trifs_find_index(fs, inode);
+    if (idx < 0) { return trifs_err_not_found(); }
+    let node: TriNode = get[TriNode](fs.*.nodes, idx);
+    if (node.kind == trifs_directory()) { return trifs_err_is_dir(); }
+    node.open_count = node.open_count + 1;
+    set[TriNode](&fs.*.nodes, idx, node);
+    return trifs_ok();
+}
+
+fn trifs_close(fs: *TriFs, inode: t27) i32 {
+    let idx: i32 = trifs_find_index(fs, inode);
+    if (idx < 0) { return trifs_err_not_found(); }
+    let node: TriNode = get[TriNode](fs.*.nodes, idx);
+    if (node.open_count < 1) { return trifs_err_invalid(); }
+    node.open_count = node.open_count - 1;
+    set[TriNode](&fs.*.nodes, idx, node);
+    return trifs_ok();
+}
+
+fn trifs_write(
+    fs: *TriFs,
+    task_id: t27,
+    inode: t27,
+    offset: t27,
+    input: *ArrayList[t9],
+) i32 {
+    if (trifs_require_writer(fs, task_id) != 0) { return trifs_err_locked(); }
+    let idx: i32 = trifs_find_index(fs, inode);
+    if (idx < 0) { return trifs_err_not_found(); }
+    let node: TriNode = get[TriNode](fs.*.nodes, idx);
+    if (node.kind != trifs_file()) { return trifs_err_is_dir(); }
+    let input_len: i32 = len[t9](input.*);
+    if (offset < 0 || offset + input_len as t27 > trifs_file_max()) { return trifs_err_range(); }
+    let end: i32 = (offset + input_len as t27) as i32;
+    while (len[t9](node.data) < end) { push[t9](&node.data, 0); }
+    let i: i32 = 0;
+    while (i < input_len) {
+        set[t9](&node.data, offset as i32 + i, get[t9](input.*, i));
+        i = i + 1;
+    }
+    if (end as t27 > node.size) { node.size = end as t27; }
+    node.version = fs.*.epoch + 1;
+    set[TriNode](&fs.*.nodes, idx, node);
+    return input_len;
+}
+
+fn trifs_read_unit(fs: *TriFs, inode: t27, offset: t27, out: *t9) i32 {
+    let idx: i32 = trifs_find_index(fs, inode);
+    if (idx < 0) { return trifs_err_not_found(); }
+    let node: TriNode = get[TriNode](fs.*.nodes, idx);
+    if (node.kind != trifs_file()) { return trifs_err_is_dir(); }
+    if (offset < 0 || offset >= node.size) { return trifs_err_range(); }
+    out.* = get[t9](node.data, offset as i32);
+    return trifs_ok();
+}
+
+fn trifs_is_descendant(fs: *TriFs, candidate: t27, ancestor: t27) i32 {
+    let cursor: t27 = candidate;
+    let guard: i32 = 0;
+    while (guard <= len[TriNode](fs.*.nodes)) {
+        if (cursor == ancestor) { return 1; }
+        if (cursor == trifs_root_inode()) { return 0; }
+        let idx: i32 = trifs_find_index(fs, cursor);
+        if (idx < 0) { return 0; }
+        cursor = get[TriNode](fs.*.nodes, idx).parent;
+        guard = guard + 1;
+    }
+    return 1;
+}
+
+fn trifs_rename(
+    fs: *TriFs,
+    task_id: t27,
+    inode: t27,
+    new_parent: t27,
+    new_name: []u8,
+) i32 {
+    if (trifs_require_writer(fs, task_id) != 0) { return trifs_err_locked(); }
+    if (inode == trifs_root_inode() || trifs_name_valid(new_name) == 0) { return trifs_err_invalid(); }
+    let idx: i32 = trifs_find_index(fs, inode);
+    let pidx: i32 = trifs_find_index(fs, new_parent);
+    if (idx < 0 || pidx < 0) { return trifs_err_not_found(); }
+    if (get[TriNode](fs.*.nodes, pidx).kind != trifs_directory()) { return trifs_err_not_dir(); }
+    let node: TriNode = get[TriNode](fs.*.nodes, idx);
+    if (node.kind == trifs_directory() && trifs_is_descendant(fs, new_parent, inode) == 1) {
+        return trifs_err_invalid();
+    }
+    let conflict: t27 = trifs_lookup(fs, new_parent, new_name);
+    if (conflict != trifs_no_inode() && conflict != inode) { return trifs_err_exists(); }
+    node.parent = new_parent;
+    node.name = new_name;
+    node.version = fs.*.epoch + 1;
+    set[TriNode](&fs.*.nodes, idx, node);
+    return trifs_ok();
+}
+
+fn trifs_child_count(fs: *TriFs, parent: t27) t27 {
+    let count: t27 = 0;
+    let i: i32 = 0;
+    while (i < len[TriNode](fs.*.nodes)) {
+        let node: TriNode = get[TriNode](fs.*.nodes, i);
+        if (node.state == trifs_alive() && node.parent == parent && node.inode != parent) {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+fn trifs_unlink(fs: *TriFs, task_id: t27, inode: t27) i32 {
+    if (trifs_require_writer(fs, task_id) != 0) { return trifs_err_locked(); }
+    if (inode == trifs_root_inode()) { return trifs_err_invalid(); }
+    let idx: i32 = trifs_find_index(fs, inode);
+    if (idx < 0) { return trifs_err_not_found(); }
+    let node: TriNode = get[TriNode](fs.*.nodes, idx);
+    if (node.open_count > 0) { return trifs_err_busy(); }
+    if (node.kind == trifs_directory() && trifs_child_count(fs, inode) > 0) {
+        return trifs_err_not_empty();
+    }
+    node.state = trifs_deleted();
+    node.version = fs.*.epoch + 1;
+    set[TriNode](&fs.*.nodes, idx, node);
+    return trifs_ok();
+}
+
+fn trifs_node(fs: *TriFs, inode: t27) TriNode {
+    let idx: i32 = trifs_find_index(fs, inode);
+    if (idx >= 0) { return get[TriNode](fs.*.nodes, idx); }
+    return TriNode{
+        .inode = trifs_no_inode(), .parent = trifs_no_inode(), .kind = trifs_file(),
+        .state = trifs_deleted(), .name = "", .data = make[t9](0), .size = 0,
+        .version = 0, .open_count = 0,
+    };
+}

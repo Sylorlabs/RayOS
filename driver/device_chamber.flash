@@ -1,0 +1,159 @@
+// driver/device_chamber.flash — device enumeration chamber (MMIO record table).
+//
+// The chamber IS the driver ABI on both targets. Native RayOS hardware: each
+// bus controller (USB, Thunderbolt, USB-C, display, network) publishes its
+// records straight into this register block and bumps GENERATION on hotplug.
+// Phase-1 hosts: the firmware seeder (device_manager.flash) fills the same
+// block from the host topology. Everything above this file — Devices UI,
+// terminal `devices`, tests — reads ONLY the chamber, so the read path
+// exercised under emulation is byte-identical to the native path.
+//
+// Layout at RAYOS_DEVICE_MMIO_BASE:
+//   +0  MAGIC       "DEVC"
+//   +4  GENERATION  bumped on every publish/hotplug
+//   +8  COUNT       records in the table
+//   +12 reserved
+//   +16 records × 128:
+//       bus[16] name[56] detail[40] state[16]   (NUL-terminated strings)
+
+@import("../core/constants.flash")
+@import("hw_rt.flash")
+
+fn DEVICE_CHAMBER_MAGIC() i32 { return 1145391683; }   // "DEVC"
+fn DEVICE_REC_BASE() i32 { return 16; }
+fn DEVICE_REC_STRIDE() i32 { return 128; }
+fn DEVICE_F_BUS() i32 { return 0; }
+fn DEVICE_F_NAME() i32 { return 16; }
+fn DEVICE_F_DETAIL() i32 { return 72; }
+fn DEVICE_F_STATE() i32 { return 112; }
+fn DEVICE_BUS_CAP() i32 { return 16; }
+fn DEVICE_NAME_CAP() i32 { return 56; }
+fn DEVICE_DETAIL_CAP() i32 { return 40; }
+fn DEVICE_STATE_CAP() i32 { return 16; }
+
+fn device_chamber_max_records() i32 {
+    return (RAYOS_DEVICE_MMIO_BYTES() - DEVICE_REC_BASE()) / DEVICE_REC_STRIDE();
+}
+
+fn device_chamber_base() i64 {
+    return RAYOS_DEVICE_MMIO_BASE();
+}
+
+fn device_chamber_init() i32 {
+    if (hw_rt_init() != 0) { return 0 - 1; }
+    let base: i64 = device_chamber_base();
+    if (mmio_read32(base) != DEVICE_CHAMBER_MAGIC()) {
+        mmio_write32(base, DEVICE_CHAMBER_MAGIC());
+        mmio_write32(base + 4, 0);
+        mmio_write32(base + 8, 0);
+    }
+    return 0;
+}
+
+fn device_chamber_generation() i32 {
+    return mmio_read32(device_chamber_base() + 4);
+}
+
+fn device_chamber_count() i32 {
+    let n: i32 = mmio_read32(device_chamber_base() + 8);
+    if (n < 0) { return 0; }
+    if (n > device_chamber_max_records()) { return device_chamber_max_records(); }
+    return n;
+}
+
+// NUL-terminated string field write, truncated to the field capacity.
+fn device_chamber_put_str(rec_off: i32, field_off: i32, cap: i32, s: []u8) void {
+    let p: *i8 = hw_mmio_ptr(
+        device_chamber_base() + (rec_off + field_off) as i64, cap,
+    );
+    if (p == null) { return; }
+    let n: i32 = s.len;
+    if (n > cap - 1) { n = cap - 1; }
+    let i: i32 = 0;
+    while (i < n) {
+        p[i] = s[i] as i8;
+        i = i + 1;
+    }
+    p[n] = 0 as i8;
+}
+
+fn device_chamber_get_str(rec_off: i32, field_off: i32, cap: i32) []u8 {
+    let p: *i8 = hw_mmio_ptr(
+        device_chamber_base() + (rec_off + field_off) as i64, cap,
+    );
+    if (p == null) { return ""; }
+    let n: i32 = 0;
+    while (n < cap - 1 && p[n] != (0 as i8)) {
+        n = n + 1;
+    }
+    let pu: *u8 = p as *u8;
+    return pu[0..n];
+}
+
+// field `idx` (0..3) of a BUS|NAME|DETAIL|STATE row
+fn device_chamber_row_field(line: []u8, idx: i32) []u8 {
+    let field: i32 = 0;
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i <= line.len) {
+        if (i == line.len || line[i] == ('|' as u8)) {
+            if (field == idx) { return line[start..i]; }
+            field = field + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// Publish a full record table (report rows: BUS|NAME|DETAIL|STATE per line).
+// Returns the number of records written. Native controllers use the same
+// register writes for incremental hotplug updates.
+fn device_chamber_publish(report: []u8) i32 {
+    if (device_chamber_init() != 0) { return 0 - 1; }
+    let base: i64 = device_chamber_base();
+    let count: i32 = 0;
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i <= report.len && count < device_chamber_max_records()) {
+        if (i == report.len || report[i] == ('\n' as u8)) {
+            let line: []u8 = report[start..i];
+            if (line.len > 0) {
+                let rec: i32 = DEVICE_REC_BASE() + count * DEVICE_REC_STRIDE();
+                device_chamber_put_str(rec, DEVICE_F_BUS(), DEVICE_BUS_CAP(), device_chamber_row_field(line, 0));
+                device_chamber_put_str(rec, DEVICE_F_NAME(), DEVICE_NAME_CAP(), device_chamber_row_field(line, 1));
+                device_chamber_put_str(rec, DEVICE_F_DETAIL(), DEVICE_DETAIL_CAP(), device_chamber_row_field(line, 2));
+                device_chamber_put_str(rec, DEVICE_F_STATE(), DEVICE_STATE_CAP(), device_chamber_row_field(line, 3));
+                count = count + 1;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    mmio_write32(base + 8, count);
+    mmio_write32(base + 4, device_chamber_generation() + 1);
+    hw_fence();
+    return count;
+}
+
+// Reconstruct the report from the chamber — the ONLY device source for the
+// UI and terminal, on hosts and native hardware alike.
+fn device_chamber_report() []u8 {
+    if (device_chamber_init() != 0) { return ""; }
+    let out: []u8 = "";
+    let n: i32 = device_chamber_count();
+    let i: i32 = 0;
+    while (i < n) {
+        let rec: i32 = DEVICE_REC_BASE() + i * DEVICE_REC_STRIDE();
+        out = _zag_str_concat(out, device_chamber_get_str(rec, DEVICE_F_BUS(), DEVICE_BUS_CAP()));
+        out = _zag_str_concat(out, "|");
+        out = _zag_str_concat(out, device_chamber_get_str(rec, DEVICE_F_NAME(), DEVICE_NAME_CAP()));
+        out = _zag_str_concat(out, "|");
+        out = _zag_str_concat(out, device_chamber_get_str(rec, DEVICE_F_DETAIL(), DEVICE_DETAIL_CAP()));
+        out = _zag_str_concat(out, "|");
+        out = _zag_str_concat(out, device_chamber_get_str(rec, DEVICE_F_STATE(), DEVICE_STATE_CAP()));
+        out = _zag_str_concat(out, "\n");
+        i = i + 1;
+    }
+    return out;
+}

@@ -1,0 +1,71 @@
+// linux_bzimage_real_test.flash — load real/synthetic bzImage, step BTM, verify boot progress
+
+@import("../core/init.flash")
+@import("../driver/virtio_block_mmio_nop.flash")
+@import("../driver/virtio_gpu_mmio_nop.flash")
+@import("../driver/hw_rt.flash")
+@import("../hypervisor/linux_boot.flash")
+@import("../storage/linux_image.flash")
+
+fn test_fail(msg: []u8) void {
+    _zag_print("linux_bzimage_real_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn linux_bzimage_vga_has_chars(guest_ram: ArrayList[u8]) i32 {
+    let base: i32 = GPA_VGA_TEXT();
+    let cells: i32 = VGA_TEXT_COLS() * VGA_TEXT_ROWS();
+    let i: i32 = 0;
+    while (i < cells) {
+        let ch: u8 = guest_ram_read_u8(guest_ram, base + i * 2);
+        if (ch != 0) {
+            if (ch != 32) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main() i32 {
+    _zag_println("linux_bzimage_real_test: running");
+
+    if (hw_rt_init() != 0) { test_fail("hw_rt_init"); }
+
+    if (_zag_file_exists("vm/linux.bin") == 0) { test_fail("missing vm/linux.bin compatibility fixture"); }
+
+    let guest_ram: ArrayList[u8] = guest_ram_new_default();
+    let load_rc: i32 = linux_image_load_bzimage(&guest_ram);
+    if (load_rc != 0) { test_fail("linux_image_load_bzimage"); }
+
+    let hv: *BinaryTranslationMatrix = btm_new();
+    linux_boot_attach(hv, &guest_ram);
+
+    let pc0: u64 = linux_boot_pc(hv);
+    let stepped: i32 = linux_boot_step_n(hv, guest_ram, 500);
+    if (stepped < 1) { test_fail("linux_boot_step_n stepped"); }
+
+    let pc1: u64 = linux_boot_pc(hv);
+    let vga_ok: i32 = linux_bzimage_vga_has_chars(guest_ram);
+    let pc_moved: i32 = 0;
+    if (pc1 != pc0) { pc_moved = 1; }
+    if (pc_moved != 1) {
+        if (vga_ok != 1) { test_fail("pc unchanged and VGA empty"); }
+    }
+
+    let milestone: u64 = linux_boot_milestone_pc(500);
+    _zag_print("linux_bzimage_real_test: milestone_pc=");
+    _zag_println(_zag_u64_to_str(milestone));
+    _zag_print("linux_bzimage_real_test: stepped=");
+    _zag_println(_zag_i64_to_str(stepped as i64));
+    _zag_print("linux_bzimage_real_test: pc0=");
+    _zag_println(_zag_u64_to_str(pc0));
+    _zag_print("linux_bzimage_real_test: pc1=");
+    _zag_println(_zag_u64_to_str(pc1));
+
+    free[u8](&guest_ram);
+    btm_free(hv);
+
+    _zag_println("linux_bzimage_real_test: ok");
+    return 0;
+}

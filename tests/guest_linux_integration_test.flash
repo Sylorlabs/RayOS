@@ -1,0 +1,77 @@
+// guest_linux_integration_test.flash — attach synthetic Linux, step, verify FB checksum
+
+@import("../core/init.flash")
+@import("../math/tekum.flash")
+@import("../math/offset_loop.flash")
+@import("../driver/hw_rt.flash")
+@import("../driver/soh_mmio.flash")
+@import("../storage/soh_block.flash")
+@import("../driver/virtio_guest.flash")
+@import("../driver/virtio_gpu_mmio_nop.flash")
+@import("../storage/linux_image.flash")
+@import("../hypervisor/guest_linux.flash")
+
+fn test_fail(msg: []u8) void {
+    _zag_print("guest_linux_integration_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn pool_checksum(pool: ArrayList[u8], off: i32, nbytes: i32) i64 {
+    let sum: i64 = 0;
+    let i: i32 = 0;
+    while (i < nbytes) {
+        let idx: i32 = off + i;
+        if (idx >= 0 && idx < len[u8](pool)) {
+            sum = sum + (get[u8](&pool, idx) as i64);
+        }
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn main() i32 {
+    _zag_println("guest_linux_integration_test: running");
+
+    if (hw_rt_init() != 0) { test_fail("hw_rt_init"); }
+
+    let ram: ArrayList[u8] = guest_ram_new_default();
+    let hv: *BinaryTranslationMatrix = btm_new();
+    guest_linux_attach(hv, &ram);
+
+    let pool: ArrayList[u8] = make[u8](0);
+    let w: i32 = 480;
+    let h: i32 = 320;
+    let bytes: i32 = w * h * 3;
+    let i: i32 = 0;
+    while (i < bytes) {
+        push[u8](&pool, 0);
+        i = i + 1;
+    }
+    let off: i32 = 0;
+
+    let cs0: i64 = pool_checksum(pool, off, bytes);
+    guest_linux_render_fb(hv, ram, &pool, off, w, h);
+    let cs_render: i64 = pool_checksum(pool, off, bytes);
+    if (cs_render == cs0) { test_fail("render checksum unchanged"); }
+
+    let pc0: u64 = guest_linux_pc(hv);
+    if (pc0 != (GPA_BOOT_SECTOR() as u64)) { test_fail("guest_linux_pc attach"); }
+
+    let cs_before: i64 = pool_checksum(pool, off, bytes);
+    let stepped: i32 = guest_linux_step_n(hv, ram, 100);
+    if (stepped < 1) { test_fail("guest_linux_step_n"); }
+    guest_linux_render_fb(hv, ram, &pool, off, w, h);
+    let cs_after: i64 = pool_checksum(pool, off, bytes);
+    if (cs_after == cs_before) { test_fail("post-step checksum unchanged"); }
+
+    let pc1: u64 = guest_linux_pc(hv);
+    if (pc1 == pc0) { test_fail("guest_linux_pc no progress"); }
+
+    free[u8](&pool);
+    free[u8](&ram);
+    btm_free(hv);
+
+    _zag_println("guest_linux_integration_test: ok");
+    return 0;
+}

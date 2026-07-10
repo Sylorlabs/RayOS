@@ -1,0 +1,98 @@
+// tools/rayos_interactive.flash — Simple input injector for RayOS desktop
+//
+// Reads raw MMIO events from /tmp/rayos_input.ev file and injects them.
+// File format: one event per line: "kind x y button"
+// kind: 0=move, 1=button
+// Example: "0 640 400 0"  (move to 640,400)
+// Example: "1 100 200 1"  (button press at 100,200)
+
+@import("../driver/input_chamber.flash")
+
+fn main() i32 {
+    _zag_println("RayOS Input Injector starting...");
+    
+    if (input_chamber_init() != 0) {
+        _zag_println("Failed to initialize input chamber");
+        return 1;
+    }
+    
+    _zag_println("Input chamber initialized");
+    _zag_println("Reading events from /tmp/rayos_input.ev");
+    _zag_println("Format: kind x y button (one event per line)");
+    
+    let input_path: []u8 = "/tmp/rayos_input.ev";
+    
+    while (true) {
+        if (_zag_file_exists(input_path) == 0) {
+            let i: i32 = 0;
+            while (i < 4096) {
+                i = i + 1;
+            }
+        } else {
+            let content: []u8 = _zag_read_file(input_path);
+            if (content.len > 0) {
+                // Parse simple format: kind x y button
+                let i: i32 = 0;
+                
+                // Parse kind
+                let kind_start: i32 = i;
+                while (i < content.len && content[i] != (' ' as u8)) {
+                    i = i + 1;
+                }
+                let kind_str: []u8 = content[kind_start..i];
+                let kind: i32 = _zag_str_to_i64(kind_str) as i32;
+                
+                if (i < content.len) {
+                    i = i + 1;  // skip space
+                    let x_start: i32 = i;
+                    while (i < content.len && content[i] != (' ' as u8)) {
+                        i = i + 1;
+                    }
+                    let x_str: []u8 = content[x_start..i];
+                    let x: i32 = _zag_str_to_i64(x_str) as i32;
+                    
+                    if (i < content.len) {
+                        i = i + 1;  // skip space
+                        let y_start: i32 = i;
+                        while (i < content.len && content[i] != (' ' as u8)) {
+                            i = i + 1;
+                        }
+                        let y_str: []u8 = content[y_start..i];
+                        let y: i32 = _zag_str_to_i64(y_str) as i32;
+                        
+                        if (i < content.len) {
+                            i = i + 1;  // skip space
+                            let btn_start: i32 = i;
+                            while (i < content.len && content[i] != ('\n' as u8)) {
+                                i = i + 1;
+                            }
+                            let btn_str: []u8 = content[btn_start..i];
+                            let btn: i32 = _zag_str_to_i64(btn_str) as i32;
+                            
+                            input_chamber_inject(x, y, btn);
+                            
+                            _zag_print("Injected: kind=");
+                            _zag_print(_zag_i64_to_str(kind as i64));
+                            _zag_print(" x=");
+                            _zag_print(_zag_i64_to_str(x as i64));
+                            _zag_print(" y=");
+                            _zag_print(_zag_i64_to_str(y as i64));
+                            _zag_print(" btn=");
+                            _zag_println(_zag_i64_to_str(btn as i64));
+                        }
+                    }
+                }
+                
+                // Clear the file after processing
+                _zag_write_file(input_path, "");
+            } else {
+                let i: i32 = 0;
+                while (i < 4096) {
+                    i = i + 1;
+                }
+            }
+        }
+    }
+    
+    return 0;
+}

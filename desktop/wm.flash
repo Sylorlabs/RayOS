@@ -1,0 +1,781 @@
+// desktop/wm.flash — RayOS window manager (retained windows, chrome, hit-test).
+//
+//   let wm: WmState = wm_new();
+//   let id: i32 = wm_add_window(&wm, "TERMINAL", 80, 60, 320, 220, 0, 0, 0);
+//   wm_paint_chrome(&wm, &fb, id);
+//   let hit: i32 = wm_hit_test(&wm, mx, my);
+
+@import("theme.flash")
+
+fn wm_content_native() i32 { return 0; }
+fn wm_content_guest() i32 { return 1; }
+fn wm_content_tasks() i32 { return 2; }
+fn wm_content_files() i32 { return 3; }
+fn wm_content_browser() i32 { return 4; }
+fn wm_content_devices() i32 { return 5; }
+fn wm_content_terminal() i32 { return 6; }
+
+fn wm_hit_none() i32 { return -1; }
+fn wm_hit_client() i32 { return 0; }
+fn wm_hit_titlebar() i32 { return 1; }
+fn wm_hit_close() i32 { return 2; }
+fn wm_hit_min() i32 { return 3; }
+fn wm_hit_max() i32 { return 4; }
+
+struct RayWindow {
+    id: i32,
+    title: []u8,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    z: i32,
+    focused: i32,
+    minimized: i32,
+    maximized: i32,
+    rest_x: i32,     // pre-maximize geometry for restore
+    rest_y: i32,
+    rest_w: i32,
+    rest_h: i32,
+    content_kind: i32,
+    guest_id: i32,
+    fb_offset: i32,
+    ver: i32,        // bumped on any visual state change (chrome or content)
+    cache_fb: i64,   // retained render of this window (*SoftFb), 0 = none
+    cache_ver: i32,  // ver the cache was rendered at
+    cache_w: i32,
+    cache_h: i32,
+}
+
+struct WmState {
+    windows: ArrayList[RayWindow],
+    next_id: i32,
+    focused_id: i32,
+    z_top: i32,
+    theme: RayOsTheme,
+}
+
+fn wm_new() WmState {
+    return WmState{
+        .windows = make[RayWindow](8),
+        .next_id = 1,
+        .focused_id = -1,
+        .z_top = 0,
+        .theme = rayos_theme(),
+    };
+}
+
+fn wm_find_index(wm: *WmState, id: i32) i32 {
+    let i: i32 = 0;
+    while (i < len[RayWindow](wm.*.windows)) {
+        let w: RayWindow = get[RayWindow](wm.*.windows, i);
+        if (w.id == id) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn wm_get(wm: *WmState, id: i32) RayWindow {
+    let idx: i32 = wm_find_index(wm, id);
+    if (idx < 0) {
+        return RayWindow{
+            .id = -1,
+            .title = "",
+            .x = 0,
+            .y = 0,
+            .w = 0,
+            .h = 0,
+            .z = 0,
+            .focused = 0,
+            .minimized = 0,
+            .maximized = 0,
+            .rest_x = 0,
+            .rest_y = 0,
+            .rest_w = 0,
+            .rest_h = 0,
+            .content_kind = 0,
+            .guest_id = 0,
+            .fb_offset = 0,
+            .ver = 0,
+            .cache_fb = 0,
+            .cache_ver = 0,
+            .cache_w = 0,
+            .cache_h = 0,
+        };
+    }
+    return get[RayWindow](wm.*.windows, idx);
+}
+
+fn wm_set(wm: *WmState, id: i32, w: RayWindow) void {
+    let idx: i32 = wm_find_index(wm, id);
+    if (idx >= 0) {
+        set[RayWindow](&wm.*.windows, idx, w);
+    }
+}
+
+fn wm_add_window(
+    wm: *WmState,
+    title: []u8,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    content_kind: i32,
+    guest_id: i32,
+    fb_offset: i32,
+) i32 {
+    wm.*.z_top = wm.*.z_top + 1;
+    let id: i32 = wm.*.next_id;
+    wm.*.next_id = wm.*.next_id + 1;
+    let win: RayWindow = RayWindow{
+        .id = id,
+        .title = title,
+        .x = x,
+        .y = y,
+        .w = w,
+        .h = h,
+        .z = wm.*.z_top,
+        .focused = 1,
+        .minimized = 0,
+        .maximized = 0,
+        .rest_x = x,
+        .rest_y = y,
+        .rest_w = w,
+        .rest_h = h,
+        .content_kind = content_kind,
+        .guest_id = guest_id,
+        .fb_offset = fb_offset,
+        .ver = 1,
+        .cache_fb = 0,
+        .cache_ver = 0,
+        .cache_w = 0,
+        .cache_h = 0,
+    };
+    push[RayWindow](&wm.*.windows, win);
+    wm_focus(wm, id);
+    return id;
+}
+
+fn wm_clear_focus(wm: *WmState) void {
+    let i: i32 = 0;
+    while (i < len[RayWindow](wm.*.windows)) {
+        let w: RayWindow = get[RayWindow](wm.*.windows, i);
+        if (w.focused == 1) { w.ver = w.ver + 1; }
+        w.focused = 0;
+        set[RayWindow](&wm.*.windows, i, w);
+        i = i + 1;
+    }
+}
+
+fn wm_focus(wm: *WmState, id: i32) void {
+    if (wm_find_index(wm, id) < 0) { return; }
+    wm_clear_focus(wm);
+    wm.*.z_top = wm.*.z_top + 1;
+    let w: RayWindow = wm_get(wm, id);
+    w.focused = 1;
+    w.z = wm.*.z_top;
+    w.minimized = 0;
+    w.ver = w.ver + 1;
+    wm_set(wm, id, w);
+    wm.*.focused_id = id;
+}
+
+fn wm_move(wm: *WmState, id: i32, x: i32, y: i32) void {
+    let w: RayWindow = wm_get(wm, id);
+    if (w.id < 0) { return; }
+    w.x = x;
+    w.y = y;
+    wm_set(wm, id, w);
+}
+
+fn wm_resize(wm: *WmState, id: i32, w: i32, h: i32) void {
+    let win: RayWindow = wm_get(wm, id);
+    if (win.id < 0) { return; }
+    if (w < 120) { w = 120; }
+    if (h < 80) { h = 80; }
+    win.w = w;
+    win.h = h;
+    win.ver = win.ver + 1;
+    wm_set(wm, id, win);
+}
+
+fn wm_minimize(wm: *WmState, id: i32) void {
+    let w: RayWindow = wm_get(wm, id);
+    if (w.id < 0) { return; }
+    w.minimized = 1;
+    w.focused = 0;
+    w.ver = w.ver + 1;
+    wm_set(wm, id, w);
+    if (wm.*.focused_id == id) {
+        wm.*.focused_id = -1;
+        let i: i32 = len[RayWindow](wm.*.windows) - 1;
+        while (i >= 0) {
+            let cand: RayWindow = get[RayWindow](wm.*.windows, i);
+            if (cand.minimized == 0) {
+                wm_focus(wm, cand.id);
+                return;
+            }
+            i = i - 1;
+        }
+    }
+}
+
+// Toggle between the saved geometry and the full work area.
+fn wm_toggle_maximize(wm: *WmState, id: i32, work_w: i32, work_h: i32) void {
+    let w: RayWindow = wm_get(wm, id);
+    if (w.id < 0) { return; }
+    if (w.maximized == 0) {
+        w.rest_x = w.x;
+        w.rest_y = w.y;
+        w.rest_w = w.w;
+        w.rest_h = w.h;
+        w.x = 0;
+        w.y = 0;
+        w.w = work_w;
+        w.h = work_h;
+        w.maximized = 1;
+    } else {
+        w.x = w.rest_x;
+        w.y = w.rest_y;
+        w.w = w.rest_w;
+        w.h = w.rest_h;
+        w.maximized = 0;
+    }
+    w.ver = w.ver + 1;
+    wm_set(wm, id, w);
+    wm_focus(wm, id);
+}
+
+fn wm_close(wm: *WmState, id: i32) void {
+    let idx: i32 = wm_find_index(wm, id);
+    if (idx < 0) { return; }
+    let victim: RayWindow = get[RayWindow](wm.*.windows, idx);
+    wm_free_cache(&victim);
+    set[RayWindow](&wm.*.windows, idx, victim);
+    let last: i32 = len[RayWindow](wm.*.windows) - 1;
+    if (idx != last) {
+        let tail: RayWindow = get[RayWindow](wm.*.windows, last);
+        set[RayWindow](&wm.*.windows, idx, tail);
+    }
+    pop[RayWindow](&wm.*.windows);
+    if (wm.*.focused_id == id) {
+        wm.*.focused_id = -1;
+        let i: i32 = len[RayWindow](wm.*.windows) - 1;
+        while (i >= 0) {
+            let cand: RayWindow = get[RayWindow](wm.*.windows, i);
+            if (cand.minimized == 0) {
+                wm_focus(wm, cand.id);
+                return;
+            }
+            i = i - 1;
+        }
+    }
+}
+
+// Mark a window's retained render stale (content changed).
+fn wm_touch(wm: *WmState, id: i32) void {
+    let w: RayWindow = wm_get(wm, id);
+    if (w.id < 0) { return; }
+    w.ver = w.ver + 1;
+    wm_set(wm, id, w);
+}
+
+// Free a window's retained render buffer, if any.
+fn wm_free_cache(win: *RayWindow) void {
+    if (win.*.cache_fb == 0) { return; }
+    let pfb: *SoftFb = win.*.cache_fb as *SoftFb;
+    free[u8](&pfb.*.pix);
+    free[u8](&pfb.*.mask);
+    free[u8](&pfb.*.acc);
+    _zag_free(win.*.cache_fb as *i8);
+    win.*.cache_fb = 0;
+    win.*.cache_w = 0;
+    win.*.cache_h = 0;
+}
+
+fn wm_client_y(th: RayOsTheme) i32 {
+    return th.titlebar_h;
+}
+
+fn wm_client_h(win: RayWindow, th: RayOsTheme) i32 {
+    let ch: i32 = win.h - th.titlebar_h;
+    if (ch < 1) { ch = 1; }
+    return ch;
+}
+
+fn wm_dist2(ax: i32, ay: i32, bx: f32, by: f32) f32 {
+    let dx: f32 = (ax as f32) - bx;
+    let dy: f32 = (ay as f32) - by;
+    return dx * dx + dy * dy;
+}
+
+fn wm_hit_test(wm: *WmState, mx: i32, my: i32) i32 {
+    let best_z: i32 = -1;
+    let best_hit: i32 = wm_hit_none();
+    let th: RayOsTheme = wm.*.theme;
+    let i: i32 = 0;
+    while (i < len[RayWindow](wm.*.windows)) {
+        let w: RayWindow = get[RayWindow](wm.*.windows, i);
+        if (w.minimized == 0) {
+            if (mx >= w.x && mx < w.x + w.w && my >= w.y && my < w.y + w.h) {
+                if (w.z > best_z) {
+                    best_z = w.z;
+                    let ay: f32 = (w.y + (th.titlebar_h / 2)) as f32;
+                    let ax: f32 = (w.x + 14) as f32;
+                    // Hit target is the half-way boundary between buttons
+                    // (9px radius on 18px pitch), not the painted dot —
+                    // comfortable click targets per WCAG 2.2 target size.
+                    let r2: f32 = 81.0;
+                    if (wm_dist2(mx, my, ax, ay) <= r2) {
+                        best_hit = wm_hit_close();
+                    } else if (wm_dist2(mx, my, ax + 18.0, ay) <= r2) {
+                        best_hit = wm_hit_min();
+                    } else if (wm_dist2(mx, my, ax + 36.0, ay) <= r2) {
+                        best_hit = wm_hit_max();
+                    } else if (my < w.y + th.titlebar_h) {
+                        best_hit = wm_hit_titlebar();
+                    } else {
+                        best_hit = wm_hit_client();
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return best_hit;
+}
+
+fn wm_hit_test_window(wm: *WmState, mx: i32, my: i32) i32 {
+    let best_id: i32 = -1;
+    let best_z: i32 = -1;
+    let i: i32 = 0;
+    while (i < len[RayWindow](wm.*.windows)) {
+        let w: RayWindow = get[RayWindow](wm.*.windows, i);
+        if (w.minimized == 0) {
+            if (mx >= w.x && mx < w.x + w.w && my >= w.y && my < w.y + w.h) {
+                if (w.z > best_z) {
+                    best_z = w.z;
+                    best_id = w.id;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return best_id;
+}
+
+// glyph: 0 = close (×), 1 = minimize (−), 2 = maximize (▢)
+fn wm_paint_traffic_light(
+    fb: *SoftFb,
+    cx: f32,
+    cy: f32,
+    rad: f32,
+    r: i32,
+    g: i32,
+    b: i32,
+    glyph: i32,
+) void {
+    let glow: VPath = vg_path_new();
+    vg_circle(&glow, cx, cy, rad + 1.5);
+    vg_fill(fb, &glow, r, g, b, 40);
+    let dot: VPath = vg_path_new();
+    vg_circle(&dot, cx, cy, rad);
+    vg_fill(fb, &dot, r, g, b, 255);
+
+    // dark inset symbol (always visible; hover states come later)
+    let s: f32 = rad * 0.45;
+    if (glyph == 0) {
+        let a: VPath = vg_path_new();
+        vg_move_to(&a, cx - s, cy - s);
+        vg_line_to(&a, cx + s, cy + s);
+        vg_stroke(fb, &a, 1.4, 40, 12, 8, 200);
+        let bpath: VPath = vg_path_new();
+        vg_move_to(&bpath, cx + s, cy - s);
+        vg_line_to(&bpath, cx - s, cy + s);
+        vg_stroke(fb, &bpath, 1.4, 40, 12, 8, 200);
+    }
+    if (glyph == 1) {
+        let m: VPath = vg_path_new();
+        vg_move_to(&m, cx - s, cy);
+        vg_line_to(&m, cx + s, cy);
+        vg_stroke(fb, &m, 1.4, 66, 44, 6, 200);
+    }
+    if (glyph == 2) {
+        let q: VPath = vg_path_new();
+        vg_rounded_rect(&q, cx - s, cy - s, s * 2.0, s * 2.0, 1.0);
+        vg_stroke(fb, &q, 1.3, 8, 48, 22, 200);
+    }
+}
+
+
+// Paint chrome into a retained cache buffer: window at (0,0), square
+// corners (softgpu_compose_round_rect applies the outline rounding), no
+// shadow (drawn at composite time against the live background).
+fn wm_paint_chrome_cache(wm: *WmState, fb: *SoftFb, win: RayWindow) void {
+    let th: RayOsTheme = wm.*.theme;
+
+    // body
+    softgpu_blend_rect(fb, 0, 0, win.w, win.h,
+        th.chrome_body_r, th.chrome_body_g, th.chrome_body_b, 255);
+
+    // titlebar
+    let tb_r: i32 = th.chrome_tb_r;
+    let tb_g: i32 = th.chrome_tb_g;
+    let tb_b: i32 = th.chrome_tb_b;
+    if (win.focused == 1) {
+        tb_r = th.chrome_tb_focus_r;
+        tb_g = th.chrome_tb_focus_g;
+        tb_b = th.chrome_tb_focus_b;
+    }
+    softgpu_blend_vgrad_rect(fb, 0, 0, win.w, th.titlebar_h,
+        tb_r, tb_g, tb_b,
+        th.chrome_body_r, th.chrome_body_g, th.chrome_body_b,
+        th.chrome_tb_a);
+
+    // border strips + titlebar separator
+    let ri: i32 = th.chrome_radius as i32;
+    softgpu_blend_rect(fb, ri, 0, win.w - ri * 2, 1,
+        th.chrome_border_r, th.chrome_border_g, th.chrome_border_b, th.chrome_border_a);
+    softgpu_blend_rect(fb, ri, win.h - 1, win.w - ri * 2, 1,
+        th.chrome_border_r, th.chrome_border_g, th.chrome_border_b, th.chrome_border_a);
+    softgpu_blend_rect(fb, 0, ri, 1, win.h - ri * 2,
+        th.chrome_border_r, th.chrome_border_g, th.chrome_border_b, th.chrome_border_a);
+    softgpu_blend_rect(fb, win.w - 1, ri, 1, win.h - ri * 2,
+        th.chrome_border_r, th.chrome_border_g, th.chrome_border_b, th.chrome_border_a);
+    softgpu_blend_rect(fb, 8, th.titlebar_h, win.w - 16, 1,
+        th.chrome_border_r, th.chrome_border_g, th.chrome_border_b, 50);
+
+    // traffic lights + title
+    let tb_h: f32 = th.titlebar_h as f32;
+    let ty: f32 = (tb_h - th.title_size) * 0.5;
+    wm_paint_traffic_light(fb, 14.0, tb_h * 0.5, th.traffic_r, th.tl_close_r, th.tl_close_g, th.tl_close_b, 0);
+    wm_paint_traffic_light(fb, 32.0, tb_h * 0.5, th.traffic_r, th.tl_min_r, th.tl_min_g, th.tl_min_b, 1);
+    wm_paint_traffic_light(fb, 50.0, tb_h * 0.5, th.traffic_r, th.tl_max_r, th.tl_max_g, th.tl_max_b, 2);
+
+    let ink_r: i32 = th.base.ink_r;
+    let ink_g: i32 = th.base.ink_g;
+    let ink_b: i32 = th.base.ink_b;
+    if (win.focused == 0) {
+        ink_r = th.base.mut_r;
+        ink_g = th.base.mut_g;
+        ink_b = th.base.mut_b;
+    }
+    vg_text_vec(fb, 68.0, ty, win.title, th.title_size, th.title_weight, ink_r, ink_g, ink_b, 255);
+}
+
+// Drop shadow, frosted glass body, rounded titlebar, traffic lights, title text.
+fn wm_paint_chrome(wm: *WmState, fb: *SoftFb, id: i32) void {
+    let win: RayWindow = wm_get(wm, id);
+    if (win.id < 0 || win.minimized == 1) { return; }
+    let th: RayOsTheme = wm.*.theme;
+
+    let ax: f32 = win.x as f32;
+    let ay: f32 = win.y as f32;
+    let aw: f32 = win.w as f32;
+    let ah: f32 = win.h as f32;
+    let rad: f32 = th.chrome_radius;
+
+    rayos_paint_shadow(fb, ax, ay, aw, ah, rad, th);
+
+    softgpu_blend_round_rect(
+        fb, win.x, win.y, win.w, win.h, rad as i32,
+        th.chrome_body_r, th.chrome_body_g, th.chrome_body_b, th.chrome_body_a,
+    );
+
+    let tb_h: f32 = th.titlebar_h as f32;
+    let tb_r: i32 = th.chrome_tb_r;
+    let tb_g: i32 = th.chrome_tb_g;
+    let tb_b: i32 = th.chrome_tb_b;
+    if (win.focused == 1) {
+        tb_r = th.chrome_tb_focus_r;
+        tb_g = th.chrome_tb_focus_g;
+        tb_b = th.chrome_tb_focus_b;
+    }
+    softgpu_blend_round_rect_vgrad(
+        fb, win.x, win.y, win.w, th.titlebar_h, rad as i32,
+        tb_r, tb_g, tb_b,
+        th.chrome_body_r, th.chrome_body_g, th.chrome_body_b,
+        th.chrome_tb_a,
+    );
+
+    // Border as four 1px strips inset past the rounded corners — a stroked
+    // rounded-rect path costs ~85ms through the coverage rasterizer (its fill
+    // bbox is the whole window); the strips are effectively free.
+    let ri: i32 = rad as i32;
+    let bw2: i32 = win.w - ri * 2;
+    let bh2: i32 = win.h - ri * 2;
+    softgpu_blend_rect(fb, win.x + ri, win.y, bw2, 1,
+        th.chrome_border_r, th.chrome_border_g, th.chrome_border_b, th.chrome_border_a);
+    softgpu_blend_rect(fb, win.x + ri, win.y + win.h - 1, bw2, 1,
+        th.chrome_border_r, th.chrome_border_g, th.chrome_border_b, th.chrome_border_a);
+    softgpu_blend_rect(fb, win.x, win.y + ri, 1, bh2,
+        th.chrome_border_r, th.chrome_border_g, th.chrome_border_b, th.chrome_border_a);
+    softgpu_blend_rect(fb, win.x + win.w - 1, win.y + ri, 1, bh2,
+        th.chrome_border_r, th.chrome_border_g, th.chrome_border_b, th.chrome_border_a);
+
+    // titlebar separator
+    softgpu_blend_rect(fb, win.x + 8, win.y + th.titlebar_h, win.w - 16, 1,
+        th.chrome_border_r, th.chrome_border_g, th.chrome_border_b, 50);
+
+    let ty: f32 = ay + (tb_h - th.title_size) * 0.5;
+    wm_paint_traffic_light(fb, ax + 14.0, ay + tb_h * 0.5, th.traffic_r, th.tl_close_r, th.tl_close_g, th.tl_close_b, 0);
+    wm_paint_traffic_light(fb, ax + 32.0, ay + tb_h * 0.5, th.traffic_r, th.tl_min_r, th.tl_min_g, th.tl_min_b, 1);
+    wm_paint_traffic_light(fb, ax + 50.0, ay + tb_h * 0.5, th.traffic_r, th.tl_max_r, th.tl_max_g, th.tl_max_b, 2);
+
+    let title_x: f32 = ax + 68.0;
+    let ink_r: i32 = th.base.ink_r;
+    let ink_g: i32 = th.base.ink_g;
+    let ink_b: i32 = th.base.ink_b;
+    if (win.focused == 0) {
+        ink_r = th.base.mut_r;
+        ink_g = th.base.mut_g;
+        ink_b = th.base.mut_b;
+    }
+    vg_text_vec(
+        fb,
+        title_x,
+        ty,
+        win.title,
+        th.title_size,
+        th.title_weight,
+        ink_r,
+        ink_g,
+        ink_b,
+        255,
+    );
+}
+
+fn wm_icon_generic() i32   { return 0; }
+fn wm_icon_terminal() i32  { return 1; }
+fn wm_icon_settings() i32 { return 2; }
+fn wm_icon_linux() i32     { return 3; }
+fn wm_icon_windows() i32   { return 4; }
+fn wm_icon_files() i32     { return 5; }
+fn wm_icon_home() i32      { return 6; }
+fn wm_icon_browser() i32   { return 7; }
+fn wm_icon_trash() i32     { return 8; }
+
+fn wm_window_icon(win: RayWindow) i32 {
+    if (win.content_kind == wm_content_guest()) {
+        if (win.guest_id == 2) { return wm_icon_windows(); }
+        return wm_icon_linux();
+    }
+    if (win.guest_id == 0 && win.fb_offset > 0) { return wm_icon_settings(); }
+    return wm_icon_terminal();
+}
+
+// Vector app icons. Every glyph is drawn in units of `size` so the same
+// artwork reads at 20px taskbar buttons and 48px launcher tiles.
+fn wm_paint_taskbar_icon(fb: *SoftFb, icon: i32, x: f32, y: f32, size: f32, th: RayOsTheme) void {
+    let s: f32 = size;
+    let lw: f32 = s * 0.07;
+    if (lw < 1.2) { lw = 1.2; }
+    let corner: f32 = s * 0.2;
+
+    // plate
+    let rr: i32 = th.base.acc2_r;
+    let rg: i32 = th.base.acc2_g;
+    let rb: i32 = th.base.acc2_b;
+    if (icon == wm_icon_terminal()) { rr = 22; rg = 34; rb = 40; }
+    if (icon == wm_icon_settings()) { rr = 96; rg = 104; rb = 132; }
+    if (icon == wm_icon_linux()) { rr = 235; rg = 180; rb = 40; }
+    if (icon == wm_icon_windows()) { rr = 36; rg = 120; rb = 210; }
+    if (icon == wm_icon_files()) { rr = 245; rg = 158; rb = 44; }
+    if (icon == wm_icon_home()) { rr = 122; rg = 88; rb = 235; }
+    if (icon == wm_icon_browser()) { rr = 26; rg = 150; rb = 180; }
+    if (icon == wm_icon_trash()) { rr = 108; rg = 116; rb = 140; }
+    let box: VPath = vg_path_new();
+    vg_rounded_rect(&box, x, y, s, s, corner);
+    vg_fill(fb, &box, rr, rg, rb, 255);
+    let shine: VPath = vg_path_new();
+    vg_rounded_rect(&shine, x, y, s, s * 0.5, corner);
+    vg_fill(fb, &shine, 255, 255, 255, 26);
+
+    if (icon == wm_icon_terminal()) {
+        // prompt chevron + cursor
+        let c0: VPath = vg_path_new();
+        vg_move_to(&c0, x + s * 0.22, y + s * 0.3);
+        vg_line_to(&c0, x + s * 0.42, y + s * 0.5);
+        vg_line_to(&c0, x + s * 0.22, y + s * 0.7);
+        vg_stroke(fb, &c0, lw * 1.3, 92, 255, 160, 255);
+        let cur: VPath = vg_path_new();
+        vg_move_to(&cur, x + s * 0.52, y + s * 0.7);
+        vg_line_to(&cur, x + s * 0.78, y + s * 0.7);
+        vg_stroke(fb, &cur, lw * 1.3, 220, 235, 230, 255);
+        return;
+    }
+    if (icon == wm_icon_files()) {
+        // folder: back tab + front body
+        let tab: VPath = vg_path_new();
+        vg_rounded_rect(&tab, x + s * 0.18, y + s * 0.24, s * 0.34, s * 0.18, s * 0.05);
+        vg_fill(fb, &tab, 255, 224, 130, 255);
+        let body: VPath = vg_path_new();
+        vg_rounded_rect(&body, x + s * 0.16, y + s * 0.34, s * 0.68, s * 0.42, s * 0.07);
+        vg_fill(fb, &body, 255, 236, 170, 255);
+        let crease: VPath = vg_path_new();
+        vg_move_to(&crease, x + s * 0.16, y + s * 0.45);
+        vg_line_to(&crease, x + s * 0.84, y + s * 0.45);
+        vg_stroke(fb, &crease, lw * 0.8, 214, 158, 40, 200);
+        return;
+    }
+    if (icon == wm_icon_home()) {
+        // roof + body + door
+        let roof: VPath = vg_path_new();
+        vg_move_to(&roof, x + s * 0.16, y + s * 0.5);
+        vg_line_to(&roof, x + s * 0.5, y + s * 0.2);
+        vg_line_to(&roof, x + s * 0.84, y + s * 0.5);
+        vg_stroke(fb, &roof, lw * 1.4, 255, 255, 255, 240);
+        let bodyh: VPath = vg_path_new();
+        vg_rounded_rect(&bodyh, x + s * 0.26, y + s * 0.48, s * 0.48, s * 0.32, s * 0.04);
+        vg_fill(fb, &bodyh, 255, 255, 255, 235);
+        let door: VPath = vg_path_new();
+        vg_rounded_rect(&door, x + s * 0.44, y + s * 0.58, s * 0.12, s * 0.22, s * 0.03);
+        vg_fill(fb, &door, rr, rg, rb, 255);
+        return;
+    }
+    if (icon == wm_icon_trash()) {
+        // lid + can with slats
+        let lid: VPath = vg_path_new();
+        vg_move_to(&lid, x + s * 0.24, y + s * 0.3);
+        vg_line_to(&lid, x + s * 0.76, y + s * 0.3);
+        vg_stroke(fb, &lid, lw * 1.3, 235, 238, 245, 240);
+        let handle: VPath = vg_path_new();
+        vg_move_to(&handle, x + s * 0.42, y + s * 0.3);
+        vg_line_to(&handle, x + s * 0.45, y + s * 0.22);
+        vg_line_to(&handle, x + s * 0.55, y + s * 0.22);
+        vg_line_to(&handle, x + s * 0.58, y + s * 0.3);
+        vg_stroke(fb, &handle, lw, 235, 238, 245, 240);
+        let can: VPath = vg_path_new();
+        vg_rounded_rect(&can, x + s * 0.3, y + s * 0.36, s * 0.4, s * 0.42, s * 0.06);
+        vg_fill(fb, &can, 235, 238, 245, 235);
+        let s1: VPath = vg_path_new();
+        vg_move_to(&s1, x + s * 0.42, y + s * 0.42);
+        vg_line_to(&s1, x + s * 0.42, y + s * 0.72);
+        vg_stroke(fb, &s1, lw * 0.8, rr, rg, rb, 255);
+        let s2: VPath = vg_path_new();
+        vg_move_to(&s2, x + s * 0.58, y + s * 0.42);
+        vg_line_to(&s2, x + s * 0.58, y + s * 0.72);
+        vg_stroke(fb, &s2, lw * 0.8, rr, rg, rb, 255);
+        return;
+    }
+    if (icon == wm_icon_settings()) {
+        // gear: ring + spokes + hub
+        let cx: f32 = x + s * 0.5;
+        let cy: f32 = y + s * 0.5;
+        let ring: VPath = vg_path_new();
+        vg_circle(&ring, cx, cy, s * 0.2);
+        vg_stroke(fb, &ring, lw * 1.6, 255, 255, 255, 240);
+        let t0: VPath = vg_path_new();
+        vg_move_to(&t0, cx, cy - s * 0.34);
+        vg_line_to(&t0, cx, cy - s * 0.22);
+        vg_stroke(fb, &t0, lw * 1.6, 255, 255, 255, 240);
+        let t1: VPath = vg_path_new();
+        vg_move_to(&t1, cx, cy + s * 0.22);
+        vg_line_to(&t1, cx, cy + s * 0.34);
+        vg_stroke(fb, &t1, lw * 1.6, 255, 255, 255, 240);
+        let t2: VPath = vg_path_new();
+        vg_move_to(&t2, cx - s * 0.34, cy);
+        vg_line_to(&t2, cx - s * 0.22, cy);
+        vg_stroke(fb, &t2, lw * 1.6, 255, 255, 255, 240);
+        let t3: VPath = vg_path_new();
+        vg_move_to(&t3, cx + s * 0.22, cy);
+        vg_line_to(&t3, cx + s * 0.34, cy);
+        vg_stroke(fb, &t3, lw * 1.6, 255, 255, 255, 240);
+        let t4: VPath = vg_path_new();
+        vg_move_to(&t4, cx - s * 0.24, cy - s * 0.24);
+        vg_line_to(&t4, cx - s * 0.16, cy - s * 0.16);
+        vg_stroke(fb, &t4, lw * 1.4, 255, 255, 255, 240);
+        let t5: VPath = vg_path_new();
+        vg_move_to(&t5, cx + s * 0.16, cy + s * 0.16);
+        vg_line_to(&t5, cx + s * 0.24, cy + s * 0.24);
+        vg_stroke(fb, &t5, lw * 1.4, 255, 255, 255, 240);
+        let t6: VPath = vg_path_new();
+        vg_move_to(&t6, cx + s * 0.24, cy - s * 0.24);
+        vg_line_to(&t6, cx + s * 0.16, cy - s * 0.16);
+        vg_stroke(fb, &t6, lw * 1.4, 255, 255, 255, 240);
+        let t7: VPath = vg_path_new();
+        vg_move_to(&t7, cx - s * 0.16, cy + s * 0.16);
+        vg_line_to(&t7, cx - s * 0.24, cy + s * 0.24);
+        vg_stroke(fb, &t7, lw * 1.4, 255, 255, 255, 240);
+        return;
+    }
+    if (icon == wm_icon_browser()) {
+        // globe: circle + equator + meridian
+        let cx: f32 = x + s * 0.5;
+        let cy: f32 = y + s * 0.5;
+        let rad: f32 = s * 0.28;
+        let globe: VPath = vg_path_new();
+        vg_circle(&globe, cx, cy, rad);
+        vg_stroke(fb, &globe, lw * 1.3, 255, 255, 255, 240);
+        let eq: VPath = vg_path_new();
+        vg_move_to(&eq, cx - rad, cy);
+        vg_line_to(&eq, cx + rad, cy);
+        vg_stroke(fb, &eq, lw, 255, 255, 255, 200);
+        let mer: VPath = vg_path_new();
+        vg_move_to(&mer, cx, cy - rad);
+        vg_line_to(&mer, cx - rad * 0.45, cy);
+        vg_line_to(&mer, cx, cy + rad);
+        vg_line_to(&mer, cx + rad * 0.45, cy);
+        vg_close(&mer);
+        vg_stroke(fb, &mer, lw * 0.9, 255, 255, 255, 200);
+        return;
+    }
+    if (icon == wm_icon_linux()) {
+        // guest VM: monitor + stand
+        let scr: VPath = vg_path_new();
+        vg_rounded_rect(&scr, x + s * 0.2, y + s * 0.24, s * 0.6, s * 0.4, s * 0.05);
+        vg_stroke(fb, &scr, lw * 1.3, 40, 34, 8, 240);
+        let inner: VPath = vg_path_new();
+        vg_rounded_rect(&inner, x + s * 0.26, y + s * 0.3, s * 0.48, s * 0.28, s * 0.03);
+        vg_fill(fb, &inner, 40, 34, 8, 210);
+        let stand: VPath = vg_path_new();
+        vg_move_to(&stand, x + s * 0.5, y + s * 0.64);
+        vg_line_to(&stand, x + s * 0.5, y + s * 0.74);
+        vg_stroke(fb, &stand, lw * 1.3, 40, 34, 8, 240);
+        let foot: VPath = vg_path_new();
+        vg_move_to(&foot, x + s * 0.36, y + s * 0.76);
+        vg_line_to(&foot, x + s * 0.64, y + s * 0.76);
+        vg_stroke(fb, &foot, lw * 1.3, 40, 34, 8, 240);
+        return;
+    }
+    if (icon == wm_icon_windows()) {
+        // four panes
+        let vsep: VPath = vg_path_new();
+        vg_move_to(&vsep, x + s * 0.5, y + s * 0.22);
+        vg_line_to(&vsep, x + s * 0.5, y + s * 0.78);
+        vg_stroke(fb, &vsep, lw * 1.4, 255, 255, 255, 235);
+        let hsep: VPath = vg_path_new();
+        vg_move_to(&hsep, x + s * 0.22, y + s * 0.5);
+        vg_line_to(&hsep, x + s * 0.78, y + s * 0.5);
+        vg_stroke(fb, &hsep, lw * 1.4, 255, 255, 255, 235);
+        let frame: VPath = vg_path_new();
+        vg_rounded_rect(&frame, x + s * 0.22, y + s * 0.22, s * 0.56, s * 0.56, s * 0.04);
+        vg_stroke(fb, &frame, lw * 1.4, 255, 255, 255, 235);
+        return;
+    }
+    // generic: app dot grid
+    let d: f32 = s * 0.09;
+    let g0: VPath = vg_path_new();
+    vg_circle(&g0, x + s * 0.36, y + s * 0.36, d);
+    vg_fill(fb, &g0, 255, 255, 255, 235);
+    let g1: VPath = vg_path_new();
+    vg_circle(&g1, x + s * 0.64, y + s * 0.36, d);
+    vg_fill(fb, &g1, 255, 255, 255, 235);
+    let g2: VPath = vg_path_new();
+    vg_circle(&g2, x + s * 0.36, y + s * 0.64, d);
+    vg_fill(fb, &g2, 255, 255, 255, 235);
+    let g3: VPath = vg_path_new();
+    vg_circle(&g3, x + s * 0.64, y + s * 0.64, d);
+    vg_fill(fb, &g3, 255, 255, 255, 235);
+}
+
+fn wm_count_visible(wm: *WmState) i32 {
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[RayWindow](wm.*.windows)) {
+        let w: RayWindow = get[RayWindow](wm.*.windows, i);
+        if (w.minimized == 0) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}

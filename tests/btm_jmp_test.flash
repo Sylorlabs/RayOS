@@ -1,0 +1,41 @@
+// btm_jmp_test.flash — EB FE rel8 loop at GPA: PC stays at loop head after step
+
+@import("../core/init.flash")
+@import("../driver/virtio_block_mmio_nop.flash")
+@import("../driver/virtio_gpu_mmio_nop.flash")
+
+fn test_fail(msg: []u8) void {
+    _zag_print("btm_jmp_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn test_expect_u64(got: u64, want: u64, msg: []u8) void {
+    if (got != want) { test_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("btm_jmp_test: running");
+
+    let gpa: i32 = 4096;
+    let ram: ArrayList[u8] = guest_ram_new(8192);
+    set[u8](&ram, gpa, 235);
+    set[u8](&ram, gpa + 1, 254);
+
+    let hv: *BinaryTranslationMatrix = btm_new();
+    btm_attach_guest(hv, GuestArch.X86_64);
+    btm_bind_guest_ram(hv, &ram);
+    grf_set(&hv.*.guest, GuestRegId.Pc, gpa as u64);
+
+    let code: []u8 = guest_ram_slice(ram, 0, len[u8](ram));
+    let step: i32 = btm_step(hv, code);
+    if (step != 2) { test_fail("btm_step EB FE len"); }
+
+    test_expect_u64(btm_guest_pc(hv.*), gpa as u64, "pc at loop head after EB FE");
+
+    free[u8](&ram);
+    btm_free(hv);
+
+    _zag_println("btm_jmp_test: ok");
+    return 0;
+}

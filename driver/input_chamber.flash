@@ -1,0 +1,122 @@
+// driver/input_chamber.flash — native input from MMIO ring buffer (no file IPC).
+//
+// Ring layout at RAYOS_INPUT_MMIO_BASE:
+//   head/tail (i32), capacity (i32), events[64] of {kind, x, y, btn}.
+//
+//   @import("input_chamber.flash")
+//   input_chamber_init();
+//   let got: i32 = input_chamber_poll(&mx, &my, &btn);
+//   input_chamber_inject(640, 400, 1);   // simulator / test injection
+
+@import("../core/constants.flash")
+@import("hw_rt.flash")
+
+fn INPUT_REG_HEAD() i32 { return 0; }
+fn INPUT_REG_TAIL() i32 { return 4; }
+fn INPUT_REG_CAPACITY() i32 { return 8; }
+fn INPUT_EVENT_BASE() i32 { return 12; }
+fn INPUT_EVENT_STRIDE() i32 { return 16; }
+fn INPUT_RING_CAPACITY() i32 { return 64; }
+
+fn INPUT_KIND_MOVE() i32 { return 0; }
+fn INPUT_KIND_BUTTON() i32 { return 1; }
+// key events reuse the ring slots: x = key code, btn = 1 down / 0 up.
+// Codes: ASCII 32..126 printable, 8 backspace, 9 tab, 10 enter, 27 escape,
+// 128..131 left/right/up/down.
+fn INPUT_KIND_KEY() i32 { return 2; }
+
+fn input_chamber_base() i64 {
+    return (RAYOS_INPUT_MMIO_BASE() as i64);
+}
+
+fn input_chamber_event_addr(idx: i32) i64 {
+    let base: i64 = input_chamber_base();
+    let off: i64 = (INPUT_EVENT_BASE() + idx * INPUT_EVENT_STRIDE()) as i64;
+    return base + off;
+}
+
+fn input_chamber_ring_index(idx: i32, cap: i32) i32 {
+    if (cap < 1) { return 0; }
+    return idx % cap;
+}
+
+fn input_chamber_init() i32 {
+    if (hw_rt_init() != 0) { return 0 - 1; }
+    let base: i64 = input_chamber_base();
+    mmio_write32(base + (INPUT_REG_HEAD() as i64), 0);
+    mmio_write32(base + (INPUT_REG_TAIL() as i64), 0);
+    mmio_write32(base + (INPUT_REG_CAPACITY() as i64), (INPUT_RING_CAPACITY() as i32));
+    return 0;
+}
+
+fn input_chamber_ensure() i32 {
+    if (hw_rt_ensure() != 0) { return 0 - 1; }
+    let base: i64 = input_chamber_base();
+    let cap: i32 = mmio_read32(base + (INPUT_REG_CAPACITY() as i64));
+    if (cap != (INPUT_RING_CAPACITY() as i32)) {
+        return input_chamber_init();
+    }
+    return 0;
+}
+
+fn input_chamber_queue_len(head: i32, tail: i32, cap: i32) i32 {
+    if (tail >= head) { return tail - head; }
+    return cap - head + tail;
+}
+
+fn input_chamber_push_event(kind: i32, x: i32, y: i32, btn: i32) i32 {
+    if (input_chamber_ensure() != 0) { return 0 - 1; }
+    let base: i64 = input_chamber_base();
+    let cap: i32 = mmio_read32(base + (INPUT_REG_CAPACITY() as i64));
+    if (cap < 1) { return 0 - 2; }
+    let head: i32 = mmio_read32(base + (INPUT_REG_HEAD() as i64));
+    let tail: i32 = mmio_read32(base + (INPUT_REG_TAIL() as i64));
+    if (input_chamber_queue_len(head, tail, cap) >= cap) { return 0 - 3; }
+
+    let slot: i32 = input_chamber_ring_index(tail, cap);
+    let ev: i64 = input_chamber_event_addr(slot);
+    mmio_write32(ev + 0, kind);
+    mmio_write32(ev + 4, x);
+    mmio_write32(ev + 8, y);
+    mmio_write32(ev + 12, btn);
+    let next: i32 = input_chamber_ring_index(tail + 1, cap);
+    mmio_write32(base + (INPUT_REG_TAIL() as i64), next);
+    hw_fence();
+    return 0;
+}
+
+fn input_chamber_poll_ev(kind: *i32, mx: *i32, my: *i32, btn: *i32) i32 {
+    if (input_chamber_ensure() != 0) { return 0; }
+    let base: i64 = input_chamber_base();
+    let cap: i32 = mmio_read32(base + (INPUT_REG_CAPACITY() as i64));
+    if (cap < 1) { return 0; }
+    let head: i32 = mmio_read32(base + (INPUT_REG_HEAD() as i64));
+    let tail: i32 = mmio_read32(base + (INPUT_REG_TAIL() as i64));
+    if (head == tail) { return 0; }
+
+    let slot: i32 = input_chamber_ring_index(head, cap);
+    let ev: i64 = input_chamber_event_addr(slot);
+    kind.* = mmio_read32(ev + 0);
+    mx.* = mmio_read32(ev + 4);
+    my.* = mmio_read32(ev + 8);
+    btn.* = mmio_read32(ev + 12);
+    let next: i32 = input_chamber_ring_index(head + 1, cap);
+    mmio_write32(base + (INPUT_REG_HEAD() as i64), next);
+    hw_fence();
+    return 1;
+}
+
+fn input_chamber_poll(mx: *i32, my: *i32, btn: *i32) i32 {
+    let kind: i32 = 0;
+    return input_chamber_poll_ev(&kind, mx, my, btn);
+}
+
+fn input_chamber_inject_ev(kind: i32, x: i32, y: i32, btn: i32) void {
+    let _rc: i32 = input_chamber_push_event(kind, x, y, btn);
+}
+
+fn input_chamber_inject(x: i32, y: i32, btn: i32) void {
+    let kind: i32 = (INPUT_KIND_MOVE() as i32);
+    if (btn != 0) { kind = (INPUT_KIND_BUTTON() as i32); }
+    let _rc: i32 = input_chamber_push_event(kind, x, y, btn);
+}

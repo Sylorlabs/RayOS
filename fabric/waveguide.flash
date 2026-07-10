@@ -1,0 +1,308 @@
+// waveguide.zag — GeSn waveguide path descriptors and slot allocation
+//
+// RayOS routes balanced-ternary photonic streams through germanium-tin (GeSn)
+// waveguides carved into the passive switchboard.  Once a path slot is
+// allocated and latched, data flows continuously — no kernel, no interrupts.
+//
+//   @import("waveguide.flash")
+//   let pool: WaveguidePool = wg_pool_new();
+//   let slot: i32 = wg_allocate_path(&pool, 0, 7, 3);
+
+// ── GeSn material / polarization ────────────────────────────────────────────
+
+enum GeSnPolarization {
+    TE,
+    TM,
+    Balanced,   // native balanced-ternary polarization triplet
+}
+
+enum WaveguideState {
+    Free,
+    Reserved,
+    Latched,    // passive switchboard committed; photons flowing
+}
+
+// ── coordinate helpers (8×8 chamber grid, flash lattice pattern) ─────────────
+
+struct ChamberCoord {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+fn chamber_coord(x: i32, y: i32, z: i32) ChamberCoord {
+    return ChamberCoord{ .x = x, .y = y, .z = z };
+}
+
+fn chamber_in_bounds(c: ChamberCoord) i32 {
+    if (c.x < 0 || c.x >= (RAYOS_CHAMBER_GRID_W() as i32)) { return 0; }
+    if (c.y < 0 || c.y >= (RAYOS_CHAMBER_GRID_H() as i32)) { return 0; }
+    if (c.z < 0 || c.z >= (RAYOS_CHAMBER_GRID_D() as i32)) { return 0; }
+    return 1;
+}
+
+fn chamber_linear_index(c: ChamberCoord) i32 {
+    let w: i32 = (RAYOS_CHAMBER_GRID_W() as i32);
+    let h: i32 = (RAYOS_CHAMBER_GRID_H() as i32);
+    return c.z * w * h + c.y * w + c.x;
+}
+
+fn chamber_from_linear(idx: i32) ChamberCoord {
+    let w: i32 = (RAYOS_CHAMBER_GRID_W() as i32);
+    let h: i32 = (RAYOS_CHAMBER_GRID_H() as i32);
+    let plane: i32 = w * h;
+    let z: i32 = idx / plane;
+    let rem: i32 = idx - z * plane;
+    let y: i32 = rem / w;
+    let x: i32 = rem - y * w;
+    return ChamberCoord{ .x = x, .y = y, .z = z };
+}
+
+fn chamber_id_valid(id: i32) i32 {
+    if (id >= 0) {
+        if (id < (RAYOS_CHAMBER_COUNT() as i32)) { return 1; }
+    }
+    return 0;
+}
+
+fn wdm_channel_valid(ch: i32) i32 {
+    if (ch >= 0) {
+        if (ch < (RAYOS_WDM_CHANNELS() as i32)) { return 1; }
+    }
+    return 0;
+}
+
+fn wdm_channel_freq_ghz(ch: i32) i32 {
+    if (wdm_channel_valid(ch) == 0) { return 0; }
+    return (RAYOS_BASE_FREQ_GHZ() as i32) + ch * (RAYOS_WDM_SPACING_GHZ() as i32);
+}
+
+// ── GeSn path descriptor ────────────────────────────────────────────────────
+
+struct GeSnWaveguide {
+    slot_id:          i32,
+    state:            WaveguideState,
+    polarization:     GeSnPolarization,
+    src_chamber:      i32,
+    dst_chamber:      i32,
+    channel_id:       i32,
+    ge_fraction_x10:  i32,   // Ge:Sn ratio × 10 (e.g. 85 = 8.5% Sn)
+    width_nm:         i32,
+    depth_nm:         i32,
+    bend_radius_um:   i32,
+    length_um:        i32,
+    bend_count:       i32,
+    insertion_loss_db_x10: i32,
+    latched:          i32,   // 1 when passive switchboard crossbar set
+}
+
+struct WaveguidePool {
+    paths:     *GeSnWaveguide,
+    slot_count: i32,
+    allocated:  i32,
+    latched:    i32,
+}
+
+struct PathAllocationResult {
+    slot_id: i32,
+    loss_db_x10: i32,
+}
+
+// ── path geometry / loss model ────────────────────────────────────────────────
+
+fn wg_manhattan_chambers(src: i32, dst: i32) i32 {
+    if (chamber_id_valid(src) == 0 || chamber_id_valid(dst) == 0) { return 0; }
+    let a: ChamberCoord = chamber_from_linear(src);
+    let b: ChamberCoord = chamber_from_linear(dst);
+    let dx: i32 = a.x - b.x;
+    if (dx < 0) { dx = 0 - dx; }
+    let dy: i32 = a.y - b.y;
+    if (dy < 0) { dy = 0 - dy; }
+    let dz: i32 = a.z - b.z;
+    if (dz < 0) { dz = 0 - dz; }
+    return dx + dy + dz;
+}
+
+fn wg_estimate_length_um(hop_count: i32) i32 {
+    // 30 mm chamber pitch (flash lattice) + 5 mm inter-chamber guide run
+    let chamber_pitch_um: i32 = 30000;
+    let inter_run_um: i32 = 5000;
+    if (hop_count < 1) { return chamber_pitch_um / 10; }
+    return hop_count * inter_run_um + chamber_pitch_um / 10;
+}
+
+fn wg_estimate_bends(hop_count: i32) i32 {
+    if (hop_count <= 1) { return 0; }
+    return hop_count - 1;
+}
+
+fn wg_compute_loss_db_x10(length_um: i32, bend_count: i32) i32 {
+    // GeSn: ~0.3 dB/cm propagation + 0.05 dB per 90° bend (×10 fixed-point)
+    let prop: i32 = (length_um * 3) / 1000;
+    let bend: i32 = bend_count * 5;
+    return prop + bend;
+}
+
+fn wg_trit_lane_valid(lane_trit: i8) i32 {
+    if (lane_trit == (PHASE_NEG() as i8)) { return 1; }
+    if (lane_trit == (PHASE_ZERO() as i8)) { return 1; }
+    if (lane_trit == (PHASE_POS() as i8)) { return 1; }
+    return 0;
+}
+
+fn wg_balance_channel_offset(base_ch: i32, trit_offset: i8) i32 {
+    let raw: i32 = base_ch as i32 + trit_offset as i32;
+    let ch: i32 = raw;
+    if (raw > 1) { ch = raw - 3; }
+    if (raw < 0 - 1) { ch = raw + 3; }
+    if (ch < 0) { ch = 0; }
+    if (ch >= (RAYOS_WDM_CHANNELS() as i32)) { ch = (RAYOS_WDM_CHANNELS() as i32) - 1; }
+    return ch;
+}
+
+// ── pool lifecycle ──────────────────────────────────────────────────────────
+
+fn wg_empty_guide() GeSnWaveguide {
+    return GeSnWaveguide{
+        .slot_id               = 0 - 1,
+        .state                 = WaveguideState.Free,
+        .polarization          = GeSnPolarization.Balanced,
+        .src_chamber           = 0 - 1,
+        .dst_chamber           = 0 - 1,
+        .channel_id            = 0 - 1,
+        .ge_fraction_x10       = 85,
+        .width_nm              = 450,
+        .depth_nm              = 220,
+        .bend_radius_um        = 50,
+        .length_um             = 0,
+        .bend_count            = 0,
+        .insertion_loss_db_x10 = 0,
+        .latched               = 0,
+    };
+}
+
+fn wg_pool_new() WaveguidePool {
+    let count: i32 = (RAYOS_WAVEGUIDE_SLOTS() as i32);
+    let raw: *i8 = _zag_malloc(count * @sizeOf[GeSnWaveguide]());
+    let paths: *GeSnWaveguide = raw as *GeSnWaveguide;
+    let i: i32 = 0;
+    while (i < count) {
+        let g: GeSnWaveguide = wg_empty_guide();
+        g.slot_id = i;
+        paths[i] = g;
+        i = i + 1;
+    }
+    return WaveguidePool{
+        .paths      = paths,
+        .slot_count = count,
+        .allocated  = 0,
+        .latched    = 0,
+    };
+}
+
+fn wg_pool_free(p: *WaveguidePool) void {
+    if (p.*.paths != null) {
+        _zag_free(p.*.paths as *i8);
+    }
+    p.*.paths = null as *GeSnWaveguide;
+    p.*.slot_count = 0;
+    p.*.allocated = 0;
+    p.*.latched = 0;
+}
+
+// ── allocation / release ────────────────────────────────────────────────────
+
+fn wg_find_free_slot(p: WaveguidePool) i32 {
+    let i: i32 = 0;
+    while (i < p.slot_count) {
+        if (p.paths[i].state == WaveguideState.Free) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn wg_allocate_path(
+    p: *WaveguidePool,
+    src_chamber: i32,
+    dst_chamber: i32,
+    channel_id: i32,
+) PathAllocationResult {
+    let fail: PathAllocationResult = PathAllocationResult{ .slot_id = 0 - 1, .loss_db_x10 = 0 };
+    if (chamber_id_valid(src_chamber) == 0 || chamber_id_valid(dst_chamber) == 0) { return fail; }
+    if (wdm_channel_valid(channel_id) == 0) { return fail; }
+    let slot: i32 = wg_find_free_slot(p.*);
+    if (slot < 0) { return fail; }
+
+    let hops: i32 = wg_manhattan_chambers(src_chamber, dst_chamber);
+    let length_um: i32 = wg_estimate_length_um(hops);
+    let bends: i32 = wg_estimate_bends(hops);
+    let loss: i32 = wg_compute_loss_db_x10(length_um, bends);
+
+    p.*.paths[slot] = GeSnWaveguide{
+        .slot_id               = slot,
+        .state                 = WaveguideState.Reserved,
+        .polarization          = GeSnPolarization.Balanced,
+        .src_chamber           = src_chamber,
+        .dst_chamber           = dst_chamber,
+        .channel_id            = channel_id,
+        .ge_fraction_x10       = 85,
+        .width_nm              = 450,
+        .depth_nm              = 220,
+        .bend_radius_um        = 50,
+        .length_um             = length_um,
+        .bend_count            = bends,
+        .insertion_loss_db_x10 = loss,
+        .latched               = 0,
+    };
+    p.*.allocated = p.*.allocated + 1;
+    return PathAllocationResult{ .slot_id = slot, .loss_db_x10 = loss };
+}
+
+fn wg_release_path(p: *WaveguidePool, slot_id: i32) i32 {
+    if (slot_id < 0 || slot_id >= p.*.slot_count) { return 0; }
+    if (p.*.paths[slot_id].state == WaveguideState.Free) { return 0; }
+    if (p.*.paths[slot_id].latched == 1) {
+        p.*.latched = p.*.latched - 1;
+    }
+    if (p.*.paths[slot_id].state != WaveguideState.Free) {
+        p.*.allocated = p.*.allocated - 1;
+    }
+    let g: GeSnWaveguide = wg_empty_guide();
+    g.slot_id = slot_id;
+    p.*.paths[slot_id] = g;
+    return 1;
+}
+
+fn wg_latch_path(p: *WaveguidePool, slot_id: i32) i32 {
+    if (slot_id < 0 || slot_id >= p.*.slot_count) { return 0; }
+    if (p.*.paths[slot_id].state != WaveguideState.Reserved) { return 0; }
+    p.*.paths[slot_id].state = WaveguideState.Latched;
+    p.*.paths[slot_id].latched = 1;
+    p.*.latched = p.*.latched + 1;
+    return 1;
+}
+
+fn wg_unlatch_path(p: *WaveguidePool, slot_id: i32) i32 {
+    if (slot_id < 0 || slot_id >= p.*.slot_count) { return 0; }
+    if (p.*.paths[slot_id].state != WaveguideState.Latched) { return 0; }
+    p.*.paths[slot_id].state = WaveguideState.Reserved;
+    p.*.paths[slot_id].latched = 0;
+    p.*.latched = p.*.latched - 1;
+    return 1;
+}
+
+fn wg_path_get(p: WaveguidePool, slot_id: i32) ?GeSnWaveguide {
+    if (slot_id < 0 || slot_id >= p.slot_count) { return null; }
+    if (p.paths[slot_id].state == WaveguideState.Free) { return null; }
+    return p.paths[slot_id];
+}
+
+fn wg_path_flowing(p: WaveguidePool, slot_id: i32) i32 {
+    if (slot_id < 0 || slot_id >= p.slot_count) { return 0; }
+    if (p.paths[slot_id].state == WaveguideState.Latched) { return 1; }
+    return 0;
+}
+
+fn wg_pool_summary(p: WaveguidePool) i32 {
+    return p.allocated;
+}

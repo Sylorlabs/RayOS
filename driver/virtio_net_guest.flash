@@ -1,0 +1,475 @@
+// driver/virtio_net_guest.flash — virtio-mmio net device on guest GPA (Wave 4).
+//
+// Guest physical window at GPA_VIRTIO_NET_BASE (0x10002000), 4 KiB.  guest_ram
+// traps MMIO via guest_ram_mmio_trap and forwards offsets into
+// virtio_net_guest_mmio_read32 / virtio_net_guest_mmio_write32.  On queue notify
+// the device injects one RX packet "RAYOS\n" into the guest-provided buffer.
+//
+// Import chain (no @import here — splice from test / init entry):
+//   @import("virtio_net_guest.flash")
+
+fn VIRTIO_NET_GUEST_MAGIC() i32 { return 1196578134; }        // "VTNT"
+
+fn VIRTIO_NET_MMIO_MAGIC_VALUE() i32 { return 1952805748; }   // 0x74726976 "virt"
+fn VIRTIO_NET_MMIO_VERSION() i32 { return 2; }
+fn VIRTIO_NET_MMIO_VENDOR_ID() i32 { return 1381259075; }     // "RAYO"
+fn VIRTIO_NET_MMIO_DEVICE_ID_NET() i32 { return 1; }
+
+fn VIRTIO_NET_MMIO_MAGIC() i32 { return 0; }
+fn VIRTIO_NET_MMIO_VERSION_REG() i32 { return 4; }
+fn VIRTIO_NET_MMIO_DEVICE_ID() i32 { return 8; }
+fn VIRTIO_NET_MMIO_VENDOR_ID_REG() i32 { return 12; }
+fn VIRTIO_NET_MMIO_DEVICE_FEATURES() i32 { return 16; }
+fn VIRTIO_NET_MMIO_DEVICE_FEATURES_SEL() i32 { return 20; }
+fn VIRTIO_NET_MMIO_DRIVER_FEATURES() i32 { return 32; }
+fn VIRTIO_NET_MMIO_DRIVER_FEATURES_SEL() i32 { return 36; }
+fn VIRTIO_NET_MMIO_QUEUE_SEL() i32 { return 40; }
+fn VIRTIO_NET_MMIO_QUEUE_NUM_MAX() i32 { return 44; }
+fn VIRTIO_NET_MMIO_QUEUE_NUM() i32 { return 48; }
+fn VIRTIO_NET_MMIO_QUEUE_READY() i32 { return 52; }
+fn VIRTIO_NET_MMIO_QUEUE_NOTIFY() i32 { return 56; }
+fn VIRTIO_NET_MMIO_INTERRUPT_STATUS() i32 { return 68; }
+fn VIRTIO_NET_MMIO_INTERRUPT_ACK() i32 { return 72; }
+fn VIRTIO_NET_MMIO_STATUS() i32 { return 80; }
+fn VIRTIO_NET_MMIO_QUEUE_DESC_LOW() i32 { return 96; }
+fn VIRTIO_NET_MMIO_QUEUE_DESC_HIGH() i32 { return 100; }
+fn VIRTIO_NET_MMIO_QUEUE_DRIVER_LOW() i32 { return 112; }
+fn VIRTIO_NET_MMIO_QUEUE_DRIVER_HIGH() i32 { return 116; }
+fn VIRTIO_NET_MMIO_QUEUE_DEVICE_LOW() i32 { return 128; }
+fn VIRTIO_NET_MMIO_QUEUE_DEVICE_HIGH() i32 { return 132; }
+
+fn VIRTIO_NET_QUEUE_NUM_DEFAULT() i32 { return 8; }
+fn VIRTIO_NET_RX_PACKET_LEN() i32 { return 6; }               // "RAYOS\n"
+fn VIRTQ_NET_DESC_SIZE() i32 { return 16; }
+
+struct VirtioNetGuestState {
+    magic: i32,
+    pid: i64,
+    ready: i32,
+    guest_ram_ptr: i64,
+    queue_num: i32,
+    queue_ready: i32,
+    queue_desc_lo: i32,
+    queue_desc_hi: i32,
+    queue_driver_lo: i32,
+    queue_driver_hi: i32,
+    queue_device_lo: i32,
+    queue_device_hi: i32,
+    device_features_sel: i32,
+    driver_features_sel: i32,
+    driver_features: i32,
+    status: i32,
+    interrupt_status: i32,
+    avail_seen: i32,
+    used_idx: i32,
+}
+
+fn virtio_net_guest_cache_path() []u8 {
+    let pid: []u8 = _zag_i64_to_str(hw_rt_getpid());
+    return _zag_str_concat(_zag_str_concat("/tmp/rayos_virtio_net_guest.", pid), ".ptr");
+}
+
+fn virtio_net_guest_state_new() VirtioNetGuestState {
+    return VirtioNetGuestState{
+        .magic = (VIRTIO_NET_GUEST_MAGIC() as i32),
+        .pid = hw_rt_getpid(),
+        .ready = 0,
+        .guest_ram_ptr = 0,
+        .queue_num = (VIRTIO_NET_QUEUE_NUM_DEFAULT() as i32),
+        .queue_ready = 0,
+        .queue_desc_lo = 0,
+        .queue_desc_hi = 0,
+        .queue_driver_lo = 0,
+        .queue_driver_hi = 0,
+        .queue_device_lo = 0,
+        .queue_device_hi = 0,
+        .device_features_sel = 0,
+        .driver_features_sel = 0,
+        .driver_features = 0,
+        .status = 0,
+        .interrupt_status = 0,
+        .avail_seen = 0,
+        .used_idx = 0,
+    };
+}
+
+fn virtio_net_guest_state_from_cache() ?*VirtioNetGuestState {
+    let path: []u8 = virtio_net_guest_cache_path();
+    if (_zag_file_exists(path) == 0) { return null; }
+    let text: []u8 = _zag_read_file(path);
+    if (text.len < 1) { return null; }
+    let addr: i64 = _zag_str_to_i64(text);
+    if (addr == 0) { return null; }
+    let st: *VirtioNetGuestState = addr as *VirtioNetGuestState;
+    if (st.*.magic != (VIRTIO_NET_GUEST_MAGIC() as i32)) { return null; }
+    if (st.*.pid != hw_rt_getpid()) { return null; }
+    return st;
+}
+
+fn virtio_net_guest_state_to_cache(st: *VirtioNetGuestState) void {
+    let path: []u8 = virtio_net_guest_cache_path();
+    let text: []u8 = _zag_i64_to_str(st as i64);
+    _zag_write_file(path, text);
+}
+
+fn virtio_net_guest_state_mut() *VirtioNetGuestState {
+    if (virtio_net_guest_state_from_cache()) |cached| {
+        return cached;
+    }
+    let raw: *i8 = _zag_malloc(@sizeOf[VirtioNetGuestState]());
+    let st: *VirtioNetGuestState = raw as *VirtioNetGuestState;
+    st.* = virtio_net_guest_state_new();
+    virtio_net_guest_state_to_cache(st);
+    return st;
+}
+
+fn virtio_net_guest_gpa_in_window(gpa: i32) i32 {
+    let base: i32 = GPA_VIRTIO_NET_BASE();
+    let end: i32 = base + GPA_VIRTIO_MMIO_BYTES();
+    if (gpa < base) { return 0; }
+    if (gpa >= end) { return 0; }
+    return 1;
+}
+
+fn virtio_net_guest_ram_ptr() ?*ArrayList[u8] {
+    let st: *VirtioNetGuestState = virtio_net_guest_state_mut();
+    if (st.*.guest_ram_ptr == 0) { return null; }
+    return st.*.guest_ram_ptr as *ArrayList[u8];
+}
+
+fn virtio_net_guest_u32_lo(v: u64) i32 {
+    let acc: u64 = v;
+    while (acc >= 4294967296) {
+        acc = acc - 4294967296;
+    }
+    if (acc >= 2147483648) { return (acc - 4294967296) as i32; }
+    return acc as i32;
+}
+
+fn virtio_net_guest_u32_hi(v: u64) i32 {
+    let acc: u64 = v;
+    let hi: i64 = 0;
+    while (acc >= 4294967296) {
+        acc = acc - 4294967296;
+        hi = hi + 1;
+    }
+    return hi as i32;
+}
+
+fn virtio_net_guest_u64_from_parts(lo: i32, hi: i32) u64 {
+    let l: u64 = lo as u64;
+    if (lo < 0) { l = l + 4294967296; }
+    let h: u64 = hi as u64;
+    if (hi < 0) { h = h + 4294967296; }
+    let shifted: u64 = h;
+    let i: i32 = 0;
+    while (i < 32) {
+        shifted = shifted + shifted;
+        i = i + 1;
+    }
+    return shifted + l;
+}
+
+fn virtio_net_guest_ram_len() i32 {
+    if (virtio_net_guest_ram_ptr()) |ram| {
+        return len[u8](ram.*);
+    }
+    return 0;
+}
+
+fn virtio_net_guest_ram_gpa_ok(gpa: i32) i32 {
+    if (gpa < 0) { return 0; }
+    if (gpa >= virtio_net_guest_ram_len()) { return 0; }
+    return 1;
+}
+
+fn virtio_net_guest_ram_load8(gpa: i32) u8 {
+    if (virtio_net_guest_ram_gpa_ok(gpa) == 0) { return 0; }
+    if (virtio_net_guest_ram_ptr()) |ram| {
+        return get[u8](ram, gpa);
+    }
+    return 0;
+}
+
+fn virtio_net_guest_ram_store8(gpa: i32, val: u8) void {
+    if (virtio_net_guest_ram_gpa_ok(gpa) == 0) { return; }
+    if (virtio_net_guest_ram_ptr()) |ram| {
+        set[u8](ram, gpa, val);
+    }
+}
+
+fn virtio_net_guest_ram_load16_le(gpa: i32) i32 {
+    let b0: i32 = virtio_net_guest_ram_load8(gpa) as i32;
+    let b1: i32 = virtio_net_guest_ram_load8(gpa + 1) as i32;
+    return b0 + b1 * 256;
+}
+
+fn virtio_net_guest_ram_store16_le(gpa: i32, val: i32) void {
+    let pack: i32 = val;
+    if (pack < 0) { pack = pack + 65536; }
+    virtio_net_guest_ram_store8(gpa, (pack - (pack / 256) * 256) as u8);
+    virtio_net_guest_ram_store8(gpa + 1, (pack / 256) as u8);
+}
+
+fn virtio_net_guest_ram_load32_le(gpa: i32) i32 {
+    let out: i64 = 0;
+    let i: i32 = 0;
+    while (i < 4) {
+        let limb: i64 = virtio_net_guest_ram_load8(gpa + i) as i64;
+        let j: i32 = 0;
+        while (j < i) {
+            limb = limb * 256;
+            j = j + 1;
+        }
+        out = out + limb;
+        i = i + 1;
+    }
+    if (out >= 2147483648) { out = out - 4294967296; }
+    return out as i32;
+}
+
+fn virtio_net_guest_ram_store32_le(gpa: i32, val: i32) void {
+    let pack: i64 = val as i64;
+    if (pack < 0) { pack = pack + 4294967296; }
+    let shift: i64 = pack;
+    let i: i32 = 0;
+    while (i < 4) {
+        let limb: i64 = shift - ((shift / 256) * 256);
+        virtio_net_guest_ram_store8(gpa + i, limb as u8);
+        shift = shift / 256;
+        i = i + 1;
+    }
+}
+
+fn virtio_net_guest_flag_has(flags: i32, bit: i32) i32 {
+    let div: i32 = 1;
+    let i: i32 = 0;
+    while (i < bit) {
+        div = div * 2;
+        i = i + 1;
+    }
+    let shifted: i32 = flags / div;
+    if ((shifted - (shifted / 2) * 2) != 0) { return 1; }
+    return 0;
+}
+
+fn virtio_net_guest_queue_desc_gpa(st: *VirtioNetGuestState) u64 {
+    return virtio_net_guest_u64_from_parts(st.*.queue_desc_lo, st.*.queue_desc_hi);
+}
+
+fn virtio_net_guest_queue_driver_gpa(st: *VirtioNetGuestState) u64 {
+    return virtio_net_guest_u64_from_parts(st.*.queue_driver_lo, st.*.queue_driver_hi);
+}
+
+fn virtio_net_guest_queue_device_gpa(st: *VirtioNetGuestState) u64 {
+    return virtio_net_guest_u64_from_parts(st.*.queue_device_lo, st.*.queue_device_hi);
+}
+
+fn virtio_net_guest_rx_byte(idx: i32) u8 {
+    if (idx == 0) { return 82; }    // R
+    if (idx == 1) { return 65; }    // A
+    if (idx == 2) { return 89; }    // Y
+    if (idx == 3) { return 79; }    // O
+    if (idx == 4) { return 83; }    // S
+    if (idx == 5) { return 10; }    // \n
+    return 0;
+}
+
+fn virtio_net_guest_mmio_read32(gpa_off: i32) i32 {
+    if (gpa_off == VIRTIO_NET_MMIO_MAGIC()) {
+        return (VIRTIO_NET_MMIO_MAGIC_VALUE() as i32);
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_VERSION_REG()) {
+        return (VIRTIO_NET_MMIO_VERSION() as i32);
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_DEVICE_ID()) {
+        return (VIRTIO_NET_MMIO_DEVICE_ID_NET() as i32);
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_VENDOR_ID_REG()) {
+        return (VIRTIO_NET_MMIO_VENDOR_ID() as i32);
+    }
+    let st: *VirtioNetGuestState = virtio_net_guest_state_mut();
+    if (gpa_off == VIRTIO_NET_MMIO_DEVICE_FEATURES()) { return 0; }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_NUM_MAX()) {
+        return (VIRTIO_NET_QUEUE_NUM_DEFAULT() as i32);
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_NUM()) { return st.*.queue_num; }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_READY()) { return st.*.queue_ready; }
+    if (gpa_off == VIRTIO_NET_MMIO_INTERRUPT_STATUS()) { return st.*.interrupt_status; }
+    if (gpa_off == VIRTIO_NET_MMIO_STATUS()) { return st.*.status; }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_DESC_LOW()) { return st.*.queue_desc_lo; }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_DESC_HIGH()) { return st.*.queue_desc_hi; }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_DRIVER_LOW()) { return st.*.queue_driver_lo; }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_DRIVER_HIGH()) { return st.*.queue_driver_hi; }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_DEVICE_LOW()) { return st.*.queue_device_lo; }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_DEVICE_HIGH()) { return st.*.queue_device_hi; }
+    return 0;
+}
+
+fn virtio_net_guest_inject_rx(st: *VirtioNetGuestState, head: i32) i32 {
+    let desc_base: i32 = virtio_net_guest_queue_desc_gpa(st) as i32;
+    let data_gpa: i32 = 0 - 1;
+    let cur: i32 = head;
+    let guard: i32 = 0;
+    let chain_done: i32 = 0;
+    while (guard < 16) {
+        if (chain_done == 1) {
+            guard = 16;
+        } else {
+            let d_off: i32 = desc_base + cur * VIRTQ_NET_DESC_SIZE();
+            let addr_lo: i32 = virtio_net_guest_ram_load32_le(d_off);
+            let addr_hi: i32 = virtio_net_guest_ram_load32_le(d_off + 4);
+            let addr: i32 = virtio_net_guest_u64_from_parts(addr_lo, addr_hi) as i32;
+            let flags: i32 = virtio_net_guest_ram_load16_le(d_off + 12);
+            let next: i32 = virtio_net_guest_ram_load16_le(d_off + 14);
+            if (virtio_net_guest_flag_has(flags, 1) == 1) {
+                if (data_gpa < 0) { data_gpa = addr; }
+            }
+            if (virtio_net_guest_flag_has(flags, 0) == 0) {
+                chain_done = 1;
+            } else {
+                cur = next;
+            }
+            guard = guard + 1;
+        }
+    }
+    if (data_gpa < 0) { return 0 - 1; }
+    let i: i32 = 0;
+    while (i < (VIRTIO_NET_RX_PACKET_LEN() as i32)) {
+        virtio_net_guest_ram_store8(data_gpa + i, virtio_net_guest_rx_byte(i));
+        i = i + 1;
+    }
+    return (VIRTIO_NET_RX_PACKET_LEN() as i32);
+}
+
+fn virtio_net_guest_process_queue() i32 {
+    let st: *VirtioNetGuestState = virtio_net_guest_state_mut();
+    if (st.*.queue_ready == 0) { return 0 - 1; }
+    if (st.*.guest_ram_ptr == 0) { return 0 - 2; }
+    let driver_gpa: i32 = virtio_net_guest_queue_driver_gpa(st) as i32;
+    let device_gpa: i32 = virtio_net_guest_queue_device_gpa(st) as i32;
+    let avail_idx: i32 = virtio_net_guest_ram_load16_le(driver_gpa + 2);
+    let qn: i32 = st.*.queue_num;
+    if (qn < 1) { return 0 - 3; }
+    while (st.*.avail_seen < avail_idx) {
+        let slot: i32 = st.*.avail_seen - (st.*.avail_seen / qn) * qn;
+        let head: i32 = virtio_net_guest_ram_load16_le(driver_gpa + 4 + slot * 2);
+        let pkt_len: i32 = virtio_net_guest_inject_rx(st, head);
+        if (pkt_len < 0) { return pkt_len; }
+        let used_slot: i32 = st.*.used_idx - (st.*.used_idx / qn) * qn;
+        let used_ring: i32 = device_gpa + 4;
+        virtio_net_guest_ram_store32_le(used_ring + used_slot * 8, head as i32);
+        virtio_net_guest_ram_store32_le(used_ring + used_slot * 8 + 4, pkt_len);
+        st.*.used_idx = st.*.used_idx + 1;
+        virtio_net_guest_ram_store16_le(device_gpa + 2, st.*.used_idx);
+        st.*.avail_seen = st.*.avail_seen + 1;
+    }
+    st.*.interrupt_status = 1;
+    virtio_net_guest_state_to_cache(st);
+    return 0;
+}
+
+fn virtio_net_guest_mmio_write32(gpa_off: i32, val: i32) void {
+    let st: *VirtioNetGuestState = virtio_net_guest_state_mut();
+    if (gpa_off == VIRTIO_NET_MMIO_DEVICE_FEATURES_SEL()) {
+        st.*.device_features_sel = val;
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_DRIVER_FEATURES_SEL()) {
+        st.*.driver_features_sel = val;
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_DRIVER_FEATURES()) {
+        st.*.driver_features = val;
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_SEL()) {
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_NUM()) {
+        if (val > 0) {
+            if (val <= (VIRTIO_NET_QUEUE_NUM_DEFAULT() as i32)) {
+                st.*.queue_num = val;
+            }
+        }
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_READY()) {
+        st.*.queue_ready = val;
+        if (val == 0) {
+            st.*.avail_seen = 0;
+            st.*.used_idx = 0;
+        }
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_NOTIFY()) {
+        let _rc: i32 = virtio_net_guest_process_queue();
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_INTERRUPT_ACK()) {
+        st.*.interrupt_status = 0;
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_STATUS()) {
+        st.*.status = val;
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_DESC_LOW()) {
+        st.*.queue_desc_lo = val;
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_DESC_HIGH()) {
+        st.*.queue_desc_hi = val;
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_DRIVER_LOW()) {
+        st.*.queue_driver_lo = val;
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_DRIVER_HIGH()) {
+        st.*.queue_driver_hi = val;
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_DEVICE_LOW()) {
+        st.*.queue_device_lo = val;
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_NET_MMIO_QUEUE_DEVICE_HIGH()) {
+        st.*.queue_device_hi = val;
+        virtio_net_guest_state_to_cache(st);
+        return;
+    }
+}
+
+fn virtio_net_guest_init() i32 {
+    let raw: *i8 = _zag_malloc(@sizeOf[VirtioNetGuestState]());
+    let st: *VirtioNetGuestState = raw as *VirtioNetGuestState;
+    st.* = virtio_net_guest_state_new();
+    st.*.pid = hw_rt_getpid();
+    st.*.ready = 1;
+    st.*.queue_num = (VIRTIO_NET_QUEUE_NUM_DEFAULT() as i32);
+    st.*.avail_seen = 0;
+    st.*.used_idx = 0;
+    st.*.interrupt_status = 0;
+    virtio_net_guest_state_to_cache(st);
+    return 0;
+}
+
+fn virtio_net_guest_attach_guest_ram(guest_ram: *ArrayList[u8]) void {
+    let st: *VirtioNetGuestState = virtio_net_guest_state_mut();
+    st.*.guest_ram_ptr = guest_ram as i64;
+    virtio_net_guest_state_to_cache(st);
+}

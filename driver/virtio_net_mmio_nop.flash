@@ -1,0 +1,11 @@
+// driver/virtio_net_mmio_nop.flash — no-op virtio net MMIO for partial virtio builds.
+
+fn virtio_net_guest_mmio_read32(gpa_off: i32) i32 {
+    let _off: i32 = gpa_off;
+    return 0;
+}
+
+fn virtio_net_guest_mmio_write32(gpa_off: i32, val: i32) void {
+    let _off: i32 = gpa_off;
+    let _val: i32 = val;
+}

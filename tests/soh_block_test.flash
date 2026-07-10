@@ -1,0 +1,63 @@
+// soh_block_test.flash — SOH MMIO 512-byte block store round-trip.
+
+@import("../core/constants.flash")
+@import("../math/trit_core.flash")
+@import("../math/tekum.flash")
+@import("../math/offset_loop.flash")
+@import("../driver/hw_rt.flash")
+@import("../driver/soh_mmio.flash")
+@import("../storage/soh_block.flash")
+
+fn test_fail(msg: []u8) void {
+    _zag_print("soh_block_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn soh_block_make_boot_sector() ArrayList[u8] {
+    let sector: ArrayList[u8] = make[u8]((SOH_BLOCK_SIZE() as i32));
+    let i: i32 = 0;
+    while (i < (SOH_BLOCK_SIZE() as i32)) {
+        push[u8](&sector, 0);
+        i = i + 1;
+    }
+    set[u8](&sector, 0, 235);
+    set[u8](&sector, 1, 254);
+    set[u8](&sector, 2, 144);
+    set[u8](&sector, 3, 250);
+    set[u8](&sector, 510, 85);
+    set[u8](&sector, 511, 170);
+    return sector;
+}
+
+fn soh_block_expect_byte(buf: *ArrayList[u8], idx: i32, want: u8, msg: []u8) void {
+    if (get[u8](buf, idx) != want) { test_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("soh_block_test: running");
+
+    if (hw_rt_init() != 0) { test_fail("hw_rt_init"); }
+
+    let sector: ArrayList[u8] = soh_block_make_boot_sector();
+    if (soh_block_write((SOH_BLOCK_BOOT_ID() as i32), sector.data[0..(SOH_BLOCK_SIZE() as i32)]) != 0) {
+        test_fail("soh_block_write");
+    }
+
+    let out: ArrayList[u8] = make[u8](0);
+    if (soh_block_read((SOH_BLOCK_BOOT_ID() as i32), &out) != 0) { test_fail("soh_block_read"); }
+    if (len[u8](out) != (SOH_BLOCK_SIZE() as i32)) { test_fail("soh_block_read len"); }
+
+    soh_block_expect_byte(&out, 0, 235, "byte0");
+    soh_block_expect_byte(&out, 1, 254, "byte1");
+    soh_block_expect_byte(&out, 2, 144, "byte2");
+    soh_block_expect_byte(&out, 3, 250, "byte3");
+    soh_block_expect_byte(&out, 510, 85, "sig_lo");
+    soh_block_expect_byte(&out, 511, 170, "sig_hi");
+
+    free[u8](&sector);
+    free[u8](&out);
+
+    _zag_println("soh_block_test: ok");
+    return 0;
+}

@@ -1,0 +1,27 @@
+@import("../browser/html.flash")
+
+fn html_test_fail(msg: []u8) void {
+    _zag_print("html_parser_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn main() i32 {
+    _zag_println("html_parser_test: running");
+    let doc: HtmlDocument = html_parse(
+        "<!doctype html><html><body><h1>Ray Browser</h1><!--safe--><p>Native <b>Flash</b><br>DOM</p></body></html>",
+    );
+    if (doc.errors != 0) { html_test_fail("valid page errors"); }
+    if (html_count_kind(&doc, html_node_element()) != 6) { html_test_fail("element count"); }
+    if (html_count_kind(&doc, html_node_text()) != 4) { html_test_fail("text count"); }
+    if (html_equal_fold(get[HtmlNode](doc.nodes, 3).tag, "H1") != 1) { html_test_fail("case fold"); }
+    html_document_free(&doc);
+
+    let malformed: HtmlDocument = html_parse("<main><p>one</main></ghost>");
+    if (malformed.errors < 1) { html_test_fail("mismatched close recovery"); }
+    if (len[HtmlNode](malformed.nodes) < 3) { html_test_fail("recovered DOM"); }
+    html_document_free(&malformed);
+
+    _zag_println("html_parser_test: ok");
+    return 0;
+}

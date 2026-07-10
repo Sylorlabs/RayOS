@@ -1,0 +1,70 @@
+// btm_memory_test.flash — MOV imm/reg, PUSH/POP, XOR zero via guest_ram + btm_guest_reg
+
+@import("../core/init.flash")
+@import("../driver/virtio_block_mmio_nop.flash")
+@import("../driver/virtio_gpu_mmio_nop.flash")
+
+fn test_fail(msg: []u8) void {
+    _zag_print("btm_memory_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn test_expect_u64(got: u64, want: u64, msg: []u8) void {
+    if (got != want) { test_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("btm_memory_test: running");
+
+    let gpa: i32 = 4096;
+    let ram: ArrayList[u8] = guest_ram_new(16384);
+    let off: i32 = gpa;
+    set[u8](&ram, off, 184);
+    set[u8](&ram, off + 1, 120);
+    set[u8](&ram, off + 2, 86);
+    set[u8](&ram, off + 3, 52);
+    set[u8](&ram, off + 4, 18);
+    set[u8](&ram, off + 5, 80);
+    set[u8](&ram, off + 6, 51);
+    set[u8](&ram, off + 7, 192);
+    set[u8](&ram, off + 8, 91);
+    set[u8](&ram, off + 9, 49);
+    set[u8](&ram, off + 10, 201);
+
+    let hv: *BinaryTranslationMatrix = btm_new();
+    btm_attach_guest(hv, GuestArch.X86_64);
+    btm_bind_guest_ram(hv, &ram);
+    grf_set(&hv.*.guest, GuestRegId.Pc, gpa as u64);
+    grf_set(&hv.*.guest, GuestRegId.R4, 4096);
+
+    let code: []u8 = guest_ram_slice(ram, 0, len[u8](ram));
+
+    if (btm_step(hv, code) != 5) { test_fail("btm_step mov eax imm32"); }
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.R0), 305419896, "eax after mov imm32");
+
+    if (btm_step(hv, code) != 1) { test_fail("btm_step push eax"); }
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.R4), 4092, "esp after push");
+    test_expect_u64(
+        guest_ram_read32(&ram, 4092) as u64,
+        305419896,
+        "stack slot after push",
+    );
+
+    if (btm_step(hv, code) != 2) { test_fail("btm_step xor eax eax"); }
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.R0), 0, "eax zeroed by xor");
+
+    if (btm_step(hv, code) != 1) { test_fail("btm_step pop ebx"); }
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.R3), 305419896, "ebx restored by pop");
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.R4), 4096, "esp after pop");
+
+    if (btm_step(hv, code) != 2) { test_fail("btm_step xor ecx ecx"); }
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.R2), 0, "ecx zeroed by xor");
+    test_expect_u64(btm_guest_pc(hv.*), (gpa + 11) as u64, "pc after memory program");
+
+    free[u8](&ram);
+    btm_free(hv);
+
+    _zag_println("btm_memory_test: ok");
+    return 0;
+}

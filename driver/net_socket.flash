@@ -1,0 +1,357 @@
+// driver/net_socket.flash — TCP/UDP socket data plane + NIC network chamber.
+//
+// The network chamber (RAYOS_NET_MMIO_BASE) is the driver ABI on both
+// targets. Native RayOS: the NIC controller / on-chip TCP offload engine
+// services connect/send/recv and updates the link + byte counters here (the
+// same model a modern smart-NIC uses). Phase-1 host: the socket driver below
+// services the ops through host BSD sockets and publishes the identical
+// counters. Everything above this file (HTTP client, browser, terminal)
+// calls net_* and reads the chamber — one code path for both worlds.
+//
+// Chamber layout at RAYOS_NET_MMIO_BASE:
+//   +0  MAGIC "NETC"   +4 LINK_UP   +8 ACTIVE   +12 GENERATION
+//   +16 TX_BYTES (i64) +24 RX_BYTES (i64)   +32 LAST_ERR
+
+@import("../core/constants.flash")
+@import("hw_rt.flash")
+
+fn NET_CHAMBER_MAGIC() i32 { return 1313817411; }   // "NETC"
+
+// syscall numbers (x86-64)
+fn NET_SYS_READ() i64 { return 0; }
+fn NET_SYS_WRITE() i64 { return 1; }
+fn NET_SYS_CLOSE() i64 { return 3; }
+fn NET_SYS_SOCKET() i64 { return 41; }
+fn NET_SYS_CONNECT() i64 { return 42; }
+fn NET_SYS_SENDTO() i64 { return 44; }
+fn NET_SYS_RECVFROM() i64 { return 45; }
+fn NET_SYS_SETSOCKOPT() i64 { return 54; }
+
+fn NET_AF_INET() i64 { return 2; }
+fn NET_SOCK_STREAM() i64 { return 1; }
+fn NET_SOCK_DGRAM() i64 { return 2; }
+fn NET_SOL_SOCKET() i64 { return 1; }
+fn NET_SO_RCVTIMEO() i64 { return 20; }
+fn NET_SO_SNDTIMEO() i64 { return 21; }
+
+fn net_chamber_init() i32 {
+    if (hw_rt_init() != 0) { return 0 - 1; }
+    let base: i64 = RAYOS_NET_MMIO_BASE();
+    if (mmio_read32(base) != NET_CHAMBER_MAGIC()) {
+        mmio_write32(base, NET_CHAMBER_MAGIC());
+        mmio_write32(base + 4, 0);
+        mmio_write32(base + 8, 0);
+        mmio_write32(base + 12, 0);
+    }
+    return 0;
+}
+
+fn net_chamber_link_up() i32 {
+    if (net_chamber_init() != 0) { return 0; }
+    return mmio_read32(RAYOS_NET_MMIO_BASE() + 4);
+}
+
+fn net_chamber_set_link(up: i32) void {
+    if (net_chamber_init() != 0) { return; }
+    mmio_write32(RAYOS_NET_MMIO_BASE() + 4, up);
+    hw_fence();
+}
+
+fn net_chamber_counter_ptr(reg: i32) *i64 {
+    let p: *i8 = hw_mmio_ptr(RAYOS_NET_MMIO_BASE() + reg as i64, 8);
+    if (p == null) { return null; }
+    return p as *i64;
+}
+
+fn net_chamber_add_tx(n: i64) void {
+    if (net_chamber_init() != 0) { return; }
+    if (net_chamber_counter_ptr(16)) |c| { c.* = c.* + n; }
+}
+
+fn net_chamber_add_rx(n: i64) void {
+    if (net_chamber_init() != 0) { return; }
+    if (net_chamber_counter_ptr(24)) |c| { c.* = c.* + n; }
+}
+
+fn net_chamber_tx_bytes() i64 {
+    if (net_chamber_init() != 0) { return 0; }
+    if (net_chamber_counter_ptr(16)) |c| { return c.*; }
+    return 0;
+}
+
+fn net_chamber_rx_bytes() i64 {
+    if (net_chamber_init() != 0) { return 0; }
+    if (net_chamber_counter_ptr(24)) |c| { return c.*; }
+    return 0;
+}
+
+fn net_chamber_active_delta(d: i32) void {
+    if (net_chamber_init() != 0) { return; }
+    let base: i64 = RAYOS_NET_MMIO_BASE();
+    mmio_write32(base + 8, mmio_read32(base + 8) + d);
+    mmio_write32(base + 12, mmio_read32(base + 12) + 1);
+    hw_fence();
+}
+
+// ── sockaddr_in helper ───────────────────────────────────────────────────────
+
+// Build a 16-byte sockaddr_in for ip (packed 4 bytes, MSB first in low 32)
+// and port. Returns the buffer pointer.
+fn net_sockaddr(ip: i64, port: i32) *i8 {
+    let sa: *i8 = _zag_malloc(16);
+    let i: i32 = 0;
+    while (i < 16) { sa[i] = 0 as i8; i = i + 1; }
+    sa[0] = NET_AF_INET() as i8;
+    sa[1] = 0 as i8;
+    sa[2] = ((port / 256) % 256) as i8;   // port big-endian
+    sa[3] = (port % 256) as i8;
+    sa[4] = ((ip / 16777216) % 256) as i8;
+    sa[5] = ((ip / 65536) % 256) as i8;
+    sa[6] = ((ip / 256) % 256) as i8;
+    sa[7] = (ip % 256) as i8;
+    return sa;
+}
+
+fn net_set_timeout(fd: i64, secs: i32) void {
+    let tv: *i8 = _zag_malloc(16);
+    let i: i32 = 0;
+    while (i < 16) { tv[i] = 0 as i8; i = i + 1; }
+    tv[0] = secs as i8;   // tv_sec low byte (little-endian)
+    let _r: i64 = _zag_raw_syscall(
+        NET_SYS_SETSOCKOPT(), fd, NET_SOL_SOCKET(), NET_SO_RCVTIMEO(), tv as i64, 16, 0);
+    let _s: i64 = _zag_raw_syscall(
+        NET_SYS_SETSOCKOPT(), fd, NET_SOL_SOCKET(), NET_SO_SNDTIMEO(), tv as i64, 16, 0);
+}
+
+// ── DNS resolver (UDP query to the system nameserver) ────────────────────────
+
+fn net_is_digit(c: u8) i32 {
+    if (c >= ('0' as u8) && c <= ('9' as u8)) { return 1; }
+    return 0;
+}
+
+// Parse a dotted-quad "a.b.c.d" into packed i64, or -1 if not a literal.
+fn net_parse_ipv4(host: []u8) i64 {
+    let parts: i32 = 0;
+    let val: i32 = 0;
+    let ip: i64 = 0;
+    let seen: i32 = 0;
+    let i: i32 = 0;
+    while (i <= host.len) {
+        if (i == host.len || host[i] == ('.' as u8)) {
+            if (seen == 0) { return 0 - 1; }
+            ip = ip * 256 + (val as i64);
+            parts = parts + 1;
+            val = 0;
+            seen = 0;
+        } else if (net_is_digit(host[i]) == 1) {
+            val = val * 10 + ((host[i] as i32) - ('0' as i32));
+            seen = 1;
+        } else {
+            return 0 - 1;
+        }
+        i = i + 1;
+    }
+    if (parts != 4) { return 0 - 1; }
+    return ip;
+}
+
+// Nameserver IP (packed) from /etc/resolv.conf; falls back to 1.1.1.1.
+fn net_nameserver() i64 {
+    let conf: []u8 = _zag_read_file("/etc/resolv.conf");
+    if (conf.len > 0) {
+        let i: i32 = 0;
+        while (i < conf.len) {
+            // line starting with "nameserver "
+            if (i + 11 <= conf.len && conf[i] == ('n' as u8)) {
+                if (conf[i + 10] == (' ' as u8)) {
+                    let s: i32 = i + 11;
+                    while (s < conf.len && conf[s] == (' ' as u8)) { s = s + 1; }
+                    let e: i32 = s;
+                    while (e < conf.len && conf[e] != ('\n' as u8) && conf[e] != (' ' as u8)) {
+                        e = e + 1;
+                    }
+                    let ip: i64 = net_parse_ipv4(conf[s..e]);
+                    if (ip >= 0) { return ip; }
+                }
+            }
+            while (i < conf.len && conf[i] != ('\n' as u8)) { i = i + 1; }
+            i = i + 1;
+        }
+    }
+    return 16843009;   // 1.1.1.1
+}
+
+fn net_dns_qname(q: *i8, at: i32, host: []u8) i32 {
+    let n: i32 = at;
+    let lstart: i32 = 0;
+    let h: i32 = 0;
+    while (h <= host.len) {
+        if (h == host.len || host[h] == ('.' as u8)) {
+            q[n] = (h - lstart) as i8;
+            n = n + 1;
+            let k: i32 = lstart;
+            while (k < h) {
+                q[n] = host[k] as i8;
+                n = n + 1;
+                k = k + 1;
+            }
+            lstart = h + 1;
+        }
+        h = h + 1;
+    }
+    q[n] = 0 as i8;
+    return n + 1;
+}
+
+// Resolve a hostname to a packed IPv4, or -1 on failure. IP literals bypass
+// DNS. On native hardware the NIC's resolver offload answers the same call.
+fn net_dns_resolve(host: []u8) i64 {
+    let literal: i64 = net_parse_ipv4(host);
+    if (literal >= 0) { return literal; }
+
+    let fd: i64 = _zag_raw_syscall(NET_SYS_SOCKET(), NET_AF_INET(), NET_SOCK_DGRAM(), 0, 0, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    net_set_timeout(fd, 5);
+
+    let ns: i64 = net_nameserver();
+    let sa: *i8 = net_sockaddr(ns, 53);
+
+    let q: *i8 = _zag_malloc(300);
+    q[0] = 18 as i8; q[1] = 52 as i8;   // id 0x1234
+    q[2] = 1 as i8;  q[3] = 0 as i8;    // flags: recursion desired
+    q[4] = 0 as i8;  q[5] = 1 as i8;    // qdcount 1
+    q[6] = 0 as i8;  q[7] = 0 as i8;
+    q[8] = 0 as i8;  q[9] = 0 as i8;
+    q[10] = 0 as i8; q[11] = 0 as i8;
+    let n: i32 = net_dns_qname(q, 12, host);
+    q[n] = 0 as i8;  q[n + 1] = 1 as i8;   // qtype A
+    q[n + 2] = 0 as i8; q[n + 3] = 1 as i8; // qclass IN
+    n = n + 4;
+
+    let _w: i64 = _zag_raw_syscall(NET_SYS_SENDTO(), fd, q as i64, n as i64, 0, sa as i64, 16);
+    let buf: *i8 = _zag_malloc(512);
+    let r: i64 = _zag_raw_syscall(NET_SYS_RECVFROM(), fd, buf as i64, 512, 0, 0, 0);
+    let _c: i64 = _zag_raw_syscall(NET_SYS_CLOSE(), fd, 0, 0, 0, 0, 0);
+    if (r < 12) { return 0 - 1; }
+
+    let ancount: i32 = ((buf[6] as u8) as i32) * 256 + ((buf[7] as u8) as i32);
+    if (ancount < 1) { return 0 - 1; }
+
+    // skip header + question
+    let p: i32 = 12;
+    while (p < (r as i32) && buf[p] != (0 as i8)) {
+        p = p + ((buf[p] as u8) as i32) + 1;
+    }
+    p = p + 1 + 4;
+
+    // walk answers to the first A record (type 1, rdlen 4)
+    let a: i32 = 0;
+    while (a < ancount && p + 12 <= (r as i32)) {
+        if (((buf[p] as u8) as i32) >= 192) {
+            p = p + 2;                       // compressed name pointer
+        } else {
+            while (p < (r as i32) && buf[p] != (0 as i8)) {
+                p = p + ((buf[p] as u8) as i32) + 1;
+            }
+            p = p + 1;
+        }
+        let atype: i32 = ((buf[p] as u8) as i32) * 256 + ((buf[p + 1] as u8) as i32);
+        let rdlen: i32 = ((buf[p + 8] as u8) as i32) * 256 + ((buf[p + 9] as u8) as i32);
+        p = p + 10;
+        if (atype == 1 && rdlen == 4) {
+            let ip: i64 = ((buf[p] as u8) as i64) * 16777216
+                + ((buf[p + 1] as u8) as i64) * 65536
+                + ((buf[p + 2] as u8) as i64) * 256
+                + ((buf[p + 3] as u8) as i64);
+            return ip;
+        }
+        p = p + rdlen;
+        a = a + 1;
+    }
+    return 0 - 1;
+}
+
+// ── TCP client ───────────────────────────────────────────────────────────────
+
+// Connect to ip:port; returns a socket handle (>= 0) or a negative error.
+fn net_tcp_connect(ip: i64, port: i32) i64 {
+    if (net_chamber_init() != 0) { return 0 - 1; }
+    let fd: i64 = _zag_raw_syscall(NET_SYS_SOCKET(), NET_AF_INET(), NET_SOCK_STREAM(), 0, 0, 0, 0);
+    if (fd < 0) { return 0 - 2; }
+    net_set_timeout(fd, 10);
+    let sa: *i8 = net_sockaddr(ip, port);
+    let rc: i64 = _zag_raw_syscall(NET_SYS_CONNECT(), fd, sa as i64, 16, 0, 0, 0);
+    if (rc < 0) {
+        let _c: i64 = _zag_raw_syscall(NET_SYS_CLOSE(), fd, 0, 0, 0, 0, 0);
+        return 0 - 3;
+    }
+    net_chamber_set_link(1);
+    net_chamber_active_delta(1);
+    return fd;
+}
+
+fn net_tcp_send(fd: i64, data: []u8) i64 {
+    if (data.len < 1) { return 0; }
+    let w: i64 = _zag_raw_syscall(NET_SYS_WRITE(), fd, (&data[0]) as i64, data.len as i64, 0, 0, 0);
+    if (w > 0) { net_chamber_add_tx(w); }
+    return w;
+}
+
+// Read up to `cap` bytes, looping until the peer closes (HTTP/1.0 close-
+// delimited) or the cap is reached. Returns a fresh []u8.
+fn net_tcp_recv_all(fd: i64, cap: i32) []u8 {
+    let buf: *i8 = _zag_malloc(cap);
+    let total: i32 = 0;
+    let done: i32 = 0;
+    while (done == 0 && total < cap) {
+        let n: i64 = _zag_raw_syscall(
+            NET_SYS_READ(), fd, (buf as i64) + (total as i64), (cap - total) as i64, 0, 0, 0);
+        if (n <= 0) {
+            done = 1;
+        } else {
+            total = total + (n as i32);
+        }
+    }
+    if (total > 0) { net_chamber_add_rx(total as i64); }
+    let bu: *u8 = buf as *u8;
+    return bu[0..total];
+}
+
+// Read exactly n bytes into buf; returns n, or <0 on error/short close.
+fn net_tcp_recv_n(fd: i64, buf: *i8, n: i32) i32 {
+    let got: i32 = 0;
+    while (got < n) {
+        let r: i64 = _zag_raw_syscall(
+            NET_SYS_READ(), fd, (buf as i64) + (got as i64), (n - got) as i64, 0, 0, 0);
+        if (r <= 0) { return 0 - 1; }
+        got = got + (r as i32);
+    }
+    net_chamber_add_rx(n as i64);
+    return got;
+}
+
+// Raw send of a byte buffer (for record framing).
+fn net_tcp_send_raw(fd: i64, buf: *i8, n: i32) i64 {
+    let w: i64 = _zag_raw_syscall(NET_SYS_WRITE(), fd, buf as i64, n as i64, 0, 0, 0);
+    if (w > 0) { net_chamber_add_tx(w); }
+    return w;
+}
+
+fn net_tcp_close(fd: i64) void {
+    let _c: i64 = _zag_raw_syscall(NET_SYS_CLOSE(), fd, 0, 0, 0, 0, 0);
+    net_chamber_active_delta(0 - 1);
+}
+
+// ── dotted-quad formatter (for status display) ───────────────────────────────
+
+fn net_ip_str(ip: i64) []u8 {
+    let s: []u8 = _zag_i64_to_str((ip / 16777216) % 256);
+    s = _zag_str_concat(s, ".");
+    s = _zag_str_concat(s, _zag_i64_to_str((ip / 65536) % 256));
+    s = _zag_str_concat(s, ".");
+    s = _zag_str_concat(s, _zag_i64_to_str((ip / 256) % 256));
+    s = _zag_str_concat(s, ".");
+    s = _zag_str_concat(s, _zag_i64_to_str(ip % 256));
+    return s;
+}

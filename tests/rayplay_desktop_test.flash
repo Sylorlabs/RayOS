@@ -1,0 +1,78 @@
+@import("../desktop/rayos_desktop.flash")
+@import("../testing/rayplay.flash")
+
+fn rayplay_test_fail(msg: []u8) void {
+    _zag_print("rayplay_desktop_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn main() i32 {
+    _zag_println("rayplay_desktop_test: running");
+    if (input_chamber_init() != 0) { rayplay_test_fail("input init"); }
+    if (display_chamber_init(RAYOS_DESKTOP_W(), RAYOS_DESKTOP_H()) != 0) {
+        rayplay_test_fail("display init");
+    }
+    let comp: Compositor = comp_new(RAYOS_DESKTOP_W(), RAYOS_DESKTOP_H());
+    let drag: RayOsDesktopDrag = rayos_desktop_drag_new();
+    let play: RayPlay = rayplay_new();
+    let start_probe: ShellHit = shell_hit_test(comp.shell, &comp.wm, 96, 776);
+    if (start_probe.kind != shell_hit_start()) { rayplay_test_fail("Start hit geometry"); }
+
+    // Open Start after frame 0, wait for its retained animation, then select
+    // Task Manager. Later open Files from the unobscured desktop icon strip.
+    if (rayplay_click(&play, 0, 96, 776) != 0) { rayplay_test_fail("queue start"); }
+    if (rayplay_click(&play, 8, 250, 500) != 0) { rayplay_test_fail("queue tasks"); }
+    if (rayplay_click(&play, 17, 52, 132) != 0) { rayplay_test_fail("queue files"); }
+    if (rayplay_click(&play, 22, 96, 776) != 0) { rayplay_test_fail("queue browser start"); }
+    if (rayplay_click(&play, 31, 52, 600) != 0) { rayplay_test_fail("queue browser"); }
+
+    let task_checksum: i32 = 0;
+    let frame: i32 = 0;
+    let files_checksum: i32 = 0;
+    while (frame < 40) {
+        let _events: t27 = rayplay_tick(&play, &comp, &drag, frame as t27);
+        if (_events < 0) { rayplay_test_fail("MMIO event dispatch"); }
+        rayos_desktop_frame(&comp, &drag, frame);
+        if (frame == 7) {
+            if (launcher_is_open(comp.launcher) != 1) { rayplay_test_fail("Start did not open"); }
+            let _launcher_dump: i32 = rayos_desktop_dump_ppm(&comp, "desktop/launcher.ppm");
+        }
+        if (frame == 14) {
+            if (rayos_desktop_dump_ppm(&comp, "desktop/task-manager.ppm") != 0) {
+                rayplay_test_fail("task screenshot");
+            }
+            task_checksum = comp_checksum(&comp);
+        }
+        if (frame == 20) {
+            if (rayos_desktop_dump_ppm(&comp, "desktop/files.ppm") != 0) {
+                rayplay_test_fail("files screenshot");
+            }
+            files_checksum = comp_checksum(&comp);
+        }
+        frame = frame + 1;
+    }
+    if (rayos_desktop_dump_ppm(&comp, "desktop/browser.ppm") != 0) {
+        rayplay_test_fail("browser screenshot");
+    }
+    let browser_checksum: i32 = comp_checksum(&comp);
+    if (rayplay_count_windows(&comp, wm_content_tasks()) != 1) {
+        rayplay_test_fail("Task Manager did not open");
+    }
+    if (rayplay_count_windows(&comp, wm_content_files()) != 1) {
+        rayplay_test_fail("Files did not open");
+    }
+    if (rayplay_count_windows(&comp, wm_content_browser()) != 1) {
+        rayplay_test_fail("Ray Browser did not open");
+    }
+    if (task_checksum == 0 || files_checksum == 0 || browser_checksum == 0 ||
+        task_checksum == files_checksum || files_checksum == browser_checksum) {
+        rayplay_test_fail("visual state checksum");
+    }
+    if (play.injected != 10) { rayplay_test_fail("all scripted events injected"); }
+
+    rayplay_free(&play);
+    comp_free(&comp);
+    _zag_println("rayplay_desktop_test: ok (3 app screenshots, retained-state assertions)");
+    return 0;
+}

@@ -1,0 +1,66 @@
+// net_http_test.flash — socket data plane + HTTP client end-to-end.
+//
+// Exercises the real network stack: DNS resolve, TCP connect, HTTP GET, and
+// the NIC chamber counters. Requires outbound network (skips gracefully when
+// unreachable so CI without egress still passes the offline assertions).
+
+@import("../net/http.flash")
+
+fn main() i32 {
+    _zag_println("net_http_test: running");
+
+    // ── offline assertions (always run) ──
+    if (net_parse_ipv4("1.1.1.1") != 16843009) {
+        _zag_println("net_http_test: FAIL ipv4 parse");
+        return 1;
+    }
+    if (net_parse_ipv4("not.an.ip.x") >= 0) {
+        _zag_println("net_http_test: FAIL ipv4 reject");
+        return 1;
+    }
+    let u: HttpUrl = http_parse_url("http://example.com:8080/a/b?c=d");
+    if (u.ok != 1) { _zag_println("net_http_test: FAIL url ok"); return 1; }
+    if (_zag_strcmp(u.host, "example.com") == 0) { _zag_println("net_http_test: FAIL url host"); return 1; }
+    if (u.port != 8080) { _zag_println("net_http_test: FAIL url port"); return 1; }
+    if (_zag_strcmp(u.path, "/a/b?c=d") == 0) { _zag_println("net_http_test: FAIL url path"); return 1; }
+
+    if (net_chamber_init() != 0) {
+        _zag_println("net_http_test: FAIL chamber init");
+        return 1;
+    }
+
+    // ── online path (best-effort) ──
+    let ip: i64 = net_dns_resolve("example.com");
+    if (ip < 0) {
+        _zag_println("net_http_test: no network egress — offline checks passed");
+        _zag_println("net_http_test: ok");
+        return 0;
+    }
+    _zag_print("net_http_test: example.com -> ");
+    _zag_println(net_ip_str(ip));
+
+    let r: HttpResponse = http_get("http://example.com/");
+    if (r.ok != 1) {
+        _zag_print("net_http_test: fetch error: ");
+        _zag_println(r.error);
+        _zag_println("net_http_test: ok (dns worked, fetch unreachable)");
+        return 0;
+    }
+    _zag_print("net_http_test: HTTP status ");
+    _zag_println(_zag_i64_to_str(r.status as i64));
+    if (r.status < 100 || r.status > 599) {
+        _zag_println("net_http_test: FAIL bad status");
+        return 1;
+    }
+    if (net_chamber_tx_bytes() < 1 || net_chamber_rx_bytes() < 1) {
+        _zag_println("net_http_test: FAIL chamber counters not updated");
+        return 1;
+    }
+    _zag_print("net_http_test: tx=");
+    _zag_print(_zag_i64_to_str(net_chamber_tx_bytes()));
+    _zag_print(" rx=");
+    _zag_println(_zag_i64_to_str(net_chamber_rx_bytes()));
+
+    _zag_println("net_http_test: ok");
+    return 0;
+}

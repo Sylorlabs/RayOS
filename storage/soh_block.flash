@@ -1,0 +1,103 @@
+// storage/soh_block.flash — Megatryte-addressed 512-byte block store on SOH MMIO plane.
+//
+// Blocks are laid out as flat block_id * SOH_BLOCK_SIZE byte slots across the
+// 6×3 SOH tile grid (RAYOS_SOH_MMIO_BASE).  Block base offsets use Tekum
+// ripple math from offset_loop.flash; per-byte slots map to tile_x/tile_y/slot
+// for soh_mmio_write_trit / soh_mmio_read_trit.
+//
+// Import chain (no @import here — splice from test / init entry):
+//   @import("../core/constants.flash")
+//   @import("../math/trit_core.flash")
+//   @import("../math/tekum.flash")
+//   @import("../math/offset_loop.flash")
+//   @import("../driver/hw_rt.flash")
+//   @import("../driver/soh_mmio.flash")
+//   @import("soh_block.flash")
+//
+//   hw_rt_init();
+//   soh_block_write(0, boot_sector);
+//   let buf: ArrayList[u8] = make[u8](512);
+//   soh_block_read(0, &buf);
+
+fn SOH_BLOCK_SIZE() i32 { return 512; }
+
+fn SOH_BLOCK_BOOT_ID() i32 { return 0; }
+
+fn soh_block_plane_slots() i32 {
+    let tx: i32 = (RAYOS_SOH_MMIO_TILES_X() as i32);
+    let ty: i32 = (RAYOS_SOH_MMIO_TILES_Y() as i32);
+    let spt: i32 = (SOH_SLOTS_PER_TILE() as i32);
+    return tx * ty * spt;
+}
+
+fn soh_block_max_blocks() i32 {
+    return soh_block_plane_slots() / (SOH_BLOCK_SIZE() as i32);
+}
+
+// Tekum-linear block base (block_id * 512 trit-address units).
+fn soh_block_megatryte_offset(block_id: i32) i64 {
+    let base: TekumValue = tekum_from_i64(0);
+    let stride: TekumValue = tekum_from_i64((SOH_BLOCK_SIZE() as i64));
+    let off: TekumValue = flash_offset_compute(base, stride, block_id);
+    return tekum_to_i64(off);
+}
+
+struct SOHBlockCoord {
+    tile_x: i32,
+    tile_y: i32,
+    slot: i32,
+}
+
+fn soh_block_flat_to_coord(flat: i32) SOHBlockCoord {
+    let tiles_x: i32 = (RAYOS_SOH_MMIO_TILES_X() as i32);
+    let spt: i32 = (SOH_SLOTS_PER_TILE() as i32);
+    let tile_idx: i32 = flat / spt;
+    let slot: i32 = flat - tile_idx * spt;
+    let tile_x: i32 = tile_idx - (tile_idx / tiles_x) * tiles_x;
+    let tile_y: i32 = tile_idx / tiles_x;
+    return SOHBlockCoord{ .tile_x = tile_x, .tile_y = tile_y, .slot = slot };
+}
+
+fn soh_block_coord(block_id: i32, byte_idx: i32) SOHBlockCoord {
+    let base_off: i64 = soh_block_megatryte_offset(block_id);
+    let flat: i32 = base_off as i32 + byte_idx;
+    return soh_block_flat_to_coord(flat);
+}
+
+fn soh_block_id_valid(block_id: i32) i32 {
+    if (block_id < 0) { return 0; }
+    if (block_id >= soh_block_max_blocks()) { return 0; }
+    return 1;
+}
+
+// Write 512 bytes to SOH-backed block.  Returns 0 on success, negative on error.
+fn soh_block_write(block_id: i32, data: []u8) i32 {
+    if (soh_block_id_valid(block_id) == 0) { return 0 - 1; }
+    if (data.len != (SOH_BLOCK_SIZE() as i32)) { return 0 - 2; }
+    let i: i32 = 0;
+    while (i < (SOH_BLOCK_SIZE() as i32)) {
+        let coord: SOHBlockCoord = soh_block_coord(block_id, i);
+        let tr: i8 = data[i] as i8;
+        let rc: i32 = soh_mmio_write_trit(coord.tile_x, coord.tile_y, coord.slot, tr);
+        if (rc != 0) { return 0 - 3; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Read 512 bytes from SOH-backed block into out indices 0..511.
+// Grows out with zero pushes when len < SOH_BLOCK_SIZE.  Returns 0 on success.
+fn soh_block_read(block_id: i32, out: *ArrayList[u8]) i32 {
+    if (soh_block_id_valid(block_id) == 0) { return 0 - 1; }
+    while (len[u8](out.*) < (SOH_BLOCK_SIZE() as i32)) {
+        push[u8](out, 0);
+    }
+    let i: i32 = 0;
+    while (i < (SOH_BLOCK_SIZE() as i32)) {
+        let coord: SOHBlockCoord = soh_block_coord(block_id, i);
+        let tr: i8 = soh_mmio_read_trit(coord.tile_x, coord.tile_y, coord.slot);
+        set[u8](out, i, tr as u8);
+        i = i + 1;
+    }
+    return 0;
+}

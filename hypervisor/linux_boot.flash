@@ -1,0 +1,275 @@
+// hypervisor/linux_boot.flash — Linux bzImage boot protocol for RayOS BTM guests
+//
+// Parses setup header fields, loads boot sector / setup / kernel into guest RAM,
+// seeds linux boot_params at GPA 0x90000, and attaches BTM for real-mode stub.
+//
+// Import chain (no @import here — splice from test / init entry):
+//   @import("../core/constants.flash")
+//   @import("../math/trit_core.flash")
+//   @import("../math/tekum.flash")
+//   @import("../math/offset_loop.flash")
+//   @import("../hypervisor/guest_ram.flash")
+//   @import("../hypervisor/guest_regs.flash")
+//   @import("../hypervisor/binary_matrix.flash")
+//   @import("../hypervisor/linux_boot.flash")
+
+struct LinuxBootImageInfo {
+    setup_sects: i32,
+    syssize: i32,
+    boot_flag: i32,
+    hdr_ok: i32,
+    kernel_file_off: i32,
+    kernel_gpa: i32,
+    image_bytes: i32,
+}
+
+fn linux_boot_read_u16_le(raw: []u8, off: i32) i32 {
+    if (off < 0 || off + 1 >= raw.len) { return 0; }
+    let lo: i32 = raw[off] as i32;
+    let hi: i32 = raw[off + 1] as i32;
+    return hi * 256 + lo;
+}
+
+fn linux_boot_read_u8(raw: []u8, off: i32) u8 {
+    if (off < 0 || off >= raw.len) { return 0; }
+    return raw[off];
+}
+
+fn linux_boot_hdr_signature_ok(raw: []u8) i32 {
+    if (raw.len < (LINUX_OFF_HDR_SIG() as i32) + 4) { return 0; }
+    let off: i32 = LINUX_OFF_HDR_SIG() as i32;
+    if (raw[off + 0] != 72) { return 0; }
+    if (raw[off + 1] != 100) { return 0; }
+    if (raw[off + 2] != 114) { return 0; }
+    if (raw[off + 3] != 83) { return 0; }
+    return 1;
+}
+
+fn linux_boot_parse_header(raw: []u8) LinuxBootImageInfo {
+    let info: LinuxBootImageInfo = LinuxBootImageInfo{
+        .setup_sects = 0,
+        .syssize = 0,
+        .boot_flag = 0,
+        .hdr_ok = 0,
+        .kernel_file_off = 0,
+        .kernel_gpa = GPA_LINUX_KERNEL() as i32,
+        .image_bytes = raw.len as i32,
+    };
+    if (raw.len < (LINUX_BOOT_SECTOR_BYTES() as i32)) { return info; }
+
+    let setup: i32 = linux_boot_read_u8(raw, LINUX_OFF_SETUP_SECTS() as i32) as i32;
+    if (setup < 1) { setup = 4; }
+    info.setup_sects = setup;
+    info.syssize = linux_boot_read_u16_le(raw, LINUX_OFF_SYSSIZE() as i32);
+    info.boot_flag = linux_boot_read_u16_le(raw, LINUX_OFF_BOOT_FLAG() as i32);
+    info.kernel_file_off = (LINUX_BOOT_SECTOR_BYTES() as i32) + setup * (LINUX_BOOT_SECTOR_BYTES() as i32);
+    if (linux_boot_hdr_signature_ok(raw) == 1) { info.hdr_ok = 1; }
+    return info;
+}
+
+fn linux_boot_kernel_gpa(_setup_sects: i32, _syssize: i32) i32 {
+    return GPA_LINUX_KERNEL_LOAD() as i32;
+}
+
+fn linux_boot_milestone_pc(steps: i32) u64 {
+    let boot_pc: u64 = GPA_BOOT_SECTOR() as u64;
+    if (steps < 1) { return boot_pc; }
+    return boot_pc;
+}
+
+fn linux_boot_seed_vga_boot(guest_ram: *ArrayList[u8]) void {
+    guest_ram_seed_vga_line(guest_ram, 0, "RayOS Linux", 15);
+}
+
+fn linux_boot_synth_bzimage() ArrayList[u8] {
+    let setup_sects: i32 = 4;
+    let sector: i32 = LINUX_BOOT_SECTOR_BYTES() as i32;
+    let kernel_paragraphs: i32 = 64;
+    let kernel_bytes: i32 = kernel_paragraphs * 16;
+    let file_len: i32 = sector + setup_sects * sector + kernel_bytes;
+
+    let img: ArrayList[u8] = make[u8](0);
+    let i: i32 = 0;
+    while (i < file_len) {
+        push[u8](&img, 0);
+        i = i + 1;
+    }
+
+    set[u8](&img, 0, 235);
+    set[u8](&img, 1, 254);
+    set[u8](&img, LINUX_OFF_SETUP_SECTS() as i32, setup_sects as u8);
+    set[u8](&img, LINUX_OFF_SYSSIZE() as i32 + 0, 64);
+    set[u8](&img, LINUX_OFF_SYSSIZE() as i32 + 1, 0);
+    set[u8](&img, LINUX_OFF_BOOT_FLAG() as i32 + 0, 85);
+    set[u8](&img, LINUX_OFF_BOOT_FLAG() as i32 + 1, 170);
+    set[u8](&img, sector - 2, 85);
+    set[u8](&img, sector - 1, 170);
+
+    set[u8](&img, LINUX_OFF_HDR_SIG() as i32 + 0, 72);
+    set[u8](&img, LINUX_OFF_HDR_SIG() as i32 + 1, 100);
+    set[u8](&img, LINUX_OFF_HDR_SIG() as i32 + 2, 114);
+    set[u8](&img, LINUX_OFF_HDR_SIG() as i32 + 3, 83);
+    set[u8](&img, LINUX_OFF_HDR_VERSION() as i32 + 0, 14);
+    set[u8](&img, LINUX_OFF_HDR_VERSION() as i32 + 1, 2);
+
+    let koff: i32 = sector + setup_sects * sector;
+    set[u8](&img, koff + 0, 144);
+    set[u8](&img, koff + 1, 144);
+    set[u8](&img, koff + 2, 131);
+    return img;
+}
+
+fn linux_boot_params_write(guest_ram: *ArrayList[u8], info: LinuxBootImageInfo) i32 {
+    let base: i32 = GPA_LINUX_BOOT_PARAMS() as i32;
+    let hdr_base: i32 = base + (LINUX_BOOT_PARAMS_HDR_OFF() as i32);
+
+    if (guest_ram_ensure(guest_ram, base + 4096) == 0) { return 0 - 1; }
+
+    if (guest_ram_write_u8(guest_ram, hdr_base + 0, info.setup_sects as u8) != 0) { return 0 - 2; }
+    if (guest_ram_write_u16_le(guest_ram, hdr_base + 1, 0) != 0) { return 0 - 3; }
+    if (guest_ram_write_u16_le(guest_ram, hdr_base + 3, info.syssize) != 0) { return 0 - 4; }
+    if (guest_ram_write_u16_le(guest_ram, hdr_base + 11, LINUX_BOOT_FLAG_MAGIC() as i32) != 0) {
+        return 0 - 5;
+    }
+
+    if (guest_ram_write_u32_le(guest_ram, hdr_base + 17, 0x53726448) != 0) { return 0 - 6; }
+    if (guest_ram_write_u16_le(guest_ram, hdr_base + 21, 0x020E) != 0) { return 0 - 7; }
+    if (guest_ram_write_u8(guest_ram, hdr_base + 23, 0xFF) != 0) { return 0 - 8; }
+    if (guest_ram_write_u32_le(guest_ram, hdr_base + 25, info.kernel_gpa) != 0) { return 0 - 9; }
+
+    let virtio_lo: i32 = (RAYOS_VIRTIO_MMIO_GPA() as i32);
+    if (guest_ram_write_u32_le(guest_ram, base + 0x250, virtio_lo) != 0) { return 0 - 10; }
+
+    return 0;
+}
+
+fn linux_boot_seed_kernel_stub(guest_ram: *ArrayList[u8]) void {
+    let load: i32 = GPA_LINUX_KERNEL_LOAD() as i32;
+    guest_ram_write8(guest_ram, load + 0, 144);
+    guest_ram_write8(guest_ram, load + 1, 144);
+    guest_ram_write8(guest_ram, load + 2, 131);
+}
+
+fn linux_boot_load_image_bytes(guest_ram: *ArrayList[u8], raw: []u8) i32 {
+    let info: LinuxBootImageInfo = linux_boot_parse_header(raw);
+    if (info.boot_flag != LINUX_BOOT_FLAG_MAGIC() as i32) {
+        let sig_lo: i32 = linux_boot_read_u16_le(raw, (LINUX_BOOT_SECTOR_BYTES() as i32) - 2);
+        if (sig_lo != LINUX_BOOT_FLAG_MAGIC() as i32) { return 0 - 1; }
+    }
+
+    let boot_gpa: i32 = GPA_BOOT_SECTOR() as i32;
+    let sector: i32 = LINUX_BOOT_SECTOR_BYTES() as i32;
+    if (guest_ram_copy(guest_ram, boot_gpa, raw[0..sector], sector) != 0) { return 0 - 2; }
+
+    let setup_bytes: i32 = info.setup_sects * sector;
+    let setup_off: i32 = sector;
+    if (raw.len < setup_off + setup_bytes) { return 0 - 3; }
+    if (guest_ram_copy(guest_ram, GPA_LINUX_SETUP() as i32, raw[setup_off..setup_off + setup_bytes], setup_bytes) != 0) {
+        return 0 - 4;
+    }
+
+    let kfile: i32 = info.kernel_file_off;
+    let kremain: i32 = raw.len as i32 - kfile;
+    if (kremain > 0) {
+        let kgpa: i32 = linux_boot_kernel_gpa(info.setup_sects, info.syssize);
+        if (guest_ram_copy(guest_ram, kgpa, raw[kfile..raw.len], kremain) != 0) { return 0 - 5; }
+    }
+
+    if (linux_boot_params_write(guest_ram, info) != 0) { return 0 - 6; }
+    linux_boot_seed_kernel_stub(guest_ram);
+    linux_boot_seed_vga_boot(guest_ram);
+    return 0;
+}
+
+fn linux_boot_load_real(path: []u8, guest_ram: *ArrayList[u8]) i32 {
+    let raw: []u8 = _zag_read_file(path);
+    if (raw.len < (LINUX_BOOT_SECTOR_BYTES() as i32)) { return 0 - 1; }
+
+    let info: LinuxBootImageInfo = linux_boot_parse_header(raw);
+    if (info.boot_flag != (LINUX_BOOT_FLAG_MAGIC() as i32)) {
+        let sig: i32 = linux_boot_read_u16_le(raw, (LINUX_BOOT_SECTOR_BYTES() as i32) - 2);
+        if (sig != (LINUX_BOOT_FLAG_MAGIC() as i32)) { return 0 - 2; }
+    }
+    if (info.setup_sects < 1) { return 0 - 3; }
+
+    let sector: i32 = LINUX_BOOT_SECTOR_BYTES() as i32;
+    let need: i32 = sector + info.setup_sects * sector;
+    if (raw.len < need) { return 0 - 4; }
+
+    return linux_boot_load_image_bytes(guest_ram, raw);
+}
+
+fn linux_boot_load_bzimage(path: []u8, guest_ram: *ArrayList[u8]) i32 {
+    let raw: []u8 = _zag_read_file(path);
+    if (raw.len < (LINUX_BOOT_SECTOR_BYTES() as i32)) {
+        let synth: ArrayList[u8] = linux_boot_synth_bzimage();
+        let rc: i32 = linux_boot_load_image_bytes(guest_ram, synth.data[0..len[u8](synth)]);
+        free[u8](&synth);
+        return rc;
+    }
+    return linux_boot_load_image_bytes(guest_ram, raw);
+}
+
+fn linux_boot_params_valid(guest_ram: ArrayList[u8]) i32 {
+    let flag: i32 = guest_ram_read_u16_le(
+        guest_ram,
+        (GPA_LINUX_BOOT_PARAMS() as i32)
+            + (LINUX_BOOT_PARAMS_HDR_OFF() as i32)
+            + 11,
+    );
+    if (flag != LINUX_BOOT_FLAG_MAGIC() as i32) { return 0; }
+    return 1;
+}
+
+fn linux_boot_magic_at_boot_sector(guest_ram: ArrayList[u8]) i32 {
+    let off: i32 = (GPA_BOOT_SECTOR() as i32) + (LINUX_BOOT_SECTOR_BYTES() as i32) - 2;
+    return guest_ram_read_u16_le(guest_ram, off);
+}
+
+fn linux_boot_seed_guest(guest_ram: *ArrayList[u8]) void {
+    let magic: i32 = linux_boot_magic_at_boot_sector(guest_ram.*);
+    if (magic != LINUX_BOOT_FLAG_MAGIC() as i32) {
+        let _rc: i32 = linux_boot_load_bzimage("", guest_ram);
+        return;
+    }
+    linux_boot_seed_kernel_stub(guest_ram);
+    linux_boot_seed_vga_boot(guest_ram);
+}
+
+fn linux_boot_attach(btm: *BinaryTranslationMatrix, guest_ram: *ArrayList[u8]) void {
+    linux_boot_seed_guest(guest_ram);
+    linux_boot_seed_vga_boot(guest_ram);
+    btm_attach_guest(btm, GuestArch.X86_64);
+    btm_bind_guest_ram(btm, guest_ram);
+    grf_set(&btm.*.guest, GuestRegId.Pc, (GPA_BOOT_SECTOR() as u64));
+    grf_set(&btm.*.guest, GuestRegId.R2, 0x80);
+    grf_set(&btm.*.guest, GuestRegId.R3, (GPA_LINUX_BOOT_PARAMS() as u64));
+    grf_set(&btm.*.guest, GuestRegId.R6, (GPA_LINUX_SETUP() as u64));
+    grf_set(&btm.*.guest, GuestRegId.R4, 0x9FFF);
+    let _flush: i32 = soh_map_flush_guest(btm.*.reg_map, btm.*.guest, btm.*.matrix);
+}
+
+fn linux_boot_step_n(
+    btm: *BinaryTranslationMatrix,
+    guest_ram: ArrayList[u8],
+    n: i32,
+) i32 {
+    let done: i32 = 0;
+    let i: i32 = 0;
+    let ram_len: i32 = len[u8](guest_ram);
+    let code: []u8 = guest_ram.data[0..ram_len];
+    while (i < n) {
+        let pc: u64 = btm.*.guest.pc;
+        let off: i32 = pc as i32;
+        if (off < 0 || off >= ram_len) { return 0 - 3; }
+        let step: i32 = btm_step(btm, code);
+        if (step < 0) { return step; }
+        done = done + 1;
+        i = i + 1;
+    }
+    return done;
+}
+
+fn linux_boot_pc(btm: *BinaryTranslationMatrix) u64 {
+    return btm.*.guest.pc;
+}

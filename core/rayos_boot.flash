@@ -1,0 +1,33 @@
+// rayos_boot.zag — RayOS foundation boot probe
+
+@import("init.flash")
+@import("../driver/virtio_block_mmio_nop.flash")
+@import("../driver/virtio_gpu_mmio_nop.flash")
+
+fn main() i32 {
+    let sys: RayOS = rayos_init();
+
+    _zag_println("RayOS: Native Photonic Balanced-Ternary OS");
+    _zag_print("  chambers=");
+    _zag_println(_zag_i64_to_str(rayos_chamber_count() as i64));
+    _zag_print("  wdm_channels=");
+    _zag_println(_zag_i64_to_str(rayos_wdm_channels() as i64));
+    _zag_print("  waveguide_slots=");
+    _zag_println(_zag_i64_to_str(rayos_waveguide_slots() as i64));
+    _zag_print("  fabric_bindings=");
+    _zag_println(_zag_i64_to_str(sys.boot.fabric_bindings as i64));
+    _zag_print("  soh_tiles=");
+    _zag_println(_zag_i64_to_str(sys.boot.soh_tiles as i64));
+    _zag_print("  soh_capacity_trits=");
+    _zag_println(_zag_i64_to_str(sys.boot.soh_capacity as i64));
+    _zag_print("  tekum_width=");
+    _zag_println(_zag_i64_to_str(sys.boot.tekum_width as i64));
+    _zag_print("  offset_probe=");
+    _zag_println(_zag_i64_to_str(sys.boot.offset_probe));
+    _zag_print("  btm_attached=");
+    _zag_println(_zag_i64_to_str(sys.boot.btm_attached as i64));
+
+    rayos_shutdown(&sys);
+    _zag_println("rayos_boot: ok");
+    return 0;
+}

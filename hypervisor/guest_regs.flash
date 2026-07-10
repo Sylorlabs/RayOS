@@ -1,0 +1,204 @@
+// hypervisor/guest_regs.zag — guest CPU register file and SOH tile slot linkage
+//
+// Maps legacy binary guest GPRs (x86_64 / ARM64) into the SOH crystal memory
+// plane so the binary-translation matrix can shadow state on a single wave
+// channel.
+//
+
+
+
+enum GuestArch {
+    X86_64,
+    ARM64,
+}
+
+enum GuestRegId {
+    R0, R1, R2, R3, R4, R5, R6, R7,
+    R8, R9, R10, R11, R12, R13, R14, R15,
+    Flags,
+    Pc,
+}
+
+struct GuestRegisterFile {
+    gpr: *u64,
+    flags: u64,
+    pc: u64,
+    arch: GuestArch,
+}
+
+struct SOHRegisterMap {
+    slots: *SOHSlotRef,
+    count: i32,
+    arch: GuestArch,
+}
+
+fn guest_reg_id_to_index(id: GuestRegId) i32 {
+    if (id == GuestRegId.Flags) { return (GUEST_REG_FLAGS() as i32); }
+    if (id == GuestRegId.Pc) { return (GUEST_REG_PC() as i32); }
+    return switch (id) {
+        .R0 => 0,
+        .R1 => 1,
+        .R2 => 2,
+        .R3 => 3,
+        .R4 => 4,
+        .R5 => 5,
+        .R6 => 6,
+        .R7 => 7,
+        .R8 => 8,
+        .R9 => 9,
+        .R10 => 10,
+        .R11 => 11,
+        .R12 => 12,
+        .R13 => 13,
+        .R14 => 14,
+        .R15 => 15,
+        .Flags => (GUEST_REG_FLAGS() as i32),
+        .Pc => (GUEST_REG_PC() as i32),
+    };
+}
+
+fn grf_new(arch: GuestArch) GuestRegisterFile {
+    let n: i32 = (GUEST_GPR_COUNT() as i32);
+    let raw: *i8 = _zag_malloc(n * 8);
+    let gpr: *u64 = raw as *u64;
+    let i: i32 = 0;
+    while (i < n) {
+        gpr[i] = 0;
+        i = i + 1;
+    }
+    return GuestRegisterFile{
+        .gpr = gpr,
+        .flags = 0,
+        .pc = 0,
+        .arch = arch,
+    };
+}
+
+fn grf_free(grf: *GuestRegisterFile) void {
+    if (grf.*.gpr != null as *u64) {
+        _zag_free(grf.*.gpr as *i8);
+    }
+    grf.*.gpr = null as *u64;
+}
+
+fn grf_get(grf: GuestRegisterFile, id: GuestRegId) u64 {
+    let idx: i32 = guest_reg_id_to_index(id);
+    if (idx == (GUEST_REG_FLAGS() as i32)) { return grf.flags; }
+    if (idx == (GUEST_REG_PC() as i32)) { return grf.pc; }
+    return grf.gpr[idx];
+}
+
+fn grf_set(grf: *GuestRegisterFile, id: GuestRegId, val: u64) void {
+    let idx: i32 = guest_reg_id_to_index(id);
+    if (idx == (GUEST_REG_FLAGS() as i32)) {
+        grf.*.flags = val;
+        return;
+    }
+    if (idx == (GUEST_REG_PC() as i32)) {
+        grf.*.pc = val;
+        return;
+    }
+    grf.*.gpr[idx] = val;
+}
+
+fn soh_map_new(arch: GuestArch) SOHRegisterMap {
+    let n: i32 = (GUEST_REG_FILE_LEN() as i32);
+    let raw: *i8 = _zag_malloc(n * @sizeOf[SOHSlotRef]());
+    let slots: *SOHSlotRef = raw as *SOHSlotRef;
+    let i: i32 = 0;
+    while (i < n) {
+        slots[i] = soh_slot_ref(0 - 1, 0 - 1, 0 - 1);
+        i = i + 1;
+    }
+    return SOHRegisterMap{
+        .slots = slots,
+        .count = n,
+        .arch = arch,
+    };
+}
+
+fn soh_map_free(map: *SOHRegisterMap) void {
+    if (map.*.slots != null as *SOHSlotRef) {
+        _zag_free(map.*.slots as *i8);
+    }
+    map.*.slots = null as *SOHSlotRef;
+    map.*.count = 0;
+}
+
+fn soh_map_default(arch: GuestArch) SOHRegisterMap {
+    let map: SOHRegisterMap = soh_map_new(arch);
+    let reg: i32 = 0;
+    while (reg < (GUEST_REG_FILE_LEN() as i32)) {
+        let tile_x: i32 = reg % 6;
+        let tile_y: i32 = reg / 6;
+        map.slots[reg] = soh_slot_ref(tile_x, tile_y, 0);
+        reg = reg + 1;
+    }
+    return map;
+}
+
+fn soh_map_link(
+    map: *SOHRegisterMap,
+    id: GuestRegId,
+    tile_x: i32,
+    tile_y: i32,
+    slot: i32,
+) i32 {
+    let idx: i32 = guest_reg_id_to_index(id);
+    if (idx < 0 || idx >= map.*.count) { return 1; }
+    map.*.slots[idx] = soh_slot_ref(tile_x, tile_y, slot);
+    return 0;
+}
+
+fn soh_map_slot_unchecked(map: SOHRegisterMap, id: GuestRegId) SOHSlotRef {
+    let idx: i32 = guest_reg_id_to_index(id);
+    return map.slots[idx];
+}
+
+// Status: 0 = ok, 1 = OutOfBounds, 2 = InvalidSlot, 3 = ArchMismatch.
+fn soh_map_flush_guest(
+    map: SOHRegisterMap,
+    grf: GuestRegisterFile,
+    matrix: *SOHMatrix,
+) i32 {
+    if (map.arch != grf.arch) { return 3; }
+    let reg: i32 = 0;
+    while (reg < (GUEST_REG_FILE_LEN() as i32)) {
+        let base: SOHSlotRef = map.slots[reg];
+        let val: u64 = 0;
+        if (reg == (GUEST_REG_FLAGS() as i32)) {
+            val = grf.flags;
+        } else if (reg == (GUEST_REG_PC() as i32)) {
+            val = grf.pc;
+        } else {
+            val = grf.gpr[reg];
+        }
+        let st: i32 = soh_store_u64_checked(matrix, base, val);
+        if (st == 1) { return 1; }
+        if (st == 2) { return 2; }
+        reg = reg + 1;
+    }
+    return 0;
+}
+
+fn soh_map_capture_guest(
+    map: SOHRegisterMap,
+    grf: *GuestRegisterFile,
+    matrix: *SOHMatrix,
+) i32 {
+    if (map.arch != grf.*.arch) { return 3; }
+    let reg: i32 = 0;
+    while (reg < (GUEST_REG_FILE_LEN() as i32)) {
+        let base: SOHSlotRef = map.slots[reg];
+        let val: u64 = soh_load_u64_checked(matrix, base);
+        if (reg == (GUEST_REG_FLAGS() as i32)) {
+            grf.*.flags = val;
+        } else if (reg == (GUEST_REG_PC() as i32)) {
+            grf.*.pc = val;
+        } else {
+            grf.*.gpr[reg] = val;
+        }
+        reg = reg + 1;
+    }
+    return 0;
+}

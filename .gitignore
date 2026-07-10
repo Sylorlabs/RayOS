@@ -1,0 +1,5 @@
+.test_bin/
+*.out
+*.zag.c
+*__shim.zag
+desktop/.bin/

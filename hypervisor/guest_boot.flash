@@ -1,0 +1,36 @@
+// hypervisor/guest_boot.flash — boot legacy guest from SOH RAM via BTM (no QEMU)
+//
+// DEPENDENCY: binary_matrix.flash, guest_regs.flash (via init chain)
+
+fn guest_boot_attach(btm: *BinaryTranslationMatrix, guest_ram: ArrayList[u8]) void {
+    let _ram_len: i32 = len[u8](guest_ram);
+    let _boot_off: i32 = GPA_BOOT_SECTOR() as i32;
+    btm_attach_guest(btm, GuestArch.X86_64);
+    grf_set(&btm.*.guest, GuestRegId.Pc, (GPA_BOOT_SECTOR() as u64));
+    let _flush: i32 = soh_map_flush_guest(btm.*.reg_map, btm.*.guest, btm.*.matrix);
+}
+
+fn guest_boot_step_n(
+    btm: *BinaryTranslationMatrix,
+    guest_ram: ArrayList[u8],
+    n: i32,
+) i32 {
+    let done: i32 = 0;
+    let i: i32 = 0;
+    let ram_len: i32 = len[u8](guest_ram);
+    let code: []u8 = guest_ram.data[0..ram_len];
+    while (i < n) {
+        let pc: u64 = btm.*.guest.pc;
+        let off: i32 = pc as i32;
+        if (off < 0 || off >= ram_len) { return 0 - 3; }
+        let step: i32 = btm_step(btm, code);
+        if (step < 0) { return step; }
+        done = done + 1;
+        i = i + 1;
+    }
+    return done;
+}
+
+fn guest_boot_pc(btm: *BinaryTranslationMatrix) u64 {
+    return btm.*.guest.pc;
+}

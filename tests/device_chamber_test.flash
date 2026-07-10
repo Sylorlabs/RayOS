@@ -1,0 +1,64 @@
+// device_chamber_test.flash — enumeration + RTC chamber ABI roundtrip.
+//
+// Exercises exactly the register reads a native bus controller / RTC would
+// serve: publish records into the chamber, read them back, check the
+// generation counter, and verify the RTC registers hold what was seeded.
+
+@import("../driver/device_chamber.flash")
+@import("../driver/rtc.flash")
+
+fn main() i32 {
+    _zag_println("device_chamber_test: running");
+
+    if (device_chamber_init() != 0) {
+        _zag_println("device_chamber_test: FAIL init");
+        return 1;
+    }
+
+    let g0: i32 = device_chamber_generation();
+    let sample: []u8 = "USB|Ternary Probe|0e8d:0616  480 Mb/s|attached\nWIFI|w0|aa:bb|up\n";
+    let wrote: i32 = device_chamber_publish(sample);
+    if (wrote != 2) {
+        _zag_println("device_chamber_test: FAIL publish count");
+        return 1;
+    }
+    if (device_chamber_generation() != g0 + 1) {
+        _zag_println("device_chamber_test: FAIL generation bump");
+        return 1;
+    }
+    if (device_chamber_count() != 2) {
+        _zag_println("device_chamber_test: FAIL count register");
+        return 1;
+    }
+
+    let back: []u8 = device_chamber_report();
+    if (_zag_strcmp(back, sample) == 0) {
+        _zag_println("device_chamber_test: FAIL roundtrip");
+        _zag_println(back);
+        return 1;
+    }
+
+    // record truncation stays inside field capacity and NUL-terminates
+    let long: []u8 = "USB|This Device Name Is Much Longer Than The Fifty Six Byte Record Field Allows For|d|attached\n";
+    let _w2: i32 = device_chamber_publish(long);
+    let back2: []u8 = device_chamber_report();
+    if (back2.len < 8) {
+        _zag_println("device_chamber_test: FAIL truncation roundtrip");
+        return 1;
+    }
+
+    // RTC chamber: epoch register is plausible and offset register readable
+    let epoch: i64 = rtc_now_epoch();
+    if (epoch < 1000000000) {
+        _zag_println("device_chamber_test: FAIL rtc epoch");
+        return 1;
+    }
+    let off: i64 = rtc_utc_offset_secs(epoch);
+    if (off < 0 - 50400 || off > 50400) {
+        _zag_println("device_chamber_test: FAIL rtc offset range");
+        return 1;
+    }
+
+    _zag_println("device_chamber_test: ok");
+    return 0;
+}

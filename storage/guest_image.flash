@@ -1,0 +1,62 @@
+// storage/guest_image.flash — load x86 boot sector (512 B) into guest RAM.
+//
+// Reads a host file via _zag_read_file when path is non-empty; otherwise pulls
+// block SOH_BLOCK_BOOT_ID from the SOH block store.  Copies 512 bytes into
+// guest_ram at byte offset gpa (x86 real-mode default 0x7C00).
+//
+// Import chain (no @import here — splice from test / init entry):
+//   @import("../core/constants.flash")
+//   @import("../math/trit_core.flash")
+//   @import("../math/tekum.flash")
+//   @import("../math/offset_loop.flash")
+//   @import("../driver/hw_rt.flash")
+//   @import("../driver/soh_mmio.flash")
+//   @import("soh_block.flash")
+//   @import("guest_image.flash")
+//
+//   let ram: ArrayList[u8] = make[u8](65536);
+//   guest_image_load_boot_sector("/path/boot.bin", &ram, (GPA_BOOT_SECTOR() as i32));
+
+fn GUEST_BOOT_SECTOR_BYTES() i32 { return (SOH_BLOCK_SIZE() as i32); }
+
+fn guest_image_ram_fit(guest_ram: *ArrayList[u8], gpa: i32, nbytes: i32) i32 {
+    let end: i32 = gpa + nbytes;
+    if (gpa < 0) { return 0; }
+    while (len[u8](guest_ram.*) < end) {
+        push[u8](guest_ram, 0);
+    }
+    return 1;
+}
+
+fn guest_image_copy_to_ram(
+    guest_ram: *ArrayList[u8],
+    gpa: i32,
+    src: []u8,
+    nbytes: i32,
+) i32 {
+    if (guest_image_ram_fit(guest_ram, gpa, nbytes) == 0) { return 0 - 1; }
+    let i: i32 = 0;
+    while (i < nbytes) {
+        set[u8](guest_ram, gpa + i, src[i]);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Load 512-byte boot sector into guest_ram at offset gpa.
+// Empty path loads from SOH block SOH_BLOCK_BOOT_ID.  Returns 0 on success.
+fn guest_image_load_boot_sector(path: []u8, guest_ram: *ArrayList[u8], gpa: i32) i32 {
+    let nbytes: i32 = (GUEST_BOOT_SECTOR_BYTES() as i32);
+    if (guest_image_ram_fit(guest_ram, gpa, nbytes) == 0) { return 0 - 1; }
+
+    if (path.len < 1) {
+        let sector: ArrayList[u8] = make[u8](nbytes);
+        let rc: i32 = soh_block_read((SOH_BLOCK_BOOT_ID() as i32), &sector);
+        if (rc != 0) { return 0 - 2; }
+        return guest_image_copy_to_ram(guest_ram, gpa, sector.data[0..nbytes], nbytes);
+    }
+
+    let raw: []u8 = _zag_read_file(path);
+    if (raw.len < nbytes) { return 0 - 3; }
+    return guest_image_copy_to_ram(guest_ram, gpa, raw[0..nbytes], nbytes);
+}

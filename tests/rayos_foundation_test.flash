@@ -1,0 +1,67 @@
+// rayos_foundation_test.zag — Spatial Fabric + Tekum + BTM integration smoke test
+
+@import("../core/init.flash")
+@import("../driver/virtio_block_mmio_nop.flash")
+@import("../driver/virtio_gpu_mmio_nop.flash")
+
+fn test_fail(msg: []u8) void {
+    _zag_print("rayos_foundation_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn test_expect_i64(got: i64, want: i64, msg: []u8) void {
+    if (got != want) { test_fail(msg); }
+}
+
+fn test_expect_i32(got: i32, want: i32, msg: []u8) void {
+    if (got != want) { test_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("rayos_foundation_test: running");
+
+    let base: TekumValue = tekum_from_i64(100);
+    let stride: TekumValue = tekum_from_i64((FLASH_CHAMBER_STRIDE_TRITS() as i32));
+    let off: TekumValue = flash_offset_compute(base, stride, 2);
+    test_expect_i64(tekum_to_i64(off), 100 + 2 * 512, "flash_offset_compute");
+
+    let soh_off: i64 = flash_offset_compute_i64(0, 1, 7);
+    test_expect_i64(soh_off, 7, "flash_offset_compute_i64 unit stride");
+
+    let f: SpatialRoutingFabric = fabric_new();
+    let bid: i32 = fabric_bind_application(&f, 7, 2, 5, 1);
+    if (bid < 0) { test_fail("fabric_bind_application"); }
+
+    if (fabric_resolve_route(f, 2, 5, 1)) |route| {
+        test_expect_i32(route.flowing, 1, "route must be latched and flowing");
+        test_expect_i32(route.src_chamber, 2, "src_chamber");
+        test_expect_i32(route.dst_chamber, 5, "dst_chamber");
+    } else {
+        test_fail("fabric_resolve_route");
+    }
+
+    if (fabric_release(&f, bid) != 1) { test_fail("fabric_release"); }
+    fabric_free(&f);
+
+    let hv: *BinaryTranslationMatrix = btm_new();
+    btm_attach_guest(hv, GuestArch.X86_64);
+
+    let code: *u8 = _zag_malloc(1);
+    code[0] = 144;
+    let slice: []u8 = code[0..1];
+    let step: i32 = btm_step(hv, slice);
+    _zag_free(code);
+    if (step < 0) { test_fail("btm_step nop"); }
+    test_expect_i64(btm_guest_pc(hv) as i64, 1, "guest pc after nop");
+
+    btm_free(hv);
+
+    let sys: RayOS = rayos_init();
+    if (sys.ready != 1) { test_fail("rayos_init ready"); }
+    if (sys.boot.fabric_bindings < 1) { test_fail("system fabric binding"); }
+    rayos_shutdown(&sys);
+
+    _zag_println("rayos_foundation_test: ok");
+    return 0;
+}

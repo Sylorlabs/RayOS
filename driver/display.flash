@@ -1,0 +1,79 @@
+// driver/display.flash — RayOS display + input without C/SDL.
+
+@import("../../flash/flash/driver/softgpu.flash")
+//
+// Present: softgpu device kind 0 = PPM file, kind 1 = /dev/fb0 raw blit.
+// Input:   poll /tmp/rayos_input.ev (written by evdev helper or tests).
+
+fn display_dev_ppm(path: []u8) SoftGpuDevice {
+    return SoftGpuDevice{ .kind = 0, .path = path };
+}
+
+fn display_dev_fb0() SoftGpuDevice {
+    return SoftGpuDevice{ .kind = 1, .path = "/dev/fb0" };
+}
+
+fn display_present(fb: *SoftFb, dev: SoftGpuDevice) i32 {
+    return softgpu_present(dev, fb);
+}
+
+fn display_skip_ws(s: []u8, i: i32) i32 {
+    let at: i32 = i;
+    while (at < s.len) {
+        let c: u8 = s[at];
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            at = at + 1;
+        } else {
+            return at;
+        }
+    }
+    return at;
+}
+
+fn display_read_int(s: []u8, i: i32) i32 {
+    let at: i32 = display_skip_ws(s, i);
+    let end: i32 = at;
+    let done: i32 = 0;
+    while (end < s.len && done == 0) {
+        let c: u8 = s[end];
+        if (c >= 48 && c <= 57) {
+            end = end + 1;
+        } else {
+            done = 1;
+        }
+    }
+    if (end <= at) { return 0; }
+    return _zag_str_to_i64(s[at..end]) as i32;
+}
+
+fn display_int_end(s: []u8, i: i32) i32 {
+    let at: i32 = display_skip_ws(s, i);
+    while (at < s.len) {
+        let c: u8 = s[at];
+        if (c >= 48 && c <= 57) {
+            at = at + 1;
+        } else {
+            return at;
+        }
+    }
+    return at;
+}
+
+fn display_poll_mouse(mx: *i32, my: *i32, btn: *i32) i32 {
+    let raw: []u8 = _zag_read_file("/tmp/rayos_input.ev");
+    if (raw.len < 3) { return 0; }
+    let x: i32 = display_read_int(raw, 0);
+    let at: i32 = display_skip_ws(raw, display_int_end(raw, 0));
+    let y: i32 = display_read_int(raw, at);
+    let at2: i32 = display_skip_ws(raw, display_int_end(raw, at));
+    let b: i32 = display_read_int(raw, at2);
+    mx.* = x;
+    my.* = y;
+    btn.* = b;
+    _zag_write_file("/tmp/rayos_input.ev", "");
+    return 1;
+}
+
+fn display_clear_input() void {
+    _zag_write_file("/tmp/rayos_input.ev", "");
+}

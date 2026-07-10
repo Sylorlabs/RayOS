@@ -1,0 +1,87 @@
+// guest_fb.flash — load guest VNC capture PPM (P6) into compositor guest pool.
+
+fn guest_fb_skip_ws(s: []u8, i: i32) i32 {
+    let at: i32 = i;
+    while (at < s.len) {
+        let c: u8 = s[at];
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            at = at + 1;
+        } else {
+            return at;
+        }
+    }
+    return at;
+}
+
+fn guest_fb_read_int(s: []u8, i: i32) i32 {
+    let at: i32 = guest_fb_skip_ws(s, i);
+    let end: i32 = at;
+    let done: i32 = 0;
+    while (end < s.len && done == 0) {
+        let c: u8 = s[end];
+        if (c >= 48 && c <= 57) {
+            end = end + 1;
+        } else {
+            done = 1;
+        }
+    }
+    if (end <= at) { return 0; }
+    return _zag_str_to_i64(s[at..end]) as i32;
+}
+
+fn guest_fb_int_end(s: []u8, i: i32) i32 {
+    let at: i32 = guest_fb_skip_ws(s, i);
+    while (at < s.len) {
+        let c: u8 = s[at];
+        if (c >= 48 && c <= 57) {
+            at = at + 1;
+        } else {
+            return at;
+        }
+    }
+    return at;
+}
+
+// Returns bytes copied, or 0 on failure.
+fn guest_fb_load_ppm_into(
+    path: []u8,
+    pool: *ArrayList[u8],
+    dst_off: i32,
+    dst_w: i32,
+    dst_h: i32,
+) i32 {
+    let raw: []u8 = _zag_read_file(path);
+    if (raw.len < 11) { return 0; }
+    if (raw[0] != 80 || raw[1] != 54) { return 0; }
+
+    let at0: i32 = guest_fb_skip_ws(raw, 2);
+    let src_w: i32 = guest_fb_read_int(raw, at0);
+    let at1: i32 = guest_fb_skip_ws(raw, guest_fb_int_end(raw, at0));
+    let src_h: i32 = guest_fb_read_int(raw, at1);
+    let at2: i32 = guest_fb_skip_ws(raw, guest_fb_int_end(raw, at1));
+    let maxv: i32 = guest_fb_read_int(raw, at2);
+    let data_at: i32 = guest_fb_int_end(raw, at2) + 1;
+
+    if (src_w < 1 || src_h < 1 || maxv != 255) { return 0; }
+    let need: i32 = src_w * src_h * 3;
+    if (raw.len < data_at + need) { return 0; }
+
+    let y: i32 = 0;
+    while (y < dst_h) {
+        let sy: i32 = (y * src_h) / dst_h;
+        let x: i32 = 0;
+        while (x < dst_w) {
+            let sx: i32 = (x * src_w) / dst_w;
+            let si: i32 = data_at + (sy * src_w + sx) * 3;
+            let di: i32 = dst_off + (y * dst_w + x) * 3;
+            if (di + 2 < len[u8](pool.*) && si + 2 < raw.len) {
+                set[u8](pool, di, raw[si]);
+                set[u8](pool, di + 1, raw[si + 1]);
+                set[u8](pool, di + 2, raw[si + 2]);
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return dst_w * dst_h * 3;
+}

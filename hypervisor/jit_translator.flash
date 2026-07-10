@@ -1,0 +1,261 @@
+// hypervisor/jit_translator.zag — JIT spatial translator (binary insn → trit phase)
+//
+// Decodes legacy guest machine code into balanced-ternary phase streams suitable
+// for single-channel wave brute-force execution on the SOH tile plane.
+//
+// DEPENDENCY: core/constants.zag, guest_regs.zag, x86_decode.flash, flash/stdlib/trit_math.zag
+
+struct PhaseBuffer {
+    trits: *i8,
+    len: i32,
+    cap: i32,
+}
+
+struct TranslatedBlock {
+    start_pc: u64,
+    insn_count: i32,
+    phase_len: i32,
+    phases: PhaseBuffer,
+    total_insn_bytes: i32,
+}
+
+fn phase_buf_new() PhaseBuffer {
+    let cap: i32 = (JIT_PHASE_BUF_LEN() as i32);
+    let raw: *i8 = _zag_malloc(cap);
+    let i: i32 = 0;
+    while (i < cap) {
+        raw[i] = (PHASE_ZERO() as i8);
+        i = i + 1;
+    }
+    return PhaseBuffer{ .trits = raw, .len = 0, .cap = cap };
+}
+
+fn phase_buf_free(buf: *PhaseBuffer) void {
+    if (buf.*.trits != null as *i8) {
+        _zag_free(buf.*.trits);
+    }
+    buf.*.trits = null as *i8;
+    buf.*.len = 0;
+    buf.*.cap = 0;
+}
+
+fn decoded_insn_free(dec: *DecodedInsn) void {
+    if (dec.*.raw != null as *u8) {
+        _zag_free(dec.*.raw);
+    }
+    dec.*.raw = null as *u8;
+    dec.*.raw_len = 0;
+}
+
+fn bit_to_phase(bit: u8) i8 {
+    if ((bit % 2) != 0) {
+        return (PHASE_POS() as i8);
+    }
+    return (PHASE_NEG() as i8);
+}
+
+fn phase_neutral() i8 {
+    return (PHASE_ZERO() as i8);
+}
+
+fn byte_to_phases(byte: u8, out: *PhaseBuffer) void {
+    let bit: i32 = 7;
+    while (bit >= 0) {
+        let shift: i32 = bit;
+        let shifted: u8 = byte;
+        let i: i32 = 0;
+        while (i < shift) {
+            shifted = shifted / 2;
+            i = i + 1;
+        }
+        if (out.*.len < out.*.cap) {
+            out.*.trits[out.*.len] = bit_to_phase(shifted);
+            out.*.len = out.*.len + 1;
+        }
+        bit = bit - 1;
+    }
+}
+
+fn bytes_to_phases(bytes: []u8) PhaseBuffer {
+    let buf: PhaseBuffer = phase_buf_new();
+    let i: i32 = 0;
+    while (i < bytes.len) {
+        byte_to_phases(bytes[i], &buf);
+        if (i + 1 < bytes.len && buf.len < buf.cap) {
+            buf.trits[buf.len] = phase_neutral();
+            buf.len = buf.len + 1;
+        }
+        i = i + 1;
+    }
+    return buf;
+}
+
+fn phase_buf_push(buf: *PhaseBuffer, t: i8) void {
+    if (buf.*.len < buf.*.cap) {
+        buf.*.trits[buf.*.len] = t;
+        buf.*.len = buf.*.len + 1;
+    }
+}
+
+fn phase_buf_append(dst: *PhaseBuffer, src: PhaseBuffer) void {
+    let i: i32 = 0;
+    while (i < src.len) {
+        phase_buf_push(dst, src.trits[i]);
+        i = i + 1;
+    }
+}
+
+fn phase_combine(a: i8, b: i8) i8 {
+    let r: TritAddResult = add(a, b, (PHASE_ZERO() as i8));
+    return r.sum;
+}
+
+fn phase_reduce(buf: PhaseBuffer) i8 {
+    let acc: i8 = phase_neutral();
+    let i: i32 = 0;
+    while (i < buf.len) {
+        acc = phase_combine(acc, buf.trits[i]);
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn decode_copy_raw(out: *DecodedInsn, bytes: []u8) void {
+    let n: i32 = bytes.len;
+    if (n > (INSN_MAX_BYTES() as i32)) { n = (INSN_MAX_BYTES() as i32); }
+    if (out.*.raw != null as *u8) {
+        _zag_free(out.*.raw);
+    }
+    out.*.raw = _zag_malloc(n);
+    let i: i32 = 0;
+    while (i < n) {
+        out.*.raw[i] = bytes[i];
+        i = i + 1;
+    }
+    out.*.raw_len = n;
+}
+
+// Status: 0 ok, -1 empty, -2 truncated
+fn decode_x86_64(pc: u64, bytes: []u8, out: *DecodedInsn) i32 {
+    if (bytes.len == 0) { return 0 - 1; }
+    let dec: DecodedInsn = x86_decode_insn(pc, bytes);
+    if (dec.len == 0) { return 0 - 2; }
+    if (dec.len > bytes.len) { return 0 - 2; }
+    out.*.arch = dec.arch;
+    out.*.pc = dec.pc;
+    out.*.len = dec.len;
+    out.*.klass = dec.klass;
+    out.*.opcode = dec.opcode;
+    out.*.modrm = dec.modrm;
+    out.*.imm = dec.imm;
+    decode_copy_raw(out, bytes[0..dec.len]);
+    return 0;
+}
+
+fn decode_arm64(pc: u64, bytes: []u8, out: *DecodedInsn) i32 {
+    if (bytes.len < 4) { return 0 - 2; }
+    let word: u32 = 0;
+    word = (bytes[0] as u32)
+        + ((bytes[1] as u32) * 256)
+        + ((bytes[2] as u32) * 65536)
+        + ((bytes[3] as u32) * 16777216);
+    out.*.arch = GuestArch.ARM64;
+    out.*.pc = pc;
+    out.*.len = 4;
+    out.*.klass = InsnClass.Unknown;
+    out.*.opcode = (word % 256) as u8;
+    out.*.modrm = 0;
+    out.*.imm = 0;
+    decode_copy_raw(out, bytes[0..4]);
+    let hi: u32 = word / 67108864;
+    if (hi == 210) {
+        out.*.klass = InsnClass.Sys;
+    }
+    if (out.*.klass == InsnClass.Unknown) {
+        let op_hi: u32 = word / 2097152;
+        if (op_hi == 512) {
+            out.*.klass = InsnClass.Add;
+        } else if (op_hi == 584) {
+            out.*.klass = InsnClass.Sub;
+        } else if (op_hi == 360) {
+            out.*.klass = InsnClass.Load;
+        } else if (op_hi == 688) {
+            out.*.klass = InsnClass.Store;
+        }
+    }
+    return 0;
+}
+
+fn decode_insn_stub_x86(pc: u64, bytes: []u8, out: *DecodedInsn) i32 {
+    return decode_x86_64(pc, bytes, out);
+}
+
+fn decode_insn_stub_arm(pc: u64, bytes: []u8, out: *DecodedInsn) i32 {
+    return decode_arm64(pc, bytes, out);
+}
+
+fn klass_tag_phase(klass: InsnClass) i8 {
+    if (klass == InsnClass.Nop) { return (PHASE_ZERO() as i8); }
+    if (klass == InsnClass.Mov) { return (PHASE_POS() as i8); }
+    if (klass == InsnClass.Add) { return (PHASE_POS() as i8); }
+    if (klass == InsnClass.Sub) { return (PHASE_NEG() as i8); }
+    if (klass == InsnClass.Jmp) { return (PHASE_ZERO() as i8); }
+    if (klass == InsnClass.Call) { return (PHASE_POS() as i8); }
+    if (klass == InsnClass.Ret) { return (PHASE_NEG() as i8); }
+    if (klass == InsnClass.Load) { return (PHASE_POS() as i8); }
+    if (klass == InsnClass.Store) { return (PHASE_NEG() as i8); }
+    if (klass == InsnClass.Push) { return (PHASE_NEG() as i8); }
+    if (klass == InsnClass.Pop) { return (PHASE_POS() as i8); }
+    if (klass == InsnClass.Xor) { return (PHASE_ZERO() as i8); }
+    if (klass == InsnClass.Hlt) { return (PHASE_ZERO() as i8); }
+    return phase_neutral();
+}
+
+fn insn_to_phases(dec: DecodedInsn) PhaseBuffer {
+    let raw_slice: []u8 = dec.raw[0..dec.raw_len];
+    let body: PhaseBuffer = bytes_to_phases(raw_slice);
+    let buf: PhaseBuffer = phase_buf_new();
+    phase_buf_push(&buf, klass_tag_phase(dec.klass));
+    phase_buf_push(&buf, phase_neutral());
+    phase_buf_append(&buf, body);
+    phase_buf_free(&body);
+    return buf;
+}
+
+fn translate_insn_x86(pc: u64, bytes: []u8, out_phases: *PhaseBuffer) i32 {
+    let dec: DecodedInsn = DecodedInsn{
+        .arch = GuestArch.X86_64,
+        .pc = pc,
+        .len = 0,
+        .klass = InsnClass.Unknown,
+        .opcode = 0,
+        .modrm = 0,
+        .imm = 0,
+        .raw = null as *u8,
+        .raw_len = 0,
+    };
+    let st: i32 = decode_x86_64(pc, bytes, &dec);
+    if (st != 0) { return st; }
+    out_phases.* = insn_to_phases(dec);
+    decoded_insn_free(&dec);
+    return 0;
+}
+
+fn translate_insn_arm(pc: u64, bytes: []u8, out_phases: *PhaseBuffer) i32 {
+    let dec: DecodedInsn = DecodedInsn{
+        .arch = GuestArch.ARM64,
+        .pc = pc,
+        .len = 0,
+        .klass = InsnClass.Unknown,
+        .opcode = 0,
+        .modrm = 0,
+        .imm = 0,
+        .raw = null as *u8,
+        .raw_len = 0,
+    };
+    let st: i32 = decode_arm64(pc, bytes, &dec);
+    if (st != 0) { return st; }
+    out_phases.* = insn_to_phases(dec);
+    decoded_insn_free(&dec);
+    return 0;
+}

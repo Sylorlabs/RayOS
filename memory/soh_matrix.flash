@@ -1,0 +1,149 @@
+// memory/soh_matrix.zag — SOH crystal tile memory plane for guest register shadows
+//
+// Each tile exposes SOH_SLOTS_PER_TILE balanced-ternary slots.  The hypervisor
+// maps guest GPRs, flags, and PC into tile coordinates for single-channel wave
+// brute-force emulation.
+//
+
+
+
+struct SOHTileCoord {
+    x: i32,
+    y: i32,
+}
+
+struct SOHSlotRef {
+    tile: SOHTileCoord,
+    slot: i32,
+}
+
+struct SOHMatrix {
+    tiles_x: i32,
+    tiles_y: i32,
+    slots_per_tile: i32,
+    trits: *i8,
+    capacity: i32,
+}
+
+fn soh_tile_coord(x: i32, y: i32) SOHTileCoord {
+    return SOHTileCoord{ .x = x, .y = y };
+}
+
+fn soh_slot_ref(tile_x: i32, tile_y: i32, slot: i32) SOHSlotRef {
+    return SOHSlotRef{
+        .tile = soh_tile_coord(tile_x, tile_y),
+        .slot = slot,
+    };
+}
+
+fn soh_flat_index(m: SOHMatrix, tile_x: i32, tile_y: i32, slot: i32) i32 {
+    if (tile_x < 0 || tile_y < 0) { return 0 - 1; }
+    if (tile_x >= m.tiles_x || tile_y >= m.tiles_y) { return 0 - 1; }
+    if (slot < 0 || slot >= m.slots_per_tile) { return 0 - 2; }
+    let tile_idx: i32 = tile_y * m.tiles_x + tile_x;
+    return tile_idx * m.slots_per_tile + slot;
+}
+
+fn soh_new(tiles_x: i32, tiles_y: i32) *SOHMatrix {
+    let tx: i32 = tiles_x;
+    let ty: i32 = tiles_y;
+    if (tx < 1) { tx = (SOH_DEFAULT_TILES_X() as i32); }
+    if (ty < 1) { ty = (SOH_DEFAULT_TILES_Y() as i32); }
+    let spt: i32 = (SOH_SLOTS_PER_TILE() as i32);
+    let cap: i32 = tx * ty * spt;
+    let raw: *i8 = _zag_malloc(cap);
+    let i: i32 = 0;
+    while (i < cap) {
+        raw[i] = (PHASE_ZERO() as i8);
+        i = i + 1;
+    }
+    let heap: *i8 = _zag_malloc(@sizeOf[SOHMatrix]());
+    let m: *SOHMatrix = heap as *SOHMatrix;
+    m.* = SOHMatrix{
+        .tiles_x = tx,
+        .tiles_y = ty,
+        .slots_per_tile = spt,
+        .trits = raw,
+        .capacity = cap,
+    };
+    return m;
+}
+
+fn soh_free(m: *SOHMatrix) void {
+    if (m.*.trits != null as *i8) {
+        _zag_free(m.*.trits);
+    }
+    m.*.trits = null as *i8;
+    m.*.capacity = 0;
+    _zag_free(m as *i8);
+}
+
+fn soh_write_trit_checked(m: *SOHMatrix, tile_x: i32, tile_y: i32, slot: i32, t: i8) i32 {
+    if (tile_x < 0 || tile_y < 0) { return 1; }
+    if (tile_x >= m.*.tiles_x || tile_y >= m.*.tiles_y) { return 1; }
+    if (slot < 0 || slot >= m.*.slots_per_tile) { return 2; }
+    let tile_idx: i32 = tile_y * m.*.tiles_x + tile_x;
+    let idx: i32 = tile_idx * m.*.slots_per_tile + slot;
+    m.*.trits[idx] = t;
+    return 0;
+}
+
+fn soh_read_trit(m: SOHMatrix, tile_x: i32, tile_y: i32, slot: i32) i8 {
+    let idx: i32 = soh_flat_index(m, tile_x, tile_y, slot);
+    if (idx < 0) { return (PHASE_ZERO() as i8); }
+    return m.trits[idx];
+}
+
+// Status: 0 = ok, 1 = OutOfBounds, 2 = InvalidSlot.
+fn soh_store_u64_checked(m: *SOHMatrix, base: SOHSlotRef, val: u64) i32 {
+    let end_slot: i32 = base.slot + (SOH_TRITS_PER_U64() as i32) - 1;
+    if (base.tile.x < 0 || base.tile.y < 0) { return 1; }
+    if (base.tile.x >= m.*.tiles_x || base.tile.y >= m.*.tiles_y) { return 1; }
+    if (base.slot < 0 || end_slot >= m.*.slots_per_tile) { return 2; }
+    let tile_idx: i32 = base.tile.y * m.*.tiles_x + base.tile.x;
+    let base_idx: i32 = tile_idx * m.*.slots_per_tile + base.slot;
+    let bit: i32 = 0;
+    while (bit < (SOH_TRITS_PER_U64() as i32)) {
+        let shift: i32 = 63 - bit;
+        let shifted: u64 = val;
+        let i: i32 = 0;
+        while (i < shift) {
+            shifted = shifted / 2;
+            i = i + 1;
+        }
+        let tr: i8 = (PHASE_NEG() as i8);
+        if ((shifted % 2) != 0) {
+            tr = (PHASE_POS() as i8);
+        }
+        m.*.trits[base_idx + bit] = tr;
+        bit = bit + 1;
+    }
+    return 0;
+}
+
+fn soh_load_u64_checked(m: *SOHMatrix, base: SOHSlotRef) u64 {
+    let out: u64 = 0;
+    let end_slot: i32 = base.slot + (SOH_TRITS_PER_U64() as i32) - 1;
+    if (base.tile.x < 0 || base.tile.y < 0) { return 0; }
+    if (base.tile.x >= m.*.tiles_x || base.tile.y >= m.*.tiles_y) { return 0; }
+    if (base.slot < 0 || end_slot >= m.*.slots_per_tile) { return 0; }
+    let tile_idx: i32 = base.tile.y * m.*.tiles_x + base.tile.x;
+    let base_idx: i32 = tile_idx * m.*.slots_per_tile + base.slot;
+    let bit: i32 = 0;
+    while (bit < (SOH_TRITS_PER_U64() as i32)) {
+        let tr: i8 = m.*.trits[base_idx + bit];
+        let one: u64 = 1;
+        let shift: i32 = 63 - bit;
+        if (tr == (PHASE_POS() as i8)) {
+            let i: i32 = 0;
+            let acc: u64 = one;
+            while (i < shift) {
+                acc = acc * 2;
+                i = i + 1;
+            }
+            out = out + acc;
+        }
+        bit = bit + 1;
+    }
+    return out;
+}

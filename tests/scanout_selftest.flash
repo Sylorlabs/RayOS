@@ -1,0 +1,40 @@
+// scanout_selftest.flash — display chamber MMIO scanout self-test.
+
+@import("../../flash/flash/driver/softgpu.flash")
+@import("../driver/display_chamber.flash")
+
+fn main() i32 {
+    _zag_println("scanout_selftest: running");
+
+    let w: i32 = 320;
+    let h: i32 = 200;
+    if (display_chamber_init(w, h) != 0) {
+        _zag_println("scanout_selftest: FAIL init");
+        return 1;
+    }
+
+    let fb: SoftFb = softgpu_new(w, h);
+    softgpu_clear(&fb, 24, 32, 64);
+    softgpu_fill_rect(&fb, 40, 30, 120, 80, 200, 64, 128);
+
+    if (scanout_blit(&fb) != 0) {
+        _zag_println("scanout_selftest: FAIL blit");
+        return 1;
+    }
+    scanout_clear_present_flag();
+    if (scanout_present() != 0) {
+        _zag_println("scanout_selftest: FAIL present");
+        return 1;
+    }
+    if (scanout_present_flag() != 1) {
+        _zag_println("scanout_selftest: FAIL present_flag");
+        return 1;
+    }
+    if (scanout_frame_seq() < 1) {
+        _zag_println("scanout_selftest: FAIL frame_seq");
+        return 1;
+    }
+
+    _zag_println("scanout_selftest: ok");
+    return 0;
+}

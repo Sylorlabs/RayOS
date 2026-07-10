@@ -1,0 +1,289 @@
+// desktop/shell.flash — RayOS bottom taskbar (48px): logo orb, start pill,
+// window buttons, system tray. Composites over wm windows on the framebuffer.
+//
+//   let sh: ShellState = shell_new(1280, 720);
+//   shell_set_clock(&sh, 52200);
+//   shell_paint(&sh, &fb, &wm);
+
+@import("theme.flash")
+@import("wm.flash")
+
+fn shell_hit_none() i32       { return 0; }
+fn shell_hit_logo() i32       { return 1; }
+fn shell_hit_start() i32      { return 2; }
+fn shell_hit_window() i32     { return 3; }
+fn shell_hit_tray_clock() i32 { return 4; }
+fn shell_hit_tray_net() i32   { return 5; }
+fn shell_hit_tray_vms() i32   { return 6; }
+
+struct ShellHit {
+    kind: i32,
+    id: i32,
+}
+
+struct ShellState {
+    screen_w: i32,
+    screen_h: i32,
+    clock_secs: i64,
+    network_up: i32,
+    guest_vm_count: i32,
+    win_btn_x: ArrayList[i32],
+    win_btn_w: ArrayList[i32],
+    win_btn_id: ArrayList[i32],
+    tray_clock_x: i32,
+    tray_clock_w: i32,
+    tray_net_x: i32,
+    tray_net_w: i32,
+    tray_vm_x: i32,
+    tray_vm_w: i32,
+}
+
+fn shell_new(w: i32, h: i32) ShellState {
+    return ShellState{
+        .screen_w = w,
+        .screen_h = h,
+        .clock_secs = 0,
+        .network_up = 1,
+        .guest_vm_count = 0,
+        .win_btn_x = make[i32](8),
+        .win_btn_w = make[i32](8),
+        .win_btn_id = make[i32](8),
+        .tray_clock_x = 0,
+        .tray_clock_w = 0,
+        .tray_net_x = 0,
+        .tray_net_w = 0,
+        .tray_vm_x = 0,
+        .tray_vm_w = 0,
+    };
+}
+
+fn shell_set_clock(sh: *ShellState, secs: i64) void {
+    sh.*.clock_secs = secs;
+}
+
+fn shell_set_network(sh: *ShellState, up: i32) void {
+    sh.*.network_up = up;
+}
+
+fn shell_set_guest_vms(sh: *ShellState, count: i32) void {
+    sh.*.guest_vm_count = count;
+}
+
+fn shell_taskbar_y(sh: ShellState, th: RayOsTheme) i32 {
+    return sh.screen_h - th.taskbar_h;
+}
+
+// Tray items exist only when they represent real state: the VM counter when
+// guest VMs are running, the network dot when a link is actually up.
+fn shell_layout_tray(sh: *ShellState) void {
+    let vm_w: i32 = 0;
+    if (sh.*.guest_vm_count > 0) {
+        vm_w = rayos_vm_width(sh.*.guest_vm_count, 11.0);
+    }
+    let net_w: i32 = 0;
+    if (sh.*.network_up == 1) {
+        net_w = 28;
+    }
+    let clk_w: i32 = (rayos_clock_width(12.0) as i32) + 16;
+    let margin: i32 = 10;
+    let x: i32 = sh.*.screen_w - margin;
+    if (vm_w > 0) { x = x - vm_w; }
+    sh.*.tray_vm_x = x;
+    sh.*.tray_vm_w = vm_w;
+    if (net_w > 0) { x = x - net_w - 8; }
+    sh.*.tray_net_x = x;
+    sh.*.tray_net_w = net_w;
+    x = x - clk_w - 8;
+    sh.*.tray_clock_x = x;
+    sh.*.tray_clock_w = clk_w;
+}
+
+fn shell_rebuild_win_buttons(sh: *ShellState, wm: *WmState) void {
+    free[i32](&sh.*.win_btn_x);
+    free[i32](&sh.*.win_btn_w);
+    free[i32](&sh.*.win_btn_id);
+    sh.*.win_btn_x = make[i32](8);
+    sh.*.win_btn_w = make[i32](8);
+    sh.*.win_btn_id = make[i32](8);
+    let x: i32 = 148;
+    let max_x: i32 = sh.*.tray_clock_x - 12;
+    let i: i32 = 0;
+    let done: i32 = 0;
+    while (i < len[RayWindow](wm.*.windows) && done == 0) {
+        let win: RayWindow = get[RayWindow](wm.*.windows, i);
+        let title_px: i32 = win.title.len * 10;
+        if (title_px > 84) { title_px = 84; }
+        let btn_w: i32 = 34 + title_px + 10;
+        if (x + btn_w > max_x) {
+            done = 1;
+        } else {
+            push[i32](&sh.*.win_btn_x, x);
+            push[i32](&sh.*.win_btn_w, btn_w);
+            push[i32](&sh.*.win_btn_id, win.id);
+            x = x + btn_w + 6;
+            i = i + 1;
+        }
+    }
+}
+
+fn shell_paint_taskbar_bg(sh: ShellState, fb: *SoftFb, th: RayOsTheme) void {
+    let y: i32 = shell_taskbar_y(sh, th);
+    // axis-aligned bar: fast-path gradient blend, no vector rasterizer
+    softgpu_blend_vgrad_rect(
+        fb,
+        0,
+        y,
+        sh.screen_w,
+        sh.screen_h - y,
+        th.taskbar_r,
+        th.taskbar_g,
+        th.taskbar_b,
+        th.base.bg2_r,
+        th.base.bg2_g,
+        th.base.bg2_b,
+        th.taskbar_a,
+    );
+    let line: VPath = vg_path_new();
+    vg_move_to(&line, 0.0, y as f32);
+    vg_line_to(&line, sh.screen_w as f32, y as f32);
+    vg_stroke(fb, &line, 1.0, th.base.acc2_r, th.base.acc2_g, th.base.acc2_b, 80);
+}
+
+fn shell_paint_logo(sh: ShellState, fb: *SoftFb, th: RayOsTheme) void {
+    let cy: f32 = (shell_taskbar_y(sh, th) + th.taskbar_h / 2) as f32;
+    rayos_paint_orb(fb, 24.0, cy, 14.0, th);
+}
+
+fn shell_paint_start(sh: ShellState, fb: *SoftFb, th: RayOsTheme) void {
+    let y: i32 = shell_taskbar_y(sh, th) + 8;
+    rayos_paint_shadow(fb, 52.0, y as f32, 88.0, 32.0, 16.0, th);
+    softgpu_blend_round_rect_vgrad(
+        fb, 52, y, 88, 32, 16,
+        th.base.acc2_r, th.base.acc2_g, th.base.acc2_b,
+        th.base.acc_r, th.base.acc_g, th.base.acc_b,
+        255,
+    );
+    vg_text_vec(fb, 68.0, (y + 8) as f32, "Start", 12.0, 0.65, 255, 255, 255, 255);
+}
+
+fn shell_paint_window_btn(sh: ShellState, fb: *SoftFb, win: RayWindow, bx: i32, bw: i32, th: RayOsTheme) void {
+    let y: i32 = shell_taskbar_y(sh, th) + 8;
+    let xf: f32 = bx as f32;
+    if (win.focused == 1) {
+        softgpu_blend_round_rect(fb, bx, y, bw, 32, 14, th.base.acc2_r, th.base.acc2_g, th.base.acc2_b, 230);
+    } else if (win.minimized == 1) {
+        softgpu_blend_round_rect(fb, bx, y, bw, 32, 14, th.taskbar_r, th.taskbar_g, th.taskbar_b, 180);
+    } else {
+        softgpu_blend_round_rect(fb, bx, y, bw, 32, 14, 60, 62, 88, 210);
+    }
+    wm_paint_taskbar_icon(fb, wm_window_icon(win), xf + 6.0, (y + 6) as f32, 20.0, th);
+    let ink_r: i32 = th.base.ink_r;
+    let ink_g: i32 = th.base.ink_g;
+    let ink_b: i32 = th.base.ink_b;
+    if (win.minimized == 1) {
+        ink_r = th.base.mut_r;
+        ink_g = th.base.mut_g;
+        ink_b = th.base.mut_b;
+    }
+    rayos_paint_text_trunc(fb, xf + 30.0, (y + 8) as f32, win.title, bw - 38, 11.0, 0.55, ink_r, ink_g, ink_b, 255);
+}
+
+fn shell_paint_tray(sh: ShellState, fb: *SoftFb, th: RayOsTheme) void {
+    let y: f32 = (shell_taskbar_y(sh, th) + 10) as f32;
+    softgpu_blend_round_rect(
+        fb,
+        sh.tray_clock_x - 6,
+        shell_taskbar_y(sh, th) + 8,
+        sh.screen_w - sh.tray_clock_x - 4,
+        30,
+        10,
+        0, 0, 0, 36,
+    );
+    rayos_paint_clock(
+        fb,
+        (sh.tray_clock_x + 6) as f32,
+        y + 4.0,
+        sh.clock_secs,
+        12.0,
+        0.6,
+        th.base.ink_r,
+        th.base.ink_g,
+        th.base.ink_b,
+        255,
+    );
+    if (sh.tray_net_w > 0) {
+        let net_cx: f32 = (sh.tray_net_x + sh.tray_net_w / 2) as f32;
+        let net_cy: f32 = (shell_taskbar_y(sh, th) + th.taskbar_h / 2) as f32;
+        rayos_paint_status_dot(fb, net_cx, net_cy, 5.0, sh.network_up, th);
+    }
+    if (sh.tray_vm_w > 0) {
+        rayos_paint_vm_count(
+            fb,
+            (sh.tray_vm_x + 4) as f32,
+            y + 4.0,
+            sh.guest_vm_count,
+            11.0,
+            0.55,
+            th.base.mut_r,
+            th.base.mut_g,
+            th.base.mut_b,
+            255,
+        );
+    }
+}
+
+fn shell_paint(sh: *ShellState, fb: *SoftFb, wm: *WmState) void {
+    let th: RayOsTheme = wm.*.theme;
+    shell_layout_tray(sh);
+    shell_rebuild_win_buttons(sh, wm);
+    shell_paint_taskbar_bg(sh.*, fb, th);
+    shell_paint_logo(sh.*, fb, th);
+    shell_paint_start(sh.*, fb, th);
+    let bi: i32 = 0;
+    while (bi < len[i32](sh.*.win_btn_id)) {
+        let wid: i32 = get[i32](sh.*.win_btn_id, bi);
+        let win: RayWindow = wm_get(wm, wid);
+        if (win.id >= 0) {
+            let bx: i32 = get[i32](sh.*.win_btn_x, bi);
+            let bw: i32 = get[i32](sh.*.win_btn_w, bi);
+            shell_paint_window_btn(sh.*, fb, win, bx, bw, th);
+        }
+        bi = bi + 1;
+    }
+    shell_paint_tray(sh.*, fb, th);
+}
+
+fn shell_hit_test(sh: ShellState, wm: *WmState, x: i32, y: i32) ShellHit {
+    let th: RayOsTheme = wm.*.theme;
+    let miss: ShellHit = ShellHit{ .kind = shell_hit_none(), .id = 0 };
+    if (y < shell_taskbar_y(sh, th)) { return miss; }
+    if (x >= 10 && x <= 38) {
+        return ShellHit{ .kind = shell_hit_logo(), .id = 0 };
+    }
+    if (x >= 52 && x <= 140) {
+        return ShellHit{ .kind = shell_hit_start(), .id = 0 };
+    }
+    let bi: i32 = 0;
+    while (bi < len[i32](sh.win_btn_id)) {
+        let bx: i32 = get[i32](sh.win_btn_x, bi);
+        let bw: i32 = get[i32](sh.win_btn_w, bi);
+        if (x >= bx && x < bx + bw) {
+            return ShellHit{ .kind = shell_hit_window(), .id = get[i32](sh.win_btn_id, bi) };
+        }
+        bi = bi + 1;
+    }
+    if (x >= sh.tray_clock_x && x < sh.tray_clock_x + sh.tray_clock_w) {
+        return ShellHit{ .kind = shell_hit_tray_clock(), .id = 0 };
+    }
+    if (x >= sh.tray_net_x && x < sh.tray_net_x + sh.tray_net_w) {
+        return ShellHit{ .kind = shell_hit_tray_net(), .id = 0 };
+    }
+    if (x >= sh.tray_vm_x && x < sh.tray_vm_x + sh.tray_vm_w) {
+        return ShellHit{ .kind = shell_hit_tray_vms(), .id = 0 };
+    }
+    return miss;
+}
+
+fn shell_taskbar_h() i32 {
+    return rayos_taskbar_h();
+}

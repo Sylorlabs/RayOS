@@ -1,0 +1,56 @@
+@import("../storage/trifs.flash")
+
+fn trifs_test_fail(msg: []u8) void {
+    _zag_print("trifs_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn trifs_expect(ok: i32, msg: []u8) void {
+    if (ok == 0) { trifs_test_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("trifs_test: running");
+    let fs: TriFs = trifs_new();
+    let shell_task: t27 = 3;
+    let index_task: t27 = 4;
+    trifs_expect(trifs_begin(&fs, shell_task) == trifs_ok(), "begin writer");
+    trifs_expect(trifs_begin(&fs, index_task) == trifs_err_locked(), "exclude second writer");
+
+    let home: t27 = trifs_create(&fs, shell_task, trifs_root_inode(), "home", trifs_directory());
+    let docs: t27 = trifs_create(&fs, shell_task, home, "Documents", trifs_directory());
+    let note: t27 = trifs_create(&fs, shell_task, docs, "note.tri", trifs_file());
+    trifs_expect(home > 1 && docs > home && note > docs, "create hierarchy");
+    trifs_expect(trifs_create(&fs, shell_task, docs, "note.tri", trifs_file()) == trifs_no_inode(), "reject duplicate");
+    trifs_expect(trifs_create(&fs, shell_task, docs, "..", trifs_file()) == trifs_no_inode(), "reject dot path");
+
+    let payload: ArrayList[t9] = make[t9](4);
+    push[t9](&payload, 0 - 1);
+    push[t9](&payload, 0);
+    push[t9](&payload, 1);
+    push[t9](&payload, 9841);
+    trifs_expect(trifs_write(&fs, shell_task, note, 0, &payload) == 4, "write native units");
+    trifs_expect(trifs_node(&fs, note).size == 4, "native size");
+    let unit: t9 = 0;
+    trifs_expect(trifs_read_unit(&fs, note, 3, &unit) == trifs_ok(), "read unit");
+    trifs_expect(unit == 9841, "preserve t9 maximum");
+
+    trifs_expect(trifs_open(&fs, note) == trifs_ok(), "open file");
+    trifs_expect(trifs_unlink(&fs, shell_task, note) == trifs_err_busy(), "open unlink busy");
+    trifs_expect(trifs_close(&fs, note) == trifs_ok(), "close file");
+    trifs_expect(trifs_rename(&fs, shell_task, docs, note, "loop") == trifs_err_not_dir(), "file is not parent");
+    trifs_expect(trifs_rename(&fs, shell_task, home, docs, "loop") == trifs_err_invalid(), "reject directory cycle");
+    trifs_expect(trifs_rename(&fs, shell_task, note, home, "renamed.tri") == trifs_ok(), "atomic cross-directory rename");
+    trifs_expect(trifs_lookup(&fs, home, "renamed.tri") == note, "lookup renamed");
+    trifs_expect(trifs_child_count(&fs, home) == 2, "children after rename");
+    trifs_expect(trifs_unlink(&fs, shell_task, docs) == trifs_ok(), "unlink empty directory");
+    trifs_expect(trifs_unlink(&fs, shell_task, home) == trifs_err_not_empty(), "protect non-empty directory");
+    trifs_expect(trifs_commit(&fs, shell_task) == trifs_ok(), "commit");
+    trifs_expect(fs.epoch == 2 && fs.writer_task == trifs_no_inode(), "epoch and unlock");
+
+    free[t9](&payload);
+    trifs_free(&fs);
+    _zag_println("trifs_test: ok");
+    return 0;
+}

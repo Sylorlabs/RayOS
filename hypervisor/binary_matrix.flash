@@ -1,0 +1,491 @@
+// hypervisor/binary_matrix.zag — RayOS Binary Translation Matrix (BTM)
+//
+// JIT spatial hypervisor: maps legacy guest binaries into SOH tile memory and
+// advances guest state through a single wave-channel brute-force emulation step.
+//
+// DEPENDENCY: core/constants.zag, memory/soh_matrix.zag, guest_regs.zag,
+
+
+
+struct WaveChannel {
+    lane: i32,
+    phase_acc: i8,
+    brute_mask: u64,
+    symbol: i64,
+    active: i32,
+}
+
+struct BinaryTranslationMatrix {
+    matrix: *SOHMatrix,
+    guest: GuestRegisterFile,
+    reg_map: SOHRegisterMap,
+    channel: WaveChannel,
+    attached: i32,
+    steps: i64,
+    last_phase_len: i32,
+    guest_ram_ptr: i64,
+    halted: i32,
+}
+
+fn wave_channel_new() WaveChannel {
+    return WaveChannel{
+        .lane = 0,
+        .phase_acc = (PHASE_ZERO() as i8),
+        .brute_mask = 0,
+        .symbol = 0,
+        .active = 1,
+    };
+}
+
+fn wave_brute_fold(mask: u64, phase: i8) u64 {
+    let bit: i32 = 0;
+    let out: u64 = mask;
+    while (bit < (WAVE_BRUTE_LANES() as i32)) {
+        let one: u64 = 1;
+        let shift: i32 = bit;
+        let acc: u64 = one;
+        let i: i32 = 0;
+        while (i < shift) {
+            acc = acc * 2;
+            i = i + 1;
+        }
+        if (phase == (PHASE_POS() as i8)) {
+            if ((out / acc) % 2 == 0) {
+                out = out + acc;
+            }
+        } else if (phase == (PHASE_NEG() as i8)) {
+            if ((out / acc) % 2 == 1) {
+                out = out - acc;
+            }
+        }
+        bit = bit + 1;
+    }
+    return out;
+}
+
+fn wave_apply_phases(ch: *WaveChannel, phases: PhaseBuffer) void {
+    let i: i32 = 0;
+    while (i < phases.len) {
+        let t: i8 = phases.trits[i];
+        ch.*.phase_acc = phase_combine(ch.*.phase_acc, t);
+        ch.*.brute_mask = wave_brute_fold(ch.*.brute_mask, t);
+        i = i + 1;
+    }
+    ch.*.symbol = ch.*.symbol + 1;
+}
+
+fn btm_new() *BinaryTranslationMatrix {
+    let matrix: *SOHMatrix = soh_new(
+        (SOH_DEFAULT_TILES_X() as i32),
+        (SOH_DEFAULT_TILES_Y() as i32),
+    );
+    let heap: *i8 = _zag_malloc(@sizeOf[BinaryTranslationMatrix]());
+    let m: *BinaryTranslationMatrix = heap as *BinaryTranslationMatrix;
+    m.* = BinaryTranslationMatrix{
+        .matrix = matrix,
+        .guest = grf_new(GuestArch.X86_64),
+        .reg_map = soh_map_new(GuestArch.X86_64),
+        .channel = wave_channel_new(),
+        .attached = 0,
+        .steps = 0,
+        .last_phase_len = 0,
+        .guest_ram_ptr = 0,
+        .halted = 0,
+    };
+    return m;
+}
+
+fn btm_free(m: *BinaryTranslationMatrix) void {
+    grf_free(&m.*.guest);
+    soh_map_free(&m.*.reg_map);
+    soh_free(m.*.matrix);
+    _zag_free(m as *i8);
+}
+
+fn btm_attach_guest(m: *BinaryTranslationMatrix, arch: GuestArch) void {
+    grf_free(&m.*.guest);
+    soh_map_free(&m.*.reg_map);
+    m.*.guest = grf_new(arch);
+    m.*.reg_map = soh_map_default(arch);
+    m.*.channel = wave_channel_new();
+    m.*.attached = 1;
+    m.*.steps = 0;
+    m.*.last_phase_len = 0;
+    m.*.guest_ram_ptr = 0;
+    m.*.halted = 0;
+}
+
+fn btm_bind_guest_ram(m: *BinaryTranslationMatrix, ram: *ArrayList[u8]) void {
+    m.*.guest_ram_ptr = ram as i64;
+}
+
+fn btm_map_register(
+    m: *BinaryTranslationMatrix,
+    id: GuestRegId,
+    tile_x: i32,
+    tile_y: i32,
+    slot: i32,
+) i32 {
+    if (m.*.attached == 0) { return 0 - 1; }
+    return soh_map_link(&m.*.reg_map, id, tile_x, tile_y, slot);
+}
+
+fn btm_x86_reg_from_reg(modrm: u8) GuestRegId {
+    let reg: i32 = ((modrm / 8) % 8) as i32;
+    return btm_x86_reg_from_index(reg);
+}
+
+fn btm_x86_reg_from_rm(modrm: u8) GuestRegId {
+    let rm: i32 = (modrm % 8) as i32;
+    if (rm == 0) { return GuestRegId.R0; }
+    if (rm == 1) { return GuestRegId.R1; }
+    if (rm == 2) { return GuestRegId.R2; }
+    if (rm == 3) { return GuestRegId.R3; }
+    if (rm == 4) { return GuestRegId.R4; }
+    if (rm == 5) { return GuestRegId.R5; }
+    if (rm == 6) { return GuestRegId.R6; }
+    return GuestRegId.R7;
+}
+
+fn btm_x86_reg_from_index(idx: i32) GuestRegId {
+    if (idx == 0) { return GuestRegId.R0; }
+    if (idx == 1) { return GuestRegId.R1; }
+    if (idx == 2) { return GuestRegId.R2; }
+    if (idx == 3) { return GuestRegId.R3; }
+    if (idx == 4) { return GuestRegId.R4; }
+    if (idx == 5) { return GuestRegId.R5; }
+    if (idx == 6) { return GuestRegId.R6; }
+    return GuestRegId.R7;
+}
+
+fn btm_sign_extend_imm8(imm: u32) i64 {
+    if (imm >= 128) {
+        return (imm as i64) - 256;
+    }
+    return imm as i64;
+}
+
+fn btm_sign_extend_imm32(imm: u32) i64 {
+    if (imm >= 2147483648) {
+        return (imm as i64) - 4294967296;
+    }
+    return imm as i64;
+}
+
+fn btm_x86_push_u32(m: *BinaryTranslationMatrix, val: u32) void {
+    let esp: u64 = grf_get(m.*.guest, GuestRegId.R4);
+    let new_esp: u64 = esp - 4;
+    grf_set(&m.*.guest, GuestRegId.R4, new_esp);
+    if (m.*.guest_ram_ptr != 0) {
+        let ram: *ArrayList[u8] = m.*.guest_ram_ptr as *ArrayList[u8];
+        let _wr: i32 = guest_ram_write32(ram, new_esp as i32, val);
+    }
+}
+
+fn btm_x86_pop_u32(m: *BinaryTranslationMatrix) u32 {
+    let esp: u64 = grf_get(m.*.guest, GuestRegId.R4);
+    let val: u32 = 0;
+    if (m.*.guest_ram_ptr != 0) {
+        let ram: *ArrayList[u8] = m.*.guest_ram_ptr as *ArrayList[u8];
+        let rd: i64 = guest_ram_read32(ram, esp as i32);
+        if (rd >= 0) { val = rd as u32; }
+    }
+    grf_set(&m.*.guest, GuestRegId.R4, esp + 4);
+    return val;
+}
+
+fn btm_read_u32_le(raw: *u8, off: i32) u32 {
+    return (raw[off] as u32)
+        + ((raw[off + 1] as u32) * 256)
+        + ((raw[off + 2] as u32) * 65536)
+        + ((raw[off + 3] as u32) * 16777216);
+}
+
+fn btm_flags_clear_carry(m: *BinaryTranslationMatrix) void {
+    let flags: u64 = grf_get(m.*.guest, GuestRegId.Flags);
+    let cleared: u64 = (flags / 2) * 2;
+    grf_set(&m.*.guest, GuestRegId.Flags, cleared);
+}
+
+fn btm_cpuid_edx_pattern() u64 {
+    return 126614527;
+}
+
+fn btm_apply_x86_effects(m: *BinaryTranslationMatrix, dec: DecodedInsn, pc: u64) void {
+    if (dec.arch != GuestArch.X86_64) { return; }
+
+    if (dec.klass == InsnClass.Jmp) {
+        if (dec.opcode == 235) {
+            let rel: i64 = btm_sign_extend_imm8(dec.imm);
+            let target: u64 = pc + (dec.len as u64) + (rel as u64);
+            grf_set(&m.*.guest, GuestRegId.Pc, target);
+            return;
+        }
+        if (dec.opcode == 233) {
+            let rel: i64 = btm_sign_extend_imm32(dec.imm);
+            let target: u64 = pc + (dec.len as u64) + (rel as u64);
+            grf_set(&m.*.guest, GuestRegId.Pc, target);
+            return;
+        }
+        return;
+    }
+
+    if (dec.klass == InsnClass.Call) {
+        if (dec.opcode == 232) {
+            let ret_addr: u32 = (pc + (dec.len as u64)) as u32;
+            btm_x86_push_u32(m, ret_addr);
+            let rel: i64 = btm_sign_extend_imm32(dec.imm);
+            let target: u64 = pc + (dec.len as u64) + (rel as u64);
+            grf_set(&m.*.guest, GuestRegId.Pc, target);
+            return;
+        }
+        return;
+    }
+
+    if (dec.klass == InsnClass.Mov) {
+        if (dec.opcode >= 184 && dec.opcode <= 191) {
+            let dst: GuestRegId = btm_x86_reg_from_index(dec.modrm as i32);
+            grf_set(&m.*.guest, dst, dec.imm as u64);
+            return;
+        }
+        if (dec.opcode == 137) {
+            let mod: i32 = dec.modrm / 64;
+            if (mod == 3) {
+                let dst: GuestRegId = btm_x86_reg_from_rm(dec.modrm);
+                let src: GuestRegId = btm_x86_reg_from_reg(dec.modrm);
+                grf_set(&m.*.guest, dst, grf_get(m.*.guest, src));
+            }
+            return;
+        }
+        if (dec.opcode == 139) {
+            let mod: i32 = dec.modrm / 64;
+            if (mod == 3) {
+                let dst: GuestRegId = btm_x86_reg_from_reg(dec.modrm);
+                let src: GuestRegId = btm_x86_reg_from_rm(dec.modrm);
+                grf_set(&m.*.guest, dst, grf_get(m.*.guest, src));
+            }
+            return;
+        }
+        if (dec.opcode == 199) {
+            let mod: i32 = dec.modrm / 64;
+            let reg: i32 = (dec.modrm / 8) % 8;
+            let rm: i32 = dec.modrm % 8;
+            if (mod == 0 && reg == 0 && rm == 5) {
+                if (m.*.guest_ram_ptr != 0 && dec.raw_len >= 10) {
+                    let disp: i32 = btm_read_u32_le(dec.raw, 2) as i32;
+                    let ram: *ArrayList[u8] = m.*.guest_ram_ptr as *ArrayList[u8];
+                    let _wr: i32 = guest_ram_write32(ram, disp, dec.imm);
+                }
+            }
+            return;
+        }
+        return;
+    }
+
+    if (dec.klass == InsnClass.Push) {
+        let reg_idx: i32 = dec.opcode - 80;
+        let src: GuestRegId = btm_x86_reg_from_index(reg_idx);
+        let val: u32 = grf_get(m.*.guest, src) as u32;
+        btm_x86_push_u32(m, val);
+        return;
+    }
+
+    if (dec.klass == InsnClass.Pop) {
+        let reg_idx: i32 = dec.opcode - 88;
+        let dst: GuestRegId = btm_x86_reg_from_index(reg_idx);
+        let val: u32 = btm_x86_pop_u32(m);
+        grf_set(&m.*.guest, dst, val as u64);
+        return;
+    }
+
+    if (dec.klass == InsnClass.Xor) {
+        if (dec.opcode == 49 || dec.opcode == 51) {
+            let mod: i32 = dec.modrm / 64;
+            if (mod == 3) {
+                let reg_field: i32 = (dec.modrm / 8) % 8;
+                let rm_field: i32 = dec.modrm % 8;
+                if (reg_field == rm_field) {
+                    let dst: GuestRegId = btm_x86_reg_from_index(rm_field);
+                    grf_set(&m.*.guest, dst, 0);
+                }
+            }
+        }
+        return;
+    }
+
+    if (dec.klass == InsnClass.Sub) {
+        if (dec.opcode == 131) {
+            let mod: i32 = dec.modrm / 64;
+            if (mod == 3) {
+                let reg_field: i32 = (dec.modrm / 8) % 8;
+                if (reg_field == 5) {
+                    let dst: GuestRegId = btm_x86_reg_from_rm(dec.modrm);
+                    let cur: u64 = grf_get(m.*.guest, dst);
+                    let delta: i64 = btm_sign_extend_imm8(dec.imm);
+                    grf_set(&m.*.guest, dst, (cur as i64 - delta) as u64);
+                }
+            }
+        }
+        return;
+    }
+
+    if (dec.klass == InsnClass.Hlt) {
+        m.*.halted = 1;
+        return;
+    }
+
+    if (dec.klass == InsnClass.Sys) {
+        if (dec.opcode == 205) {
+            if (dec.imm == 16) { return; }
+            if (dec.imm == 22) { return; }
+            if (dec.imm == 21) {
+                btm_flags_clear_carry(m);
+                return;
+            }
+            return;
+        }
+        if (dec.opcode == 15) {
+            if (dec.imm == 162) {
+                grf_set(&m.*.guest, GuestRegId.R0, 1);
+                grf_set(&m.*.guest, GuestRegId.R1, 0);
+                grf_set(&m.*.guest, GuestRegId.R2, 0);
+                grf_set(&m.*.guest, GuestRegId.R3, btm_cpuid_edx_pattern());
+                return;
+            }
+            if (dec.imm == 49) {
+                let steps: u64 = m.*.steps;
+                grf_set(&m.*.guest, GuestRegId.R0, steps % 4294967296);
+                grf_set(&m.*.guest, GuestRegId.R2, steps / 4294967296);
+                return;
+            }
+        }
+        return;
+    }
+
+    if (dec.klass != InsnClass.Add) { return; }
+    if (dec.opcode == 5) {
+        let cur: u64 = grf_get(m.*.guest, GuestRegId.R0);
+        grf_set(&m.*.guest, GuestRegId.R0, cur + (dec.imm as u64));
+        return;
+    }
+    if (dec.opcode == 131) {
+        let mod: i32 = dec.modrm / 64;
+        if (mod != 3) { return; }
+        let dst: GuestRegId = btm_x86_reg_from_rm(dec.modrm);
+        let cur: u64 = grf_get(m.*.guest, dst);
+        grf_set(&m.*.guest, dst, cur + (dec.imm as u64));
+    }
+}
+
+// Status: >= 0 insn bytes stepped, negative = failure.
+fn btm_step_apply(
+    m: *BinaryTranslationMatrix,
+    pc: u64,
+    dec: DecodedInsn,
+    phases: PhaseBuffer,
+) i32 {
+    let insn_len: i32 = dec.len;
+    m.*.last_phase_len = phases.len;
+    wave_apply_phases(&m.*.channel, phases);
+    btm_apply_x86_effects(m, dec, pc);
+    let advance_pc: i32 = 1;
+    if (dec.klass == InsnClass.Jmp) { advance_pc = 0; }
+    if (dec.klass == InsnClass.Call) { advance_pc = 0; }
+    if (dec.klass == InsnClass.Hlt) { advance_pc = 0; }
+    if (advance_pc == 1) {
+        grf_set(&m.*.guest, GuestRegId.Pc, pc + (insn_len as u64));
+    }
+    let pc_ref: SOHSlotRef = soh_map_slot_unchecked(m.*.reg_map, GuestRegId.Pc);
+    let wr: i32 = soh_write_trit_checked(
+        m.*.matrix,
+        pc_ref.tile.x,
+        pc_ref.tile.y,
+        pc_ref.slot,
+        m.*.channel.phase_acc,
+    );
+    decoded_insn_free(&dec);
+    phase_buf_free(&phases);
+    if (wr != 0) { return 0 - wr; }
+    let pc_val: u64 = grf_get(m.*.guest, GuestRegId.Pc);
+    let pc_slot: SOHSlotRef = soh_map_slot_unchecked(m.*.reg_map, GuestRegId.Pc);
+    let st: i32 = soh_store_u64_checked(m.*.matrix, pc_slot, pc_val);
+    if (st != 0) { return 0 - st; }
+    m.*.steps = m.*.steps + 1;
+    return insn_len;
+}
+
+fn btm_step_x86(m: *BinaryTranslationMatrix, guest_bytes: []u8) i32 {
+    let pc: u64 = m.*.guest.pc;
+    let off: i32 = pc as i32;
+    if (off < 0 || off >= guest_bytes.len) { return 0 - 3; }
+    let at_pc: []u8 = guest_bytes[off..guest_bytes.len];
+    let dec: DecodedInsn = DecodedInsn{
+        .arch = GuestArch.X86_64,
+        .pc = pc,
+        .len = 0,
+        .klass = InsnClass.Unknown,
+        .opcode = 0,
+        .modrm = 0,
+        .imm = 0,
+        .raw = null as *u8,
+        .raw_len = 0,
+    };
+    let dst: DecodedInsn = dec;
+    let st: i32 = decode_insn_stub_x86(pc, at_pc, &dst);
+    if (st != 0) { return 0 - 10; }
+    if (dst.len < 1) { return 0 - 11; }
+    let phases: PhaseBuffer = insn_to_phases(dst);
+    return btm_step_apply(m, pc, dst, phases);
+}
+
+fn btm_step_arm(m: *BinaryTranslationMatrix, guest_bytes: []u8) i32 {
+    let pc: u64 = m.*.guest.pc;
+    let off: i32 = pc as i32;
+    if (off < 0 || off >= guest_bytes.len) { return 0 - 3; }
+    let at_pc: []u8 = guest_bytes[off..guest_bytes.len];
+    let dec: DecodedInsn = DecodedInsn{
+        .arch = GuestArch.ARM64,
+        .pc = pc,
+        .len = 0,
+        .klass = InsnClass.Unknown,
+        .opcode = 0,
+        .modrm = 0,
+        .imm = 0,
+        .raw = null as *u8,
+        .raw_len = 0,
+    };
+    let st: i32 = decode_insn_stub_arm(pc, at_pc, &dec);
+    if (st != 0) { return 0 - 10; }
+    let phases: PhaseBuffer = insn_to_phases(dec);
+    return btm_step_apply(m, pc, dec, phases);
+}
+
+fn btm_step(m: *BinaryTranslationMatrix, guest_bytes: []u8) i32 {
+    if (m.*.attached == 0) { return 0 - 1; }
+    if (m.*.halted == 1) { return 0 - 20; }
+    if (guest_bytes.len == 0) { return 0 - 2; }
+    if (m.*.guest.arch == GuestArch.X86_64) {
+        return btm_step_x86(m, guest_bytes);
+    }
+    return btm_step_arm(m, guest_bytes);
+}
+
+fn btm_guest_pc(m: BinaryTranslationMatrix) u64 {
+    return m.guest.pc;
+}
+
+fn btm_guest_reg(m: BinaryTranslationMatrix, id: GuestRegId) u64 {
+    return grf_get(m.guest, id);
+}
+
+fn btm_phase_acc(m: BinaryTranslationMatrix) i8 {
+    return m.channel.phase_acc;
+}
+
+fn btm_arch(m: BinaryTranslationMatrix) GuestArch {
+    return m.guest.arch;
+}
+
+fn btm_halted(m: BinaryTranslationMatrix) i32 {
+    return m.halted;
+}

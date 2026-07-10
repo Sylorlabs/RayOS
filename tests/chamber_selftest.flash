@@ -1,0 +1,17 @@
+// tests/chamber_selftest.flash — MMIO fabric chamber latch self-test.
+
+@import("../core/constants.flash")
+@import("../driver/hw_rt.flash")
+@import("../driver/chamber_mmio.flash")
+
+fn main() i32 {
+    _zag_println("chamber_selftest: running");
+    let rc: i32 = fabric_selftest_mmio();
+    if (rc == 0) {
+        _zag_println("chamber_selftest: PASS");
+        return 0;
+    }
+    _zag_print("chamber_selftest: FAIL rc=");
+    _zag_println(_zag_i64_to_str(rc as i64));
+    return 1;
+}

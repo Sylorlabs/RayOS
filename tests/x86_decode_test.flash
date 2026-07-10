@@ -1,0 +1,143 @@
+// x86_decode_test.flash — unit tests for x86_64 instruction decoder
+
+@import("../core/init.flash")
+@import("../driver/virtio_block_mmio_nop.flash")
+@import("../driver/virtio_gpu_mmio_nop.flash")
+
+fn test_fail(msg: []u8) void {
+    _zag_print("x86_decode_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn test_expect_i32(got: i32, want: i32, msg: []u8) void {
+    if (got != want) { test_fail(msg); }
+}
+
+fn test_expect_insn_class(got: InsnClass, want: InsnClass, msg: []u8) void {
+    if (got != want) { test_fail(msg); }
+}
+
+fn test_decode(bytes: []u8, want_len: i32, want_klass: InsnClass, msg: []u8) void {
+    let dec: DecodedInsn = x86_decode_insn(0, bytes);
+    test_expect_i32(dec.len, want_len, msg);
+    test_expect_insn_class(dec.klass, want_klass, msg);
+}
+
+fn main() i32 {
+    _zag_println("x86_decode_test: running");
+
+    let nop: *u8 = _zag_malloc(1);
+    nop[0] = 144;
+    test_decode(nop[0..1], 1, InsnClass.Nop, "NOP");
+    _zag_free(nop);
+
+    let ret: *u8 = _zag_malloc(1);
+    ret[0] = 195;
+    test_decode(ret[0..1], 1, InsnClass.Ret, "RET");
+    _zag_free(ret);
+
+    let jmp8: *u8 = _zag_malloc(2);
+    jmp8[0] = 235;
+    jmp8[1] = 16;
+    test_decode(jmp8[0..2], 2, InsnClass.Jmp, "JMP rel8");
+    _zag_free(jmp8);
+
+    let jmp32: *u8 = _zag_malloc(5);
+    jmp32[0] = 233;
+    jmp32[1] = 0;
+    jmp32[2] = 0;
+    jmp32[3] = 0;
+    jmp32[4] = 0;
+    test_decode(jmp32[0..5], 5, InsnClass.Jmp, "JMP rel32");
+    _zag_free(jmp32);
+
+    let mov_rr: *u8 = _zag_malloc(2);
+    mov_rr[0] = 137;
+    mov_rr[1] = 192;
+    test_decode(mov_rr[0..2], 2, InsnClass.Mov, "MOV r/m, r mod=11");
+    _zag_free(mov_rr);
+
+    let mov_rip: *u8 = _zag_malloc(6);
+    mov_rip[0] = 139;
+    mov_rip[1] = 5;
+    mov_rip[2] = 0;
+    mov_rip[3] = 0;
+    mov_rip[4] = 0;
+    mov_rip[5] = 0;
+    test_decode(mov_rip[0..6], 6, InsnClass.Mov, "MOV r, [rip+disp32]");
+    _zag_free(mov_rip);
+
+    let add_rr: *u8 = _zag_malloc(2);
+    add_rr[0] = 1;
+    add_rr[1] = 192;
+    test_decode(add_rr[0..2], 2, InsnClass.Add, "ADD r/m, r");
+    _zag_free(add_rr);
+
+    let add_imm: *u8 = _zag_malloc(6);
+    add_imm[0] = 129;
+    add_imm[1] = 192;
+    add_imm[2] = 1;
+    add_imm[3] = 0;
+    add_imm[4] = 0;
+    add_imm[5] = 0;
+    test_decode(add_imm[0..6], 6, InsnClass.Add, "ADD r/m, imm32");
+    _zag_free(add_imm);
+
+    let push_rax: *u8 = _zag_malloc(1);
+    push_rax[0] = 80;
+    test_decode(push_rax[0..1], 1, InsnClass.Push, "PUSH rax");
+    _zag_free(push_rax);
+
+    let pop_rax: *u8 = _zag_malloc(1);
+    pop_rax[0] = 88;
+    test_decode(pop_rax[0..1], 1, InsnClass.Pop, "POP rax");
+    _zag_free(pop_rax);
+
+    let hlt: *u8 = _zag_malloc(1);
+    hlt[0] = 244;
+    test_decode(hlt[0..1], 1, InsnClass.Hlt, "HLT");
+    _zag_free(hlt);
+
+    let xor_rr: *u8 = _zag_malloc(2);
+    xor_rr[0] = 51;
+    xor_rr[1] = 192;
+    test_decode(xor_rr[0..2], 2, InsnClass.Xor, "XOR eax eax");
+    _zag_free(xor_rr);
+
+    let sub_imm8: *u8 = _zag_malloc(3);
+    sub_imm8[0] = 131;
+    sub_imm8[1] = 232;
+    sub_imm8[2] = 3;
+    test_decode(sub_imm8[0..3], 3, InsnClass.Sub, "SUB eax imm8");
+    _zag_free(sub_imm8);
+
+    let mov_disp_imm: *u8 = _zag_malloc(10);
+    mov_disp_imm[0] = 199;
+    mov_disp_imm[1] = 5;
+    mov_disp_imm[2] = 0;
+    mov_disp_imm[3] = 16;
+    mov_disp_imm[4] = 0;
+    mov_disp_imm[5] = 0;
+    mov_disp_imm[6] = 1;
+    mov_disp_imm[7] = 0;
+    mov_disp_imm[8] = 0;
+    mov_disp_imm[9] = 0;
+    test_decode(mov_disp_imm[0..10], 10, InsnClass.Mov, "MOV [disp32] imm32");
+    _zag_free(mov_disp_imm);
+
+    let int80: *u8 = _zag_malloc(2);
+    int80[0] = 205;
+    int80[1] = 128;
+    test_decode(int80[0..2], 2, InsnClass.Sys, "INT imm8");
+    _zag_free(int80);
+
+    let nop66: *u8 = _zag_malloc(2);
+    nop66[0] = 102;
+    nop66[1] = 144;
+    test_decode(nop66[0..2], 2, InsnClass.Nop, "66 NOP");
+    _zag_free(nop66);
+
+    _zag_println("x86_decode_test: ok");
+    return 0;
+}

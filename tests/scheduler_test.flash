@@ -1,0 +1,48 @@
+@import("../core/scheduler.flash")
+
+fn scheduler_test_fail(msg: []u8) void {
+    _zag_print("scheduler_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn scheduler_expect(ok: i32, msg: []u8) void {
+    if (ok == 0) { scheduler_test_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("scheduler_test: running");
+    let sched: RayScheduler = scheduler_new();
+    let ui: t27 = scheduler_spawn(&sched, 0, "compositor", 6);
+    let io: t27 = scheduler_spawn(&sched, 0, "filesystem", 3);
+    let bg: t27 = scheduler_spawn(&sched, 0, "indexer", 0 - 6);
+    scheduler_expect(ui > 0 && io > 0 && bg > 0, "spawn ids");
+    scheduler_expect(scheduler_runnable_count(&sched) == 3, "three runnable");
+
+    let first: t27 = scheduler_tick(&sched, 0);
+    scheduler_expect(first == ui, "priority deadline selects compositor");
+    let second: t27 = scheduler_tick(&sched, 1);
+    scheduler_expect(second == io || second == ui, "weighted second dispatch");
+
+    scheduler_expect(scheduler_sleep(&sched, ui, 9) == 0, "sleep ui");
+    scheduler_expect(scheduler_task(&sched, ui).state == task_sleeping(), "ui sleeping state");
+    let i: i32 = 0;
+    while (i < 9) {
+        let picked: t27 = scheduler_tick(&sched, 1);
+        scheduler_expect(picked != scheduler_no_task(), "work exists while ui sleeps");
+        i = i + 1;
+    }
+    scheduler_expect(scheduler_task(&sched, ui).state != task_sleeping(), "deadline wake");
+
+    scheduler_expect(scheduler_block(&sched, io) == 0, "block filesystem");
+    scheduler_expect(scheduler_wake(&sched, io) == 0, "wake filesystem");
+    scheduler_expect(scheduler_set_priority(&sched, bg, 99) == 0, "clamp priority");
+    scheduler_expect(scheduler_task(&sched, bg).priority == scheduler_max_priority(), "max clamp");
+    scheduler_expect(scheduler_exit(&sched, bg, 7) == 0, "exit task");
+    scheduler_expect(scheduler_task(&sched, bg).state == task_zombie(), "zombie state");
+    scheduler_expect(scheduler_task(&sched, bg).exit_code == 7, "exit code");
+
+    scheduler_free(&sched);
+    _zag_println("scheduler_test: ok");
+    return 0;
+}

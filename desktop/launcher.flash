@@ -1,0 +1,381 @@
+// desktop/launcher.flash — RayOS start menu overlay (320×400), slides up from
+// the taskbar with frosted panel, search field, and application grid.
+//
+//   let menu: LauncherState = launcher_new(1280, 720);
+//   launcher_open(&menu);
+//   launcher_tick(&menu);
+//   launcher_paint(&menu, &fb, &wm);
+
+@import("theme.flash")
+@import("wm.flash")
+
+fn launcher_app_none() i32     { return -1; }
+fn launcher_app_terminal() i32 { return 0; }
+fn launcher_app_settings() i32 { return 1; }
+fn launcher_app_linux() i32    { return 2; }
+fn launcher_app_windows() i32  { return 3; }
+fn launcher_app_files() i32    { return 4; }
+fn launcher_app_tasks() i32    { return 5; }
+fn launcher_app_browser() i32  { return 6; }
+fn launcher_hit_search() i32   { return 100; }
+fn launcher_hit_close() i32    { return 101; }
+
+fn launcher_panel_w() i32 { return 320; }
+fn launcher_panel_h() i32 { return 500; }
+
+struct LauncherState {
+    open: i32,
+    slide: f32,
+    slide_target: f32,
+    search_focus: i32,
+    anchor_x: i32,
+    screen_w: i32,
+    screen_h: i32,
+    cache_fb: i64,    // retained panel render (*SoftFb), 0 = none
+    cache_key: i32,   // state key the cache was rendered with (-1 = stale)
+    search: ArrayList[u8],   // live search query
+}
+
+struct LauncherApp {
+    id: i32,
+    name: []u8,
+    icon: i32,
+}
+
+fn launcher_new(screen_w: i32, screen_h: i32) LauncherState {
+    return LauncherState{
+        .open = 0,
+        .slide = 0.0,
+        .slide_target = 0.0,
+        .search_focus = 0,
+        .anchor_x = 8,
+        .screen_w = screen_w,
+        .screen_h = screen_h,
+        .cache_fb = 0,
+        .cache_key = -1,
+        .search = make[u8](16),
+    };
+}
+
+fn launcher_open(st: *LauncherState) void {
+    st.*.open = 1;
+    st.*.slide_target = 1.0;
+    st.*.search_focus = 1;
+    st.*.search.len = 0;
+}
+
+fn launcher_close(st: *LauncherState) void {
+    st.*.open = 0;
+    st.*.slide_target = 0.0;
+    st.*.search_focus = 0;
+}
+
+fn launcher_is_open(st: LauncherState) i32 {
+    return st.open;
+}
+
+fn launcher_tick(st: *LauncherState) void {
+    let delta: f32 = 0.14;
+    if (st.*.slide < st.*.slide_target) {
+        st.*.slide = st.*.slide + delta;
+        if (st.*.slide > st.*.slide_target) { st.*.slide = st.*.slide_target; }
+    } else if (st.*.slide > st.*.slide_target) {
+        st.*.slide = st.*.slide - delta;
+        if (st.*.slide < st.*.slide_target) { st.*.slide = st.*.slide_target; }
+    }
+}
+
+fn launcher_panel_y(st: LauncherState, th: RayOsTheme) f32 {
+    let bar_y: f32 = (st.screen_h - th.taskbar_h) as f32;
+    let hidden: f32 = (launcher_panel_h() + 16) as f32;
+    let shown: f32 = bar_y - (launcher_panel_h() as f32) - 8.0;
+    return shown + (hidden * (1.0 - st.slide));
+}
+
+fn launcher_app_count() i32 { return 7; }
+
+fn launcher_app_at(idx: i32) LauncherApp {
+    if (idx == 0) {
+        return LauncherApp{ .id = launcher_app_terminal(), .name = "RayTerminal", .icon = wm_icon_terminal() };
+    }
+    if (idx == 1) {
+        return LauncherApp{ .id = launcher_app_settings(), .name = "Devices", .icon = wm_icon_settings() };
+    }
+    if (idx == 2) {
+        return LauncherApp{ .id = launcher_app_linux(), .name = "Linux Guest", .icon = wm_icon_linux() };
+    }
+    if (idx == 3) {
+        return LauncherApp{ .id = launcher_app_windows(), .name = "Windows Guest", .icon = wm_icon_windows() };
+    }
+    if (idx == 4) {
+        return LauncherApp{ .id = launcher_app_files(), .name = "Files", .icon = wm_icon_files() };
+    }
+    if (idx == 5) {
+        return LauncherApp{ .id = launcher_app_tasks(), .name = "Task Manager", .icon = wm_icon_settings() };
+    }
+    return LauncherApp{ .id = launcher_app_browser(), .name = "Ray Browser", .icon = wm_icon_browser() };
+}
+
+fn launcher_lower(c: u8) u8 {
+    if (c >= ('A' as u8) && c <= ('Z' as u8)) { return c + 32; }
+    return c;
+}
+
+// case-insensitive substring match of the query against an app name
+fn launcher_match(name: []u8, query: []u8) i32 {
+    if (query.len < 1) { return 1; }
+    if (name.len < query.len) { return 0; }
+    let i: i32 = 0;
+    while (i <= name.len - query.len) {
+        let j: i32 = 0;
+        let hit: i32 = 1;
+        while (j < query.len) {
+            if (launcher_lower(name[i + j]) != launcher_lower(query[j])) {
+                hit = 0;
+                j = query.len;
+            } else {
+                j = j + 1;
+            }
+        }
+        if (hit == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn launcher_query(st: *LauncherState) []u8 {
+    return st.*.search.data[0..st.*.search.len];
+}
+
+fn launcher_filtered_count(st: *LauncherState) i32 {
+    let q: []u8 = launcher_query(st);
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < launcher_app_count()) {
+        if (launcher_match(launcher_app_at(i).name, q) == 1) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn launcher_filtered_at(st: *LauncherState, idx: i32) LauncherApp {
+    let q: []u8 = launcher_query(st);
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < launcher_app_count()) {
+        let app: LauncherApp = launcher_app_at(i);
+        if (launcher_match(app.name, q) == 1) {
+            if (n == idx) { return app; }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return LauncherApp{ .id = launcher_app_none(), .name = "", .icon = wm_icon_generic() };
+}
+
+// Key input: 0 = unhandled, 1 = handled, 2 = launch first match, 3 = close.
+fn launcher_key(st: *LauncherState, code: i32) i32 {
+    if (code == 27) { return 3; }
+    if (code == 10) { return 2; }
+    if (code == 8) {
+        if (st.*.search.len > 0) { st.*.search.len = st.*.search.len - 1; }
+        return 1;
+    }
+    if (code >= 32 && code <= 126) {
+        if (st.*.search.len < 24) {
+            push[u8](&st.*.search, code as u8);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+fn launcher_paint_search(st: LauncherState, fb: *SoftFb, x: f32, y: f32, w: f32, th: RayOsTheme) void {
+    let h: f32 = 34.0;
+    if (st.search_focus == 1) {
+        softgpu_blend_round_rect(fb, x as i32, y as i32, w as i32, 34, 10, 255, 255, 255, 230);
+        let ring: VPath = vg_path_new();
+        vg_rounded_rect(&ring, x + 0.5, y + 0.5, w - 1.0, h - 1.0, 10.0);
+        vg_stroke(fb, &ring, 1.5, th.base.acc2_r, th.base.acc2_g, th.base.acc2_b, 200);
+    } else {
+        softgpu_blend_round_rect(fb, x as i32, y as i32, w as i32, 34, 10, 255, 255, 255, 170);
+    }
+    let icon: VPath = vg_path_new();
+    vg_circle(&icon, x + 16.0, y + h * 0.5, 6.0);
+    vg_stroke(fb, &icon, 1.5, th.base.mut_r, th.base.mut_g, th.base.mut_b, 220);
+    let stem: VPath = vg_path_new();
+    vg_move_to(&stem, x + 20.0, y + h * 0.5 + 4.0);
+    vg_line_to(&stem, x + 26.0, y + h * 0.5 + 10.0);
+    vg_stroke(fb, &stem, 1.5, th.base.mut_r, th.base.mut_g, th.base.mut_b, 220);
+    let q: []u8 = st.search.data[0..st.search.len];
+    if (q.len > 0) {
+        vg_text_vec(fb, x + 34.0, y + 10.0, q, 11.0, 0.6, 40, 42, 62, 255);
+        let cx2: f32 = x + 34.0 + (q.len as f32) * rayos_glyph_advance(11.0);
+        softgpu_blend_rect(fb, cx2 as i32, (y + 8.0) as i32, 2, 16, 40, 42, 62, 220);
+    } else {
+        vg_text_vec(fb, x + 34.0, y + 10.0, "Search apps", 11.0, 0.55, th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+    }
+}
+
+fn launcher_paint_tile(st: LauncherState, fb: *SoftFb, app: LauncherApp, x: f32, y: f32, th: RayOsTheme) void {
+    let tile: f32 = 88.0;
+    rayos_paint_shadow(fb, x, y, tile, tile + 18.0, 12.0, th);
+    softgpu_blend_round_rect(fb, x as i32, y as i32, 88, 88, 12, 255, 255, 255, 200);
+    wm_paint_taskbar_icon(fb, app.icon, x + 20.0, y + 16.0, 48.0, th);
+    // dark ink: labels sit on the light frosted panel
+    vg_text_vec(fb, x + 8.0, y + tile + 2.0, app.name, 10.0, 0.55, 44, 46, 66, 255);
+}
+
+fn launcher_cache_state_key(st: *LauncherState) i32 {
+    let key: i32 = 1 + st.*.search_focus;
+    let i: i32 = 0;
+    while (i < st.*.search.len) {
+        key = key * 131 + (get[u8](st.*.search, i) as i32);
+        i = i + 1;
+    }
+    return key;
+}
+
+// Render the full panel once into a retained buffer (panel at origin,
+// square corners; the composite rounds the outline).
+fn launcher_build_cache(st: *LauncherState, screen_fb: *SoftFb, wm: *WmState) i64 {
+    let key: i32 = launcher_cache_state_key(st);
+    if (st.*.cache_fb != 0 && st.*.cache_key == key) { return st.*.cache_fb; }
+    let th: RayOsTheme = wm.*.theme;
+    let w: i32 = launcher_panel_w();
+    let h: i32 = launcher_panel_h();
+
+    if (st.*.cache_fb == 0) {
+        let raw: *i8 = _zag_malloc(@sizeOf[SoftFb]());
+        let nfb: *SoftFb = raw as *SoftFb;
+        nfb.* = softgpu_new(w, h);
+        nfb.*.glyph_cache = vg_glyph_cache_block(screen_fb);
+        st.*.cache_fb = raw as i64;
+    }
+    let fb: *SoftFb = st.*.cache_fb as *SoftFb;
+
+    // frosted plate (opaque in the cache; slides over the scene as a solid panel)
+    softgpu_blend_rect(fb, 0, 0, w, h,
+        th.chrome_body_r + 200, th.chrome_body_g + 200, th.chrome_body_b + 200, 255);
+    let rim: VPath = vg_path_new();
+    vg_rounded_rect(&rim, 0.5, 0.5, (w as f32) - 1.0, (h as f32) - 1.0, th.chrome_radius);
+    vg_stroke(fb, &rim, 1.0, 255, 255, 255, 48);
+
+    rayos_paint_orb(fb, 28.0, 28.0, 12.0, th);
+    vg_text_vec(fb, 48.0, 16.0, "RayOS", 16.0, 0.7, th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+    vg_text_vec(fb, 48.0, 34.0, "Photon Desktop", 10.0, 0.5, th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+    launcher_paint_search(st.*, fb, 16.0, 56.0, (w - 32) as f32, th);
+
+    let gx: f32 = 16.0;
+    let gy: f32 = 104.0;
+    let col: i32 = 0;
+    let row: i32 = 0;
+    let i: i32 = 0;
+    let shown: i32 = launcher_filtered_count(st);
+    while (i < shown) {
+        let app: LauncherApp = launcher_filtered_at(st, i);
+        let tx: f32 = gx + (col as f32) * 96.0;
+        let ty: f32 = gy + (row as f32) * 108.0;
+        launcher_paint_tile(st.*, fb, app, tx, ty, th);
+        col = col + 1;
+        if (col >= 3) {
+            col = 0;
+            row = row + 1;
+        }
+        i = i + 1;
+    }
+    st.*.cache_key = key;
+    return st.*.cache_fb;
+}
+
+fn launcher_paint(st: *LauncherState, fb: *SoftFb, wm: *WmState) void {
+    if (st.*.slide <= 0.001) { return; }
+    let th: RayOsTheme = wm.*.theme;
+    let cache: i64 = launcher_build_cache(st, fb, wm);
+    if (cache == 0) { return; }
+    let x: i32 = st.*.anchor_x;
+    let y: i32 = launcher_panel_y(st.*, th) as i32;
+    rayos_paint_shadow(
+        fb, x as f32, y as f32,
+        launcher_panel_w() as f32, launcher_panel_h() as f32,
+        th.chrome_radius, th,
+    );
+    softgpu_compose_round_rect(fb, cache as *SoftFb, x, y, th.chrome_radius as i32);
+}
+
+fn launcher_hit_test(st: *LauncherState, wm: *WmState, x: i32, y: i32) i32 {
+    if (st.*.slide <= 0.01) { return launcher_app_none(); }
+    let th: RayOsTheme = wm.*.theme;
+    let px: f32 = st.*.anchor_x as f32;
+    let py: f32 = launcher_panel_y(st.*, th);
+    let pw: f32 = launcher_panel_w() as f32;
+    let ph: f32 = launcher_panel_h() as f32;
+    if ((x as f32) < px || (y as f32) < py) { return launcher_hit_close(); }
+    if ((x as f32) > px + pw || (y as f32) > py + ph) { return launcher_hit_close(); }
+    let sx: f32 = px + 16.0;
+    let sy: f32 = py + 56.0;
+    let sw: f32 = pw - 32.0;
+    let sh: f32 = 34.0;
+    if ((x as f32) >= sx && (x as f32) < sx + sw && (y as f32) >= sy && (y as f32) < sy + sh) {
+        return launcher_hit_search();
+    }
+    let gx: f32 = px + 16.0;
+    let gy: f32 = py + 104.0;
+    let shown: i32 = launcher_filtered_count(st);
+    let i: i32 = 0;
+    let col: i32 = 0;
+    let row: i32 = 0;
+    while (i < shown) {
+        let tx: f32 = gx + (col as f32) * 96.0;
+        let ty: f32 = gy + (row as f32) * 108.0;
+        if ((x as f32) >= tx && (x as f32) < tx + 88.0 && (y as f32) >= ty && (y as f32) < ty + 106.0) {
+            return launcher_filtered_at(st, i).id;
+        }
+        col = col + 1;
+        if (col >= 3) {
+            col = 0;
+            row = row + 1;
+        }
+        i = i + 1;
+    }
+    return launcher_app_none();
+}
+
+fn launcher_app_title(app_id: i32) []u8 {
+    if (app_id == launcher_app_terminal()) { return "RayTerminal"; }
+    if (app_id == launcher_app_settings()) { return "Devices"; }
+    if (app_id == launcher_app_linux()) { return "Linux Guest"; }
+    if (app_id == launcher_app_windows()) { return "Windows Guest"; }
+    if (app_id == launcher_app_files()) { return "Files"; }
+    if (app_id == launcher_app_tasks()) { return "Task Manager"; }
+    if (app_id == launcher_app_browser()) { return "Ray Browser"; }
+    return "App";
+}
+
+fn launcher_app_icon(app_id: i32) i32 {
+    if (app_id == launcher_app_terminal()) { return wm_icon_terminal(); }
+    if (app_id == launcher_app_settings()) { return wm_icon_settings(); }
+    if (app_id == launcher_app_linux()) { return wm_icon_linux(); }
+    if (app_id == launcher_app_windows()) { return wm_icon_windows(); }
+    if (app_id == launcher_app_files()) { return wm_icon_files(); }
+    if (app_id == launcher_app_browser()) { return wm_icon_browser(); }
+    return wm_icon_generic();
+}
+
+fn launcher_app_content_kind(app_id: i32) i32 {
+    if (app_id == launcher_app_linux() || app_id == launcher_app_windows()) {
+        return wm_content_guest();
+    }
+    if (app_id == launcher_app_files()) { return wm_content_files(); }
+    if (app_id == launcher_app_tasks()) { return wm_content_tasks(); }
+    if (app_id == launcher_app_browser()) { return wm_content_browser(); }
+    if (app_id == launcher_app_settings()) { return wm_content_devices(); }
+    if (app_id == launcher_app_terminal()) { return wm_content_terminal(); }
+    return wm_content_native();
+}
+
+fn launcher_app_guest_id(app_id: i32) i32 {
+    if (app_id == launcher_app_windows()) { return 2; }
+    if (app_id == launcher_app_linux()) { return 1; }
+    return 0;
+}

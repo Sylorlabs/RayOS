@@ -1,0 +1,94 @@
+// driver/chamber_mmio.flash — spatial routing fabric chamber MMIO latch driver.
+//
+// Maps RAYOS_CHAMBER_COUNT passive switchboard chambers at
+//   RAYOS_MMIO_BASE + chamber_id * RAYOS_CHAMBER_MMIO_STRIDE
+// with latch / src / dst / channel / status register words.
+//
+//   @import("chamber_mmio.flash")
+//   let rc: i32 = chamber_latch(2, 2, 5, 1);
+//   let st: i32 = chamber_status(2);
+
+@import("hw_rt.flash")
+
+struct ChamberRegs {
+    latch: i32,
+    src: i32,
+    dst: i32,
+    channel: i32,
+    status: i32,
+}
+
+fn CHAMBER_REG_LATCH() i32 { return 0; }
+fn CHAMBER_REG_SRC() i32 { return 4; }
+fn CHAMBER_REG_DST() i32 { return 8; }
+fn CHAMBER_REG_CHANNEL() i32 { return 12; }
+fn CHAMBER_REG_STATUS() i32 { return 16; }
+
+fn CHAMBER_STATUS_IDLE() i32 { return 0; }
+fn CHAMBER_STATUS_FLOWING() i32 { return 1; }
+
+fn chamber_mmio_addr(chamber_id: i32) i64 {
+    let base: i64 = (RAYOS_MMIO_BASE() as i64);
+    let stride: i64 = RAYOS_CHAMBER_MMIO_STRIDE() as i64;
+    return base + chamber_id as i64 * stride;
+}
+
+fn chamber_regs_valid(chamber_id: i32) i32 {
+    if (chamber_id < 0 || chamber_id >= (RAYOS_CHAMBER_COUNT() as i32)) { return 0; }
+    return 1;
+}
+
+fn chamber_latch(chamber_id: i32, src_ch: i32, dst_ch: i32, channel: i32) i32 {
+    if (chamber_regs_valid(chamber_id) == 0) { return 0 - 1; }
+    if (src_ch < 0 || src_ch >= (RAYOS_CHAMBER_COUNT() as i32)) { return 0 - 2; }
+    if (dst_ch < 0 || dst_ch >= (RAYOS_CHAMBER_COUNT() as i32)) { return 0 - 3; }
+    if (channel < 0 || channel >= (RAYOS_WDM_CHANNELS() as i32)) { return 0 - 4; }
+    let base: i64 = chamber_mmio_addr(chamber_id);
+    mmio_write32(base + CHAMBER_REG_SRC() as i64, src_ch);
+    mmio_write32(base + CHAMBER_REG_DST() as i64, dst_ch);
+    mmio_write32(base + CHAMBER_REG_CHANNEL() as i64, channel);
+    mmio_write32(base + CHAMBER_REG_STATUS() as i64, (CHAMBER_STATUS_IDLE() as i32));
+    mmio_write32(base + CHAMBER_REG_LATCH() as i64, 1);
+    hw_fence();
+    mmio_write32(base + CHAMBER_REG_STATUS() as i64, (CHAMBER_STATUS_FLOWING() as i32));
+    hw_fence();
+    return 0;
+}
+
+fn chamber_status(chamber_id: i32) i32 {
+    if (chamber_regs_valid(chamber_id) == 0) { return 0 - 1; }
+    let base: i64 = chamber_mmio_addr(chamber_id);
+    return mmio_read32(base + CHAMBER_REG_STATUS() as i64);
+}
+
+fn chamber_read_regs(chamber_id: i32) ChamberRegs {
+    let empty: ChamberRegs = ChamberRegs{
+        .latch = 0,
+        .src = 0 - 1,
+        .dst = 0 - 1,
+        .channel = 0 - 1,
+        .status = 0 - 1,
+    };
+    if (chamber_regs_valid(chamber_id) == 0) { return empty; }
+    let base: i64 = chamber_mmio_addr(chamber_id);
+    return ChamberRegs{
+        .latch = mmio_read32(base + CHAMBER_REG_LATCH() as i64),
+        .src = mmio_read32(base + CHAMBER_REG_SRC() as i64),
+        .dst = mmio_read32(base + CHAMBER_REG_DST() as i64),
+        .channel = mmio_read32(base + CHAMBER_REG_CHANNEL() as i64),
+        .status = mmio_read32(base + CHAMBER_REG_STATUS() as i64),
+    };
+}
+
+fn fabric_selftest_mmio() i32 {
+    if (hw_rt_init() != 0) { return 0 - 1; }
+    if (chamber_latch(2, 2, 5, 1) != 0) { return 0 - 2; }
+    let regs: ChamberRegs = chamber_read_regs(2);
+    if (regs.latch != 1) { return 0 - 3; }
+    if (regs.src != 2) { return 0 - 4; }
+    if (regs.dst != 5) { return 0 - 5; }
+    if (regs.channel != 1) { return 0 - 6; }
+    let st: i32 = chamber_status(2);
+    if (st != (CHAMBER_STATUS_FLOWING() as i32)) { return 0 - 7; }
+    return 0;
+}

@@ -1,0 +1,54 @@
+// storage/linux_image.flash — load Linux bzImage into guest RAM for RayOS BTM.
+//
+// Resolves vm/linux.bin, vm/vmlinuz, or falls back to linux_boot_synth_bzimage().
+//
+// Import chain (no @import here — splice from test / init entry):
+//   @import("../core/constants.flash")
+//   @import("../math/trit_core.flash")
+//   @import("../math/tekum.flash")
+//   @import("../math/offset_loop.flash")
+//   @import("../hypervisor/guest_ram.flash")
+//   @import("../hypervisor/linux_boot.flash")
+//   @import("linux_image.flash")
+//
+//   let ram: ArrayList[u8] = guest_ram_new_default();
+//   linux_image_load_bzimage(&ram);
+
+fn LINUX_IMAGE_DEFAULT_PATH() []u8 {
+    return "vm/linux.bin";
+}
+
+fn LINUX_IMAGE_VMLINUZ_PATH() []u8 {
+    return "vm/vmlinuz";
+}
+
+fn linux_image_resolve_path() []u8 {
+    let linux_bin: []u8 = LINUX_IMAGE_DEFAULT_PATH();
+    if (_zag_file_exists(linux_bin) == 1) {
+        return linux_bin;
+    }
+    let vmlinuz: []u8 = LINUX_IMAGE_VMLINUZ_PATH();
+    if (_zag_file_exists(vmlinuz) == 1) {
+        return vmlinuz;
+    }
+    return "";
+}
+
+fn linux_image_load_bzimage(guest_ram: *ArrayList[u8]) i32 {
+    let path: []u8 = linux_image_resolve_path();
+    if (path.len < 1) {
+        return linux_boot_load_bzimage("", guest_ram);
+    }
+    return linux_boot_load_real(path, guest_ram);
+}
+
+fn linux_image_load(path: []u8, guest_ram: *ArrayList[u8]) i32 {
+    if (path.len < 1) {
+        return linux_image_load_bzimage(guest_ram);
+    }
+    let raw: []u8 = _zag_read_file(path);
+    if (raw.len < (LINUX_BOOT_SECTOR_BYTES() as i32)) {
+        return linux_boot_load_bzimage(path, guest_ram);
+    }
+    return linux_boot_load_real(path, guest_ram);
+}

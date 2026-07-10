@@ -1,0 +1,374 @@
+// tekum.zag — Balanced Ternary Tapered Precision (Tekum) for RayOS Flash memory math.
+//
+// Tekum values carry TEKUM_MAX_TRITS digit lanes (LSF-first) plus an i64 host
+// embed for bootstrap hosts. Active width tapers with magnitude: small values
+// retain full precision (27 trits), large values narrow toward TEKUM_MIN_TRITS.
+//
+//   @import("tekum.flash") as tekum
+//   let off: tekum.TekumValue = tekum.tekum_from_i64(128);
+
+// trit_math (add/mul/balance_sum) is injected by flashc at compile time.
+
+// ── tapered precision bounds ─────────────────────────────────────────────────
+
+fn TEKUM_MAX_TRITS() i32 { return 27; }
+fn TEKUM_MIN_TRITS() i32 { return 9; }
+fn TEKUM_DIGIT_CAP() i32 { return 27; }
+
+fn TRIT_NEG() i8 { return 0 - 1; }
+fn TRIT_ZERO() i8 { return 0; }
+fn TRIT_POS() i8 { return 1; }
+
+// ── digit storage (fixed 27-lane LSF buffer) ─────────────────────────────────
+
+struct TekumDigits {
+    t00: i8, t01: i8, t02: i8, t03: i8, t04: i8,
+    t05: i8, t06: i8, t07: i8, t08: i8, t09: i8,
+    t10: i8, t11: i8, t12: i8, t13: i8, t14: i8,
+    t15: i8, t16: i8, t17: i8, t18: i8, t19: i8,
+    t20: i8, t21: i8, t22: i8, t23: i8, t24: i8,
+    t25: i8, t26: i8,
+}
+
+struct TekumValue {
+    width: i32,       // active trit lanes (TEKUM_MIN_TRITS..TEKUM_MAX_TRITS)
+    host: i64,        // scalar embed for host-fast paths
+    digits: TekumDigits,
+}
+
+struct TekumRippleResult {
+    value: TekumValue,
+    final_carry: i8,
+}
+
+// ── digit lane accessors ─────────────────────────────────────────────────────
+
+fn tekum_digits_zero() TekumDigits {
+    return TekumDigits{
+        .t00 = 0, .t01 = 0, .t02 = 0, .t03 = 0, .t04 = 0,
+        .t05 = 0, .t06 = 0, .t07 = 0, .t08 = 0, .t09 = 0,
+        .t10 = 0, .t11 = 0, .t12 = 0, .t13 = 0, .t14 = 0,
+        .t15 = 0, .t16 = 0, .t17 = 0, .t18 = 0, .t19 = 0,
+        .t20 = 0, .t21 = 0, .t22 = 0, .t23 = 0, .t24 = 0,
+        .t25 = 0, .t26 = 0,
+    };
+}
+
+// Normalize znc i8 storage (255 == balanced −1) to canonical trit wires.
+fn tekum_trit_wire(d: i8) i8 {
+    let u: i32 = d as i32;
+    if (u == 255) { return (TRIT_NEG() as i32); }
+    if (u == TRIT_NEG() as i32) { return (TRIT_NEG() as i32); }
+    if (u == TRIT_POS() as i32) { return (TRIT_POS() as i32); }
+    return (TRIT_ZERO() as i32);
+}
+
+fn tekum_digit_get(d: TekumDigits, idx: i32) i8 {
+    let raw: i8 = switch (idx) {
+        0 => d.t00,  1 => d.t01,  2 => d.t02,  3 => d.t03,  4 => d.t04,
+        5 => d.t05,  6 => d.t06,  7 => d.t07,  8 => d.t08,  9 => d.t09,
+        10 => d.t10, 11 => d.t11, 12 => d.t12, 13 => d.t13, 14 => d.t14,
+        15 => d.t15, 16 => d.t16, 17 => d.t17, 18 => d.t18, 19 => d.t19,
+        20 => d.t20, 21 => d.t21, 22 => d.t22, 23 => d.t23, 24 => d.t24,
+        25 => d.t25, 26 => d.t26,
+        else => (TRIT_ZERO() as i32),
+    };
+    return tekum_trit_wire(raw);
+}
+
+fn tekum_digit_set(d: *TekumDigits, idx: i32, v: i8) void {
+    let wire: i8 = tekum_trit_wire(v);
+    if (idx == 0) { d.*.t00 = wire; return; }
+    if (idx == 1) { d.*.t01 = wire; return; }
+    if (idx == 2) { d.*.t02 = wire; return; }
+    if (idx == 3) { d.*.t03 = wire; return; }
+    if (idx == 4) { d.*.t04 = wire; return; }
+    if (idx == 5) { d.*.t05 = wire; return; }
+    if (idx == 6) { d.*.t06 = wire; return; }
+    if (idx == 7) { d.*.t07 = wire; return; }
+    if (idx == 8) { d.*.t08 = wire; return; }
+    if (idx == 9) { d.*.t09 = wire; return; }
+    if (idx == 10) { d.*.t10 = wire; return; }
+    if (idx == 11) { d.*.t11 = wire; return; }
+    if (idx == 12) { d.*.t12 = wire; return; }
+    if (idx == 13) { d.*.t13 = wire; return; }
+    if (idx == 14) { d.*.t14 = wire; return; }
+    if (idx == 15) { d.*.t15 = wire; return; }
+    if (idx == 16) { d.*.t16 = wire; return; }
+    if (idx == 17) { d.*.t17 = wire; return; }
+    if (idx == 18) { d.*.t18 = wire; return; }
+    if (idx == 19) { d.*.t19 = wire; return; }
+    if (idx == 20) { d.*.t20 = wire; return; }
+    if (idx == 21) { d.*.t21 = wire; return; }
+    if (idx == 22) { d.*.t22 = wire; return; }
+    if (idx == 23) { d.*.t23 = wire; return; }
+    if (idx == 24) { d.*.t24 = wire; return; }
+    if (idx == 25) { d.*.t25 = wire; return; }
+    if (idx == 26) { d.*.t26 = wire; return; }
+}
+
+fn tekum_copy_digits(src: TekumDigits) TekumDigits {
+    let d: TekumDigits = tekum_digits_zero();
+    let i: i32 = 0;
+    while (i < (TEKUM_DIGIT_CAP() as i32)) {
+        tekum_digit_set(&d, i, tekum_digit_get(src, i));
+        i = i + 1;
+    }
+    return d;
+}
+
+// ── balanced carry (re-export trit_math.balance_sum semantics) ───────────────
+
+fn tekum_balance_carry(raw: i32) TritAddResult {
+    return balance_sum(raw);
+}
+
+fn tekum_abs_i64(v: i64) i64 {
+    if (v < 0) { return 0 - v; }
+    return v;
+}
+
+fn tekum_trit_to_i64(d: i8) i64 {
+    let wire: i8 = tekum_trit_wire(d);
+    if (wire == (TRIT_NEG() as i32)) { return 0 - 1; }
+    if (wire == (TRIT_POS() as i32)) { return 1; }
+    return 0;
+}
+
+fn tekum_pow3(exp: i32) i64 {
+    if (exp <= 0) { return 1; }
+    let r: i64 = 1;
+    let i: i32 = 0;
+    while (i < exp) {
+        r = r * 3;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn tekum_balanced_digit(rem: i64) i8 {
+    let r: i64 = rem % 3;
+    if (r < 0) { r = r + 3; }
+    if (r > 1) { return (TRIT_NEG() as i32); }
+    if (r == 1) { return (TRIT_POS() as i32); }
+    return (TRIT_ZERO() as i32);
+}
+
+// Regime trits: order of magnitude in base 3 (0 for |v| < 3).
+fn tekum_regime_trits(host: i64) i32 {
+    let mag: i64 = tekum_abs_i64(host);
+    if (mag < 3) { return 0; }
+    let regime: i32 = 0;
+    let bound: i64 = 3;
+    while (bound <= mag && regime < (TEKUM_MAX_TRITS() as i32)) {
+        bound = bound * 3;
+        regime = regime + 1;
+    }
+    return regime;
+}
+
+// Tapered active width: wide near zero, narrows as magnitude grows.
+fn tekum_taper_width_for_host(host: i64) i32 {
+    let regime: i32 = tekum_regime_trits(host);
+    let w: i32 = (TEKUM_MAX_TRITS() as i32) - regime;
+    if (w < (TEKUM_MIN_TRITS() as i32)) { w = (TEKUM_MIN_TRITS() as i32); }
+    if (w > (TEKUM_MAX_TRITS() as i32)) { w = (TEKUM_MAX_TRITS() as i32); }
+    return w;
+}
+
+fn tekum_significant_trits(d: TekumDigits, cap: i32) i32 {
+    let i: i32 = cap - 1;
+    while (i >= 0) {
+        if (tekum_digit_get(d, i) != 0) { return i + 1; }
+        i = i - 1;
+    }
+    return 1;
+}
+
+// ── host ↔ balanced ternary conversion ───────────────────────────────────────
+
+fn tekum_from_i64(v: i64) TekumValue {
+    let rem: i64 = v;
+    let digits: TekumDigits = tekum_digits_zero();
+    let i: i32 = 0;
+    let guard: i32 = 0;
+    while ((rem != 0 || i == 0) && guard < (TEKUM_DIGIT_CAP() as i32)) {
+        let digit: i8 = tekum_balanced_digit(rem);
+        tekum_digit_set(&digits, i, digit);
+        rem = (rem - tekum_trit_to_i64(digit)) / 3;
+        i = i + 1;
+        guard = guard + 1;
+    }
+    let width: i32 = tekum_taper_width_for_host(v);
+    let sig: i32 = tekum_significant_trits(digits, i);
+    if (sig > width) { width = sig; }
+    if (width > (TEKUM_MAX_TRITS() as i32)) { width = (TEKUM_MAX_TRITS() as i32); }
+    return TekumValue{ .width = width, .host = v, .digits = digits };
+}
+
+fn tekum_to_i64(v: TekumValue) i64 {
+    let acc: i64 = 0;
+    let pow: i64 = 1;
+    let i: i32 = 0;
+    while (i < v.width) {
+        let d: i8 = tekum_digit_get(v.digits, i);
+        acc = acc + tekum_trit_to_i64(d) * pow;
+        pow = pow * 3;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn tekum_zero() TekumValue {
+    return tekum_from_i64(0);
+}
+
+fn tekum_sync_host(v: *TekumValue) void {
+    v.*.host = tekum_to_i64(v.*);
+}
+
+// ── taper: drop low-significance lanes beyond active width ───────────────────
+
+fn tekum_taper(v: TekumValue) TekumValue {
+    let target: i32 = tekum_taper_width_for_host(v.host);
+    let sig: i32 = tekum_significant_trits(v.digits, (TEKUM_DIGIT_CAP() as i32));
+    if (sig > target) { target = sig; }
+    if (target > (TEKUM_MAX_TRITS() as i32)) { target = (TEKUM_MAX_TRITS() as i32); }
+    if (target < (TEKUM_MIN_TRITS() as i32)) { target = (TEKUM_MIN_TRITS() as i32); }
+    let trimmed: TekumDigits = tekum_copy_digits(v.digits);
+    let i: i32 = target;
+    while (i < (TEKUM_DIGIT_CAP() as i32)) {
+        tekum_digit_set(&trimmed, i, 0);
+        i = i + 1;
+    }
+    let host0: i64 = tekum_to_i64(TekumValue{
+        .width = target,
+        .host = v.host,
+        .digits = trimmed,
+    });
+    let width0: i32 = tekum_taper_width_for_host(host0);
+    let sig2: i32 = tekum_significant_trits(trimmed, (TEKUM_DIGIT_CAP() as i32));
+    let width1: i32 = width0;
+    if (sig2 > width1) { width1 = sig2; }
+    return TekumValue{
+        .width = width1,
+        .host = host0,
+        .digits = trimmed,
+    };
+}
+
+// ── ripple add (LSF-first, balanced carry) ─────────────────────────────────
+
+fn tekum_add_ripple(a: TekumValue, b: TekumValue, carry_in: i8) TekumRippleResult {
+    let n: i32 = a.width;
+    if (b.width > n) { n = b.width; }
+    if (n < (TEKUM_MIN_TRITS() as i32)) { n = (TEKUM_MIN_TRITS() as i32); }
+    if (n > (TEKUM_MAX_TRITS() as i32)) { n = (TEKUM_MAX_TRITS() as i32); }
+
+    let digits: TekumDigits = tekum_copy_digits(a.digits);
+    let carry: i8 = carry_in;
+    let i: i32 = 0;
+    while (i < n) {
+        let da: i8 = 0;
+        if (i < a.width) { da = tekum_digit_get(a.digits, i); }
+        let db: i8 = 0;
+        if (i < b.width) { db = tekum_digit_get(b.digits, i); }
+        let step: TritAddResult = add(da, db, carry);
+        tekum_digit_set(&digits, i, step.sum);
+        carry = step.carry;
+        i = i + 1;
+    }
+
+    let out_width: i32 = n;
+    if (carry != 0 && out_width < (TEKUM_MAX_TRITS() as i32)) {
+        tekum_digit_set(&digits, out_width, carry);
+        out_width = out_width + 1;
+    }
+
+    let raw_out: TekumValue = TekumValue{
+        .width = out_width,
+        .host = 0,
+        .digits = digits,
+    };
+    let synced: TekumValue = TekumValue{
+        .width = raw_out.width,
+        .host = tekum_to_i64(raw_out),
+        .digits = tekum_copy_digits(raw_out.digits),
+    };
+    let tapered: TekumValue = tekum_taper(synced);
+    return TekumRippleResult{ .value = tapered, .final_carry = carry };
+}
+
+fn tekum_add(a: TekumValue, b: TekumValue) TekumValue {
+    let res: TekumRippleResult = tekum_add_ripple(a, b, 0);
+    return res.value;
+}
+
+// ── multiply: schoolbook ripple over balanced trits ──────────────────────────
+
+fn tekum_mul_digit(a: TekumValue, trit: i8) TekumValue {
+    if (trit == 0) { return tekum_zero(); }
+    let digits: TekumDigits = tekum_digits_zero();
+    let carry: i8 = 0;
+    let i: i32 = 0;
+    while (i < a.width) {
+        let da: i8 = tekum_digit_get(a.digits, i);
+        let prod: TritMulResult = mul(da, trit);
+        let step: TritAddResult = add(prod.product, 0, carry);
+        tekum_digit_set(&digits, i, step.sum);
+        carry = step.carry;
+        i = i + 1;
+    }
+    let width: i32 = a.width;
+    if (carry != 0 && width < (TEKUM_MAX_TRITS() as i32)) {
+        tekum_digit_set(&digits, width, carry);
+        width = width + 1;
+    }
+    return TekumValue{
+        .width = width,
+        .host = tekum_to_i64(TekumValue{ .width = width, .host = 0, .digits = digits }),
+        .digits = digits,
+    };
+}
+
+fn tekum_shift_left(v: TekumValue, places: i32) TekumValue {
+    if (places <= 0) { return v; }
+    let digits: TekumDigits = tekum_digits_zero();
+    let i: i32 = 0;
+    while (i < (TEKUM_DIGIT_CAP() as i32)) {
+        let src: i32 = i - places;
+        if (src >= 0 && src < v.width) {
+            tekum_digit_set(&digits, i, tekum_digit_get(v.digits, src));
+        }
+        i = i + 1;
+    }
+    let width: i32 = v.width + places;
+    if (width > (TEKUM_MAX_TRITS() as i32)) { width = (TEKUM_MAX_TRITS() as i32); }
+    return TekumValue{
+        .width = width,
+        .host = tekum_to_i64(TekumValue{ .width = width, .host = 0, .digits = digits }),
+        .digits = digits,
+    };
+}
+
+fn tekum_mul(a: TekumValue, b: TekumValue) TekumValue {
+    let acc0: TekumValue = tekum_zero();
+    let j: i32 = 0;
+    let acc_cur: TekumValue = acc0;
+    while (j < b.width) {
+        let tr: i8 = tekum_digit_get(b.digits, j);
+        if (tr != 0) {
+            let partial: TekumValue = tekum_mul_digit(a, tr);
+            let shifted: TekumValue = tekum_shift_left(partial, j);
+            acc_cur = tekum_add(acc_cur, shifted);
+        }
+        j = j + 1;
+    }
+    let host_prod: i64 = a.host * b.host;
+    let merged: TekumValue = TekumValue{
+        .width = acc_cur.width,
+        .host = host_prod,
+        .digits = tekum_copy_digits(acc_cur.digits),
+    };
+    return tekum_taper(merged);
+}

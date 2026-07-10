@@ -1,0 +1,110 @@
+// desktop/guest_linux_host.flash — singleton Linux guest host for RayOS desktop.
+//
+// Only rayos_desktop (or tests) may import guest modules; this thin host wires
+// init + virtio + guest_linux and caches BTM/RAM across frames.
+
+@import("../core/init.flash")
+@import("../math/tekum.flash")
+@import("../math/offset_loop.flash")
+@import("../driver/hw_rt.flash")
+@import("../driver/soh_mmio.flash")
+@import("../storage/soh_block.flash")
+@import("../storage/linux_image.flash")
+@import("../driver/virtio_guest.flash")
+@import("../driver/virtio_gpu_guest.flash")
+@import("../hypervisor/guest_linux.flash")
+
+struct GuestLinuxHost {
+    btm: *BinaryTranslationMatrix,
+    ram: ArrayList[u8],
+    ready: i32,
+}
+
+fn guest_linux_host_cache_path() []u8 {
+    let pid: []u8 = _zag_i64_to_str(hw_rt_getpid());
+    return _zag_str_concat(_zag_str_concat("/tmp/rayos_guest_linux_host.", pid), ".ptr");
+}
+
+fn guest_linux_host_from_cache() ?*GuestLinuxHost {
+    let path: []u8 = guest_linux_host_cache_path();
+    if (_zag_file_exists(path) == 0) { return null; }
+    let text: []u8 = _zag_read_file(path);
+    if (text.len < 1) { return null; }
+    let addr: i64 = _zag_str_to_i64(text);
+    if (addr == 0) { return null; }
+    return addr as *GuestLinuxHost;
+}
+
+fn guest_linux_host_to_cache(host: *GuestLinuxHost) void {
+    let path: []u8 = guest_linux_host_cache_path();
+    let text: []u8 = _zag_i64_to_str(host as i64);
+    _zag_write_file(path, text);
+}
+
+fn guest_linux_host_mut() *GuestLinuxHost {
+    if (guest_linux_host_from_cache()) |cached| {
+        return cached;
+    }
+    let raw: *i8 = _zag_malloc(@sizeOf[GuestLinuxHost]());
+    let host: *GuestLinuxHost = raw as *GuestLinuxHost;
+    host.* = GuestLinuxHost{
+        .btm = null as *BinaryTranslationMatrix,
+        .ram = make[u8](0),
+        .ready = 0,
+    };
+    guest_linux_host_to_cache(host);
+    return host;
+}
+
+fn guest_linux_host_ensure() void {
+    let host: *GuestLinuxHost = guest_linux_host_mut();
+    if (host.*.ready == 1) { return; }
+    host.*.btm = btm_new();
+    host.*.ram = guest_ram_new_default();
+    let _vg: i32 = virtio_gpu_guest_init();
+    guest_linux_attach(host.*.btm, &host.*.ram);
+    host.*.ready = 1;
+}
+
+fn virtio_gpu_available() i32 {
+    if (virtio_gpu_guest_state_from_cache()) |st| {
+        if (st.*.ready == 1) { return 1; }
+    }
+    return 0;
+}
+
+fn virtio_gpu_blit(
+    guest_pool: *ArrayList[u8],
+    fb_off: i32,
+    w: i32,
+    h: i32,
+) void {
+    let host: *GuestLinuxHost = guest_linux_host_mut();
+    virtio_gpu_blit_from_guest_ram(&host.*.ram, guest_pool, fb_off, w, h);
+}
+
+fn guest_linux_host_step_guest_pool(
+    guest_pool: *ArrayList[u8],
+    fb_off: i32,
+    w: i32,
+    h: i32,
+) void {
+    guest_linux_host_ensure();
+    let host: *GuestLinuxHost = guest_linux_host_mut();
+    if (virtio_gpu_available() == 1) {
+        let _steps: i32 = guest_linux_step_n(
+            host.*.btm,
+            host.*.ram,
+            GUEST_LINUX_STEPS_PER_FRAME(),
+        );
+        virtio_gpu_blit(guest_pool, fb_off, w, h);
+        return;
+    }
+    guest_linux_step_frame(host.*.btm, host.*.ram, guest_pool, fb_off, w, h);
+}
+
+fn guest_linux_host_pc() u64 {
+    guest_linux_host_ensure();
+    let host: *GuestLinuxHost = guest_linux_host_mut();
+    return guest_linux_pc(host.*.btm);
+}

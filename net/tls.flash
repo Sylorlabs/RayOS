@@ -1,0 +1,451 @@
+// net/tls.flash — TLS 1.3 client (RFC 8446), in Flash.
+//
+// Cipher suite: TLS_CHACHA20_POLY1305_SHA256 with X25519 key exchange — the
+// primitives are verified bit-exact in net/crypto.flash. Implements the full
+// 1-RTT handshake: ClientHello, key schedule (HKDF), decrypt of the server's
+// encrypted flight, client Finished, then encrypted application data.
+//
+// SECURITY CAVEAT — read this: the server certificate chain and
+// CertificateVerify signature are NOT yet validated. The channel is
+// ENCRYPTED but NOT AUTHENTICATED, so it is not safe against an active
+// man-in-the-middle. This is the "HTTPS transport works" milestone; the cert
+// trust store + RSA/ECDSA signature verification is the next security layer.
+// tls_last_authenticated() reports 0 to make this explicit to callers.
+//
+//   let n: i32 = tls_https_get("example.com", 443, "/", out, cap);
+
+@import("crypto.flash")
+@import("../driver/net_socket.flash")
+
+struct TlsConn {
+    fd: i64,
+    priv: *i8,            // our X25519 private key (32)
+    transcript: *i8,      // concatenated handshake messages
+    tlen: i32,
+    hs_secret: *i8,       // handshake_secret (32)
+    c_hs: *i8,            // client handshake traffic secret (32)
+    s_hs_key: *i8, s_hs_iv: *i8,
+    c_hs_key: *i8, c_hs_iv: *i8,
+    s_ap_key: *i8, s_ap_iv: *i8,
+    c_ap_key: *i8, c_ap_iv: *i8,
+    s_seq: i64,           // server record sequence (current epoch)
+    c_seq: i64,           // client record sequence (current epoch)
+    err: i32,
+}
+
+fn tls_ok() i32 { return 0; }
+fn tls_last_authenticated() i32 { return 0; }   // cert validation not yet implemented
+
+// ── little appenders over a (*i8, pos) cursor ────────────────────────────────
+
+fn tls_put8(b: *i8, at: i32, v: i32) i32 { b[at] = (v & 255) as i8; return at + 1; }
+fn tls_put16(b: *i8, at: i32, v: i32) i32 {
+    b[at] = ((v >> 8) & 255) as i8; b[at + 1] = (v & 255) as i8; return at + 2;
+}
+fn tls_put24(b: *i8, at: i32, v: i32) i32 {
+    b[at] = ((v >> 16) & 255) as i8; b[at + 1] = ((v >> 8) & 255) as i8;
+    b[at + 2] = (v & 255) as i8; return at + 3;
+}
+fn tls_putbytes(b: *i8, at: i32, src: *i8, n: i32) i32 {
+    let i: i32 = 0;
+    while (i < n) { b[at + i] = src[i]; i = i + 1; }
+    return at + n;
+}
+fn tls_putstr(b: *i8, at: i32, s: []u8) i32 {
+    let i: i32 = 0;
+    while (i < s.len) { b[at + i] = s[i] as i8; i = i + 1; }
+    return at + s.len;
+}
+fn tls_rd16(b: *i8, at: i32) i32 {
+    return ((b[at] as u8) as i32) * 256 + ((b[at + 1] as u8) as i32);
+}
+fn tls_rd24(b: *i8, at: i32) i32 {
+    return ((b[at] as u8) as i32) * 65536 + ((b[at + 1] as u8) as i32) * 256 + ((b[at + 2] as u8) as i32);
+}
+
+// per-record nonce: iv (12) with seq XORed into the low 8 bytes (big-endian).
+fn tls_nonce(iv: *i8, seq: i64, out: *i8) void {
+    let i: i32 = 0;
+    while (i < 12) { out[i] = iv[i]; i = i + 1; }
+    let s: i64 = seq;
+    let j: i32 = 0;
+    while (j < 8) {
+        let sb: i64 = (s >> ((7 - j) * 8)) & 255;
+        out[4 + j] = (((out[4 + j] as u8) as i64) ^ sb) as i8;
+        j = j + 1;
+    }
+}
+
+fn tls_transcript_add(c: *TlsConn, msg: *i8, n: i32) void {
+    let i: i32 = 0;
+    while (i < n) { c.*.transcript[c.*.tlen + i] = msg[i]; i = i + 1; }
+    c.*.tlen = c.*.tlen + n;
+}
+
+fn tls_transcript_hash(c: *TlsConn, out: *i8) void {
+    sha256(c.*.transcript, c.*.tlen, out);
+}
+
+// ── ClientHello ──────────────────────────────────────────────────────────────
+
+fn tls_build_client_hello(c: *TlsConn, host: []u8, pub: *i8, out: *i8) i32 {
+    // handshake body starts after the 4-byte handshake header (type+len24)
+    let p: i32 = 4;
+    p = tls_put16(out, p, 771);          // legacy_version 0x0303
+    let rnd: *i8 = _zag_malloc(32);
+    let _r: i32 = crypto_random(rnd, 32);
+    p = tls_putbytes(out, p, rnd, 32);   // random
+    p = tls_put8(out, p, 32);            // session_id len
+    let sid: *i8 = _zag_malloc(32);
+    let _s: i32 = crypto_random(sid, 32);
+    p = tls_putbytes(out, p, sid, 32);   // legacy session id
+    p = tls_put16(out, p, 2);            // cipher_suites length
+    p = tls_put16(out, p, 4867);         // TLS_CHACHA20_POLY1305_SHA256 = 0x1303
+    p = tls_put8(out, p, 1);             // compression methods len
+    p = tls_put8(out, p, 0);             // null compression
+
+    // extensions
+    let ext_len_pos: i32 = p;
+    p = p + 2;
+    let ext_start: i32 = p;
+
+    // server_name (0x0000)
+    p = tls_put16(out, p, 0);
+    p = tls_put16(out, p, host.len + 5);      // ext data len
+    p = tls_put16(out, p, host.len + 3);      // server_name_list len
+    p = tls_put8(out, p, 0);                  // host_name type
+    p = tls_put16(out, p, host.len);
+    p = tls_putstr(out, p, host);
+
+    // supported_groups (0x000a) = x25519 (0x001d)
+    p = tls_put16(out, p, 10);
+    p = tls_put16(out, p, 4);
+    p = tls_put16(out, p, 2);
+    p = tls_put16(out, p, 29);
+
+    // signature_algorithms (0x000d)
+    p = tls_put16(out, p, 13);
+    p = tls_put16(out, p, 8);
+    p = tls_put16(out, p, 6);
+    p = tls_put16(out, p, 1027);              // ecdsa_secp256r1_sha256 0x0403
+    p = tls_put16(out, p, 2052);              // rsa_pss_rsae_sha256 0x0804
+    p = tls_put16(out, p, 1025);              // rsa_pkcs1_sha256 0x0401
+
+    // supported_versions (0x002b) = TLS 1.3 (0x0304)
+    p = tls_put16(out, p, 43);
+    p = tls_put16(out, p, 3);
+    p = tls_put8(out, p, 2);
+    p = tls_put16(out, p, 772);
+
+    // key_share (0x0033): x25519 public
+    p = tls_put16(out, p, 51);
+    p = tls_put16(out, p, 38);
+    p = tls_put16(out, p, 36);                // client_shares len
+    p = tls_put16(out, p, 29);                // group x25519
+    p = tls_put16(out, p, 32);                // key length
+    p = tls_putbytes(out, p, pub, 32);
+
+    let _fix: i32 = tls_put16(out, ext_len_pos, p - ext_start);
+
+    // handshake header
+    let _h1: i32 = tls_put8(out, 0, 1);       // client_hello
+    let _h2: i32 = tls_put24(out, 1, p - 4);
+    return p;
+}
+
+// ── key schedule ─────────────────────────────────────────────────────────────
+
+fn tls_derive_traffic_keys(secret: *i8, key: *i8, iv: *i8) void {
+    hkdf_expand_label(secret, "key", (0 as *i8), 0, 32, key);
+    hkdf_expand_label(secret, "iv", (0 as *i8), 0, 12, iv);
+}
+
+fn tls_key_schedule(c: *TlsConn, server_pub: *i8) void {
+    let zeros: *i8 = _zag_malloc(32);
+    let i: i32 = 0;
+    while (i < 32) { zeros[i] = 0 as i8; i = i + 1; }
+    let empty_hash: *i8 = _zag_malloc(32);
+    sha256(zeros, 0, empty_hash);
+
+    let early: *i8 = _zag_malloc(32);
+    hkdf_extract(zeros, 32, zeros, 32, early);
+    let derived: *i8 = _zag_malloc(32);
+    hkdf_expand_label(early, "derived", empty_hash, 32, 32, derived);
+
+    let shared: *i8 = _zag_malloc(32);
+    x25519_shared(shared, c.*.priv, server_pub);
+    hkdf_extract(derived, 32, shared, 32, c.*.hs_secret);
+
+    let th: *i8 = _zag_malloc(32);
+    tls_transcript_hash(c, th);          // hash(ClientHello || ServerHello)
+    hkdf_expand_label(c.*.hs_secret, "c hs traffic", th, 32, 32, c.*.c_hs);
+    let s_hs: *i8 = _zag_malloc(32);
+    hkdf_expand_label(c.*.hs_secret, "s hs traffic", th, 32, 32, s_hs);
+
+    tls_derive_traffic_keys(c.*.c_hs, c.*.c_hs_key, c.*.c_hs_iv);
+    tls_derive_traffic_keys(s_hs, c.*.s_hs_key, c.*.s_hs_iv);
+    c.*.s_seq = 0;
+    c.*.c_seq = 0;
+}
+
+fn tls_app_schedule(c: *TlsConn) void {
+    let zeros: *i8 = _zag_malloc(32);
+    let i: i32 = 0;
+    while (i < 32) { zeros[i] = 0 as i8; i = i + 1; }
+    let empty_hash: *i8 = _zag_malloc(32);
+    sha256(zeros, 0, empty_hash);
+    let derived2: *i8 = _zag_malloc(32);
+    hkdf_expand_label(c.*.hs_secret, "derived", empty_hash, 32, 32, derived2);
+    let master: *i8 = _zag_malloc(32);
+    hkdf_extract(derived2, 32, zeros, 32, master);
+
+    let th: *i8 = _zag_malloc(32);
+    tls_transcript_hash(c, th);          // hash through server Finished
+    let c_ap: *i8 = _zag_malloc(32);
+    let s_ap: *i8 = _zag_malloc(32);
+    hkdf_expand_label(master, "c ap traffic", th, 32, 32, c_ap);
+    hkdf_expand_label(master, "s ap traffic", th, 32, 32, s_ap);
+    tls_derive_traffic_keys(c_ap, c.*.c_ap_key, c.*.c_ap_iv);
+    tls_derive_traffic_keys(s_ap, c.*.s_ap_key, c.*.s_ap_iv);
+}
+
+// ── record I/O ───────────────────────────────────────────────────────────────
+
+// Read one TLS record. Writes type to *rtype, payload to buf, returns length
+// (payload bytes) or <0 on error.
+fn tls_read_record(c: *TlsConn, rtype: *i32, buf: *i8) i32 {
+    let hdr: *i8 = _zag_malloc(5);
+    if (net_tcp_recv_n(c.*.fd, hdr, 5) < 0) { return 0 - 1; }
+    rtype.* = (hdr[0] as u8) as i32;
+    let len: i32 = tls_rd16(hdr, 3);
+    if (len < 0 || len > 20000) { return 0 - 2; }
+    if (net_tcp_recv_n(c.*.fd, buf, len) < 0) { return 0 - 3; }
+    return len;
+}
+
+// Send a plaintext handshake record (type 22).
+fn tls_send_plain(c: *TlsConn, payload: *i8, n: i32) i64 {
+    let rec: *i8 = _zag_malloc(n + 5);
+    let p: i32 = tls_put8(rec, 0, 22);
+    p = tls_put16(rec, p, 771);
+    p = tls_put16(rec, p, n);
+    p = tls_putbytes(rec, p, payload, n);
+    return net_tcp_send_raw(c.*.fd, rec, p);
+}
+
+// Encrypt and send an application_data record (inner_type appended).
+fn tls_send_encrypted(c: *TlsConn, key: *i8, iv: *i8, seq: i64, inner_type: i32, data: *i8, n: i32) i64 {
+    let inner: *i8 = _zag_malloc(n + 1);
+    let i: i32 = 0;
+    while (i < n) { inner[i] = data[i]; i = i + 1; }
+    inner[n] = inner_type as i8;
+    let inner_len: i32 = n + 1;
+
+    let ctlen: i32 = inner_len + 16;
+    let aad: *i8 = _zag_malloc(5);
+    let _a: i32 = tls_put8(aad, 0, 23);
+    let _a2: i32 = tls_put16(aad, 1, 771);
+    let _a3: i32 = tls_put16(aad, 3, ctlen);
+
+    let nonce: *i8 = _zag_malloc(12);
+    tls_nonce(iv, seq, nonce);
+    let ct: *i8 = _zag_malloc(ctlen);
+    aead_seal(key, nonce, aad, 5, inner, inner_len, ct);
+
+    let rec: *i8 = _zag_malloc(ctlen + 5);
+    let p: i32 = tls_putbytes(rec, 0, aad, 5);
+    p = tls_putbytes(rec, p, ct, ctlen);
+    return net_tcp_send_raw(c.*.fd, rec, p);
+}
+
+// Decrypt an application_data record in place; returns inner content type and
+// plaintext length via *outlen, or <0 on auth failure.
+fn tls_decrypt_record(key: *i8, iv: *i8, seq: i64, ct: *i8, ctlen: i32, out: *i8, outlen: *i32) i32 {
+    let aad: *i8 = _zag_malloc(5);
+    let _a: i32 = tls_put8(aad, 0, 23);
+    let _a2: i32 = tls_put16(aad, 1, 771);
+    let _a3: i32 = tls_put16(aad, 3, ctlen);
+    let nonce: *i8 = _zag_malloc(12);
+    tls_nonce(iv, seq, nonce);
+    if (aead_open(key, nonce, aad, 5, ct, ctlen, out) == 0) { return 0 - 1; }
+    let plen: i32 = ctlen - 16;
+    // strip trailing zeros; last non-zero byte is the real content type
+    while (plen > 0 && out[plen - 1] == (0 as i8)) { plen = plen - 1; }
+    if (plen < 1) { return 0 - 2; }
+    let itype: i32 = (out[plen - 1] as u8) as i32;
+    outlen.* = plen - 1;
+    return itype;
+}
+
+// ── handshake ────────────────────────────────────────────────────────────────
+
+fn tls_alloc_conn() *TlsConn {
+    let c: *TlsConn = _zag_malloc(@sizeOf[TlsConn]()) as *TlsConn;
+    c.*.priv = _zag_malloc(32);
+    c.*.transcript = _zag_malloc(20000);
+    c.*.tlen = 0;
+    c.*.hs_secret = _zag_malloc(32);
+    c.*.c_hs = _zag_malloc(32);
+    c.*.s_hs_key = _zag_malloc(32); c.*.s_hs_iv = _zag_malloc(12);
+    c.*.c_hs_key = _zag_malloc(32); c.*.c_hs_iv = _zag_malloc(12);
+    c.*.s_ap_key = _zag_malloc(32); c.*.s_ap_iv = _zag_malloc(12);
+    c.*.c_ap_key = _zag_malloc(32); c.*.c_ap_iv = _zag_malloc(12);
+    c.*.err = 0;
+    return c;
+}
+
+// Parse ServerHello payload, extracting the server's key_share pubkey (32).
+// Returns 0 on success.
+fn tls_parse_server_hello(sh: *i8, shlen: i32, server_pub: *i8) i32 {
+    // handshake: type(1)=2 len(3) body
+    if ((sh[0] as u8) as i32 != 2) { return 0 - 1; }
+    let p: i32 = 4;
+    p = p + 2;                 // legacy_version
+    p = p + 32;                // random
+    let sidlen: i32 = (sh[p] as u8) as i32; p = p + 1 + sidlen;
+    p = p + 2;                 // cipher_suite
+    p = p + 1;                 // compression
+    let ext_total: i32 = tls_rd16(sh, p); p = p + 2;
+    let ext_end: i32 = p + ext_total;
+    while (p + 4 <= ext_end) {
+        let etype: i32 = tls_rd16(sh, p); p = p + 2;
+        let elen: i32 = tls_rd16(sh, p); p = p + 2;
+        if (etype == 51) {                 // key_share
+            // group(2) keylen(2) key
+            let keylen: i32 = tls_rd16(sh, p + 2);
+            let i: i32 = 0;
+            while (i < keylen && i < 32) { server_pub[i] = sh[p + 4 + i]; i = i + 1; }
+            return 0;
+        }
+        p = p + elen;
+    }
+    return 0 - 2;
+}
+
+// Full handshake + HTTP GET. Writes the decrypted HTTP response into out,
+// returns its length, or a negative TLS error.
+fn tls_https_get(host: []u8, port: i32, path: []u8, out: *i8, cap: i32) i32 {
+    let ip: i64 = net_dns_resolve(host);
+    if (ip < 0) { return 0 - 10; }
+    let fd: i64 = net_tcp_connect(ip, port);
+    if (fd < 0) { return 0 - 11; }
+
+    let c: *TlsConn = tls_alloc_conn();
+    c.*.fd = fd;
+    let _r: i32 = crypto_random(c.*.priv, 32);
+    let pub: *i8 = _zag_malloc(32);
+    x25519_base(pub, c.*.priv);
+
+    // ClientHello
+    let ch: *i8 = _zag_malloc(1024);
+    let chlen: i32 = tls_build_client_hello(c, host, pub, ch);
+    tls_transcript_add(c, ch, chlen);
+    let _w: i64 = tls_send_plain(c, ch, chlen);
+
+    // ServerHello (plaintext handshake record; may be preceded by CCS)
+    let rbuf: *i8 = _zag_malloc(20000);
+    let rtype: i32 = 0;
+    let rlen: i32 = tls_read_record(c, &rtype, rbuf);
+    while (rlen > 0 && rtype == 20) {          // skip ChangeCipherSpec
+        rlen = tls_read_record(c, &rtype, rbuf);
+    }
+    if (rlen < 0 || rtype != 22) { net_tcp_close(fd); return 0 - 12; }
+    tls_transcript_add(c, rbuf, rlen);
+    let server_pub: *i8 = _zag_malloc(32);
+    if (tls_parse_server_hello(rbuf, rlen, server_pub) != 0) { net_tcp_close(fd); return 0 - 13; }
+
+    tls_key_schedule(c, server_pub);
+
+    // Encrypted handshake flight: decrypt records until server Finished (0x14)
+    let hs_stream: *i8 = _zag_malloc(20000);
+    let hs_len: i32 = 0;
+    let saw_finished: i32 = 0;
+    let dec: *i8 = _zag_malloc(20000);
+    let guard: i32 = 0;
+    while (saw_finished == 0 && guard < 32) {
+        rlen = tls_read_record(c, &rtype, rbuf);
+        if (rlen < 0) { net_tcp_close(fd); return 0 - 14; }
+        if (rtype == 20) { guard = guard + 1; }   // CCS between flights
+        if (rtype == 23) {
+            let plen: i32 = 0;
+            let itype: i32 = tls_decrypt_record(c.*.s_hs_key, c.*.s_hs_iv, c.*.s_seq, rbuf, rlen, dec, &plen);
+            c.*.s_seq = c.*.s_seq + 1;
+            if (itype < 0) { net_tcp_close(fd); return 0 - 15; }
+            if (itype == 22) {
+                let i: i32 = 0;
+                while (i < plen) { hs_stream[hs_len + i] = dec[i]; i = i + 1; }
+                hs_len = hs_len + plen;
+                // scan for a Finished (type 0x14) message boundary
+                let q: i32 = 0;
+                while (q + 4 <= hs_len) {
+                    let mtype: i32 = (hs_stream[q] as u8) as i32;
+                    let mlen: i32 = tls_rd24(hs_stream, q + 1);
+                    if (q + 4 + mlen > hs_len) { q = hs_len; }
+                    else {
+                        if (mtype == 20) { saw_finished = 1; }
+                        q = q + 4 + mlen;
+                    }
+                }
+            }
+        }
+        guard = guard + 1;
+    }
+    if (saw_finished == 0) { net_tcp_close(fd); return 0 - 16; }
+    // append the full server handshake flight to the transcript
+    tls_transcript_add(c, hs_stream, hs_len);
+
+    // client Finished (before app schedule uses same transcript-through-server-Finished)
+    let th_sf: *i8 = _zag_malloc(32);
+    tls_transcript_hash(c, th_sf);
+    let fin_key: *i8 = _zag_malloc(32);
+    hkdf_expand_label(c.*.c_hs, "finished", (0 as *i8), 0, 32, fin_key);
+    let verify: *i8 = _zag_malloc(32);
+    hmac_sha256(fin_key, 32, th_sf, 32, verify);
+    let finmsg: *i8 = _zag_malloc(36);
+    let fp: i32 = tls_put8(finmsg, 0, 20);
+    fp = tls_put24(finmsg, 1, 32);
+    fp = tls_putbytes(finmsg, fp, verify, 32);
+    let _cf: i64 = tls_send_encrypted(c, c.*.c_hs_key, c.*.c_hs_iv, c.*.c_seq, 22, finmsg, fp);
+    c.*.c_seq = c.*.c_seq + 1;
+
+    // application keys (schedule uses transcript through server Finished)
+    tls_app_schedule(c);
+    c.*.s_seq = 0;   // new epoch: server application records
+    let c_app_seq: i64 = 0;
+
+    // send the HTTP request encrypted
+    let req: []u8 = _zag_str_concat("GET ", path);
+    req = _zag_str_concat(req, " HTTP/1.0\r\nHost: ");
+    req = _zag_str_concat(req, host);
+    req = _zag_str_concat(req, "\r\nUser-Agent: RayBrowser/0.1 (RayOS)\r\nConnection: close\r\n\r\n");
+    let reqbuf: *i8 = _zag_malloc(req.len);
+    let i: i32 = 0;
+    while (i < req.len) { reqbuf[i] = req[i] as i8; i = i + 1; }
+    let _hr: i64 = tls_send_encrypted(c, c.*.c_ap_key, c.*.c_ap_iv, c_app_seq, 23, reqbuf, req.len);
+    c_app_seq = c_app_seq + 1;
+
+    // read encrypted application data until close
+    let total: i32 = 0;
+    let reading: i32 = 1;
+    while (reading == 1 && total < cap) {
+        rlen = tls_read_record(c, &rtype, rbuf);
+        if (rlen < 0) { reading = 0; }
+        else if (rtype == 23) {
+            let plen: i32 = 0;
+            let itype: i32 = tls_decrypt_record(c.*.s_ap_key, c.*.s_ap_iv, c.*.s_seq, rbuf, rlen, dec, &plen);
+            c.*.s_seq = c.*.s_seq + 1;
+            if (itype < 0) { reading = 0; }
+            else if (itype == 23) {
+                let k: i32 = 0;
+                while (k < plen && total < cap) { out[total] = dec[k]; total = total + 1; k = k + 1; }
+            } else if (itype == 21) {
+                reading = 0;   // alert (incl. close_notify)
+            }
+            // itype == 22 (NewSessionTicket): ignore
+        } else if (rtype == 21) {
+            reading = 0;
+        }
+    }
+    net_tcp_close(fd);
+    return total;
+}

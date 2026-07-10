@@ -1,0 +1,259 @@
+// core/scheduler.flash — native balanced-ternary weighted deadline scheduler.
+//
+// Scheduling values are t27/t9. i32 appears only where Flash's current
+// ArrayList ABI requires a host-sized index during bootstrap emulation.
+
+fn task_ready() t9    { return 0; }
+fn task_running() t9  { return 1; }
+fn task_sleeping() t9 { return 0 - 1; }
+fn task_blocked() t9  { return 2; }
+fn task_stopped() t9  { return 0 - 2; }
+fn task_zombie() t9   { return 3; }
+
+fn scheduler_no_task() t27 { return 0 - 1; }
+fn scheduler_min_priority() t9 { return 0 - 8; }
+fn scheduler_max_priority() t9 { return 8; }
+fn scheduler_base_slice() t27 { return 27; }
+fn scheduler_scale() t27 { return 729; }
+
+struct RayTask {
+    id: t27,
+    parent_id: t27,
+    name: []u8,
+    state: t9,
+    priority: t9,
+    weight: t27,
+    runtime: t27,
+    vruntime: t27,
+    deadline: t27,
+    wake_tick: t27,
+    dispatches: t27,
+    exit_code: t9,
+}
+
+struct RayScheduler {
+    tasks: ArrayList[RayTask],
+    next_id: t27,
+    clock: t27,
+    current_index: t27,
+    dispatches: t27,
+}
+
+fn scheduler_clamp_priority(priority: t9) t9 {
+    if (priority < scheduler_min_priority()) { return scheduler_min_priority(); }
+    if (priority > scheduler_max_priority()) { return scheduler_max_priority(); }
+    return priority;
+}
+
+// The 17 priority bands use positive weights 3..51 in steps of three.
+fn scheduler_priority_weight(priority: t9) t27 {
+    let p: t9 = scheduler_clamp_priority(priority);
+    return 27 + (p as t27) * 3;
+}
+
+fn scheduler_new() RayScheduler {
+    return RayScheduler{
+        .tasks = make[RayTask](27),
+        .next_id = 1,
+        .clock = 0,
+        .current_index = scheduler_no_task(),
+        .dispatches = 0,
+    };
+}
+
+fn scheduler_free(sched: *RayScheduler) void {
+    free[RayTask](&sched.*.tasks);
+    sched.*.current_index = scheduler_no_task();
+}
+
+fn scheduler_find_index(sched: *RayScheduler, task_id: t27) i32 {
+    let i: i32 = 0;
+    while (i < len[RayTask](sched.*.tasks)) {
+        let task: RayTask = get[RayTask](sched.*.tasks, i);
+        if (task.id == task_id) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn scheduler_spawn(
+    sched: *RayScheduler,
+    parent_id: t27,
+    name: []u8,
+    priority: t9,
+) t27 {
+    if (name.len < 1 || name.len > 81) { return scheduler_no_task(); }
+    let id: t27 = sched.*.next_id;
+    let p: t9 = scheduler_clamp_priority(priority);
+    let weight: t27 = scheduler_priority_weight(p);
+    let task: RayTask = RayTask{
+        .id = id,
+        .parent_id = parent_id,
+        .name = name,
+        .state = task_ready(),
+        .priority = p,
+        .weight = weight,
+        .runtime = 0,
+        .vruntime = 0,
+        .deadline = scheduler_base_slice() * scheduler_scale() / weight,
+        .wake_tick = 0,
+        .dispatches = 0,
+        .exit_code = 0,
+    };
+    push[RayTask](&sched.*.tasks, task);
+    sched.*.next_id = id + 1;
+    return id;
+}
+
+fn scheduler_set_priority(sched: *RayScheduler, task_id: t27, priority: t9) i32 {
+    let idx: i32 = scheduler_find_index(sched, task_id);
+    if (idx < 0) { return 0 - 1; }
+    let task: RayTask = get[RayTask](sched.*.tasks, idx);
+    if (task.state == task_zombie()) { return 0 - 2; }
+    task.priority = scheduler_clamp_priority(priority);
+    task.weight = scheduler_priority_weight(task.priority);
+    task.deadline = task.vruntime + scheduler_base_slice() * scheduler_scale() / task.weight;
+    set[RayTask](&sched.*.tasks, idx, task);
+    return 0;
+}
+
+fn scheduler_wake_due(sched: *RayScheduler) void {
+    let i: i32 = 0;
+    while (i < len[RayTask](sched.*.tasks)) {
+        let task: RayTask = get[RayTask](sched.*.tasks, i);
+        if (task.state == task_sleeping() && task.wake_tick <= sched.*.clock) {
+            task.state = task_ready();
+            task.wake_tick = 0;
+            task.deadline = task.vruntime + scheduler_base_slice() * scheduler_scale() / task.weight;
+            set[RayTask](&sched.*.tasks, i, task);
+        }
+        i = i + 1;
+    }
+}
+
+fn scheduler_account_current(sched: *RayScheduler, elapsed: t27) void {
+    if (elapsed < 1 || sched.*.current_index < 0) { return; }
+    let idx: i32 = sched.*.current_index as i32;
+    if (idx < 0 || idx >= len[RayTask](sched.*.tasks)) {
+        sched.*.current_index = scheduler_no_task();
+        return;
+    }
+    let task: RayTask = get[RayTask](sched.*.tasks, idx);
+    if (task.state != task_running()) {
+        sched.*.current_index = scheduler_no_task();
+        return;
+    }
+    task.runtime = task.runtime + elapsed;
+    let delta: t27 = elapsed * scheduler_scale() / task.weight;
+    if (delta < 1) { delta = 1; }
+    task.vruntime = task.vruntime + delta;
+    task.deadline = task.vruntime + scheduler_base_slice() * scheduler_scale() / task.weight;
+    task.state = task_ready();
+    set[RayTask](&sched.*.tasks, idx, task);
+    sched.*.current_index = scheduler_no_task();
+}
+
+// Earliest virtual deadline wins. Task id is a deterministic tie breaker.
+fn scheduler_pick_next(sched: *RayScheduler) t27 {
+    let best_idx: i32 = 0 - 1;
+    let best_deadline: t27 = 3812798742493;
+    let best_id: t27 = 3812798742493;
+    let i: i32 = 0;
+    while (i < len[RayTask](sched.*.tasks)) {
+        let task: RayTask = get[RayTask](sched.*.tasks, i);
+        if (task.state == task_ready()) {
+            if (best_idx < 0 || task.deadline < best_deadline ||
+                (task.deadline == best_deadline && task.id < best_id)) {
+                best_idx = i;
+                best_deadline = task.deadline;
+                best_id = task.id;
+            }
+        }
+        i = i + 1;
+    }
+    if (best_idx < 0) { return scheduler_no_task(); }
+    let selected: RayTask = get[RayTask](sched.*.tasks, best_idx);
+    selected.state = task_running();
+    selected.dispatches = selected.dispatches + 1;
+    set[RayTask](&sched.*.tasks, best_idx, selected);
+    sched.*.current_index = best_idx as t27;
+    sched.*.dispatches = sched.*.dispatches + 1;
+    return selected.id;
+}
+
+fn scheduler_tick(sched: *RayScheduler, elapsed: t27) t27 {
+    if (elapsed < 0) { elapsed = 0; }
+    scheduler_account_current(sched, elapsed);
+    sched.*.clock = sched.*.clock + elapsed;
+    scheduler_wake_due(sched);
+    return scheduler_pick_next(sched);
+}
+
+fn scheduler_sleep(sched: *RayScheduler, task_id: t27, duration: t27) i32 {
+    if (duration < 1) { return 0 - 2; }
+    let idx: i32 = scheduler_find_index(sched, task_id);
+    if (idx < 0) { return 0 - 1; }
+    let task: RayTask = get[RayTask](sched.*.tasks, idx);
+    if (task.state == task_zombie()) { return 0 - 3; }
+    task.state = task_sleeping();
+    task.wake_tick = sched.*.clock + duration;
+    set[RayTask](&sched.*.tasks, idx, task);
+    if (sched.*.current_index == idx as t27) { sched.*.current_index = scheduler_no_task(); }
+    return 0;
+}
+
+fn scheduler_block(sched: *RayScheduler, task_id: t27) i32 {
+    let idx: i32 = scheduler_find_index(sched, task_id);
+    if (idx < 0) { return 0 - 1; }
+    let task: RayTask = get[RayTask](sched.*.tasks, idx);
+    if (task.state == task_zombie()) { return 0 - 2; }
+    task.state = task_blocked();
+    set[RayTask](&sched.*.tasks, idx, task);
+    if (sched.*.current_index == idx as t27) { sched.*.current_index = scheduler_no_task(); }
+    return 0;
+}
+
+fn scheduler_wake(sched: *RayScheduler, task_id: t27) i32 {
+    let idx: i32 = scheduler_find_index(sched, task_id);
+    if (idx < 0) { return 0 - 1; }
+    let task: RayTask = get[RayTask](sched.*.tasks, idx);
+    if (task.state != task_blocked() && task.state != task_stopped() &&
+        task.state != task_sleeping()) { return 0 - 2; }
+    task.state = task_ready();
+    task.wake_tick = 0;
+    set[RayTask](&sched.*.tasks, idx, task);
+    return 0;
+}
+
+fn scheduler_exit(sched: *RayScheduler, task_id: t27, code: t9) i32 {
+    let idx: i32 = scheduler_find_index(sched, task_id);
+    if (idx < 0) { return 0 - 1; }
+    let task: RayTask = get[RayTask](sched.*.tasks, idx);
+    task.state = task_zombie();
+    task.exit_code = code;
+    set[RayTask](&sched.*.tasks, idx, task);
+    if (sched.*.current_index == idx as t27) { sched.*.current_index = scheduler_no_task(); }
+    return 0;
+}
+
+fn scheduler_task(sched: *RayScheduler, task_id: t27) RayTask {
+    let idx: i32 = scheduler_find_index(sched, task_id);
+    if (idx >= 0) { return get[RayTask](sched.*.tasks, idx); }
+    return RayTask{
+        .id = scheduler_no_task(), .parent_id = scheduler_no_task(), .name = "",
+        .state = task_zombie(), .priority = 0, .weight = 0, .runtime = 0,
+        .vruntime = 0, .deadline = 0, .wake_tick = 0, .dispatches = 0,
+        .exit_code = 0,
+    };
+}
+
+fn scheduler_runnable_count(sched: *RayScheduler) t27 {
+    let count: t27 = 0;
+    let i: i32 = 0;
+    while (i < len[RayTask](sched.*.tasks)) {
+        let state: t9 = get[RayTask](sched.*.tasks, i).state;
+        if (state == task_ready() || state == task_running()) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}

@@ -1,0 +1,486 @@
+// routing_table.zag — passive optical routing table for RayOS spatial fabric
+//
+// Tracks WDM wavelength slots, GeSn waveguide path bindings, application
+// endpoints, and route lookup.  Allocation is explicit; once a route is
+// committed the passive switchboard carries photons without kernel mediation.
+//
+//   @import("routing_table.flash")
+//   let rt: RoutingTable = routing_table_new();
+//   let rid: i32 = rt_allocate_route(&rt, 0, 7, 3, path_slot);
+
+
+
+
+// ── routing descriptors ─────────────────────────────────────────────────────
+
+struct WaveguidePath {
+    slot_id:      i32,   // GeSn pool index (0..255)
+    src_chamber:  i32,
+    dst_chamber:  i32,
+    channel_id:   i32,
+    hop_count:    i32,
+    freq_ghz:     i32,
+    loss_db_x10:  i32,
+    latched:      i32,   // 1 = passive crossbar set, continuous flow
+}
+
+struct WavelengthSlot {
+    chamber_id:   i32,
+    channel_id:   i32,
+    occupied:     i32,
+    route_id:     i32,   // -1 when free
+    binding_id:   i32,
+    freq_ghz:     i32,
+}
+
+struct RouteEntry {
+    route_id:     i32,
+    path:         WaveguidePath,
+    src_chamber:  i32,
+    dst_chamber:  i32,
+    channel_id:   i32,
+    active:       i32,
+    binding_id:   i32,
+}
+
+struct ApplicationBinding {
+    binding_id:   i32,
+    app_id:       i32,
+    route_id:     i32,
+    chamber_id:   i32,   // home execution chamber
+    channel_id:   i32,
+    path_slot:    i32,
+    active:       i32,
+}
+
+struct RoutingTable {
+    routes:           *RouteEntry,
+    route_count:      i32,
+    route_capacity:   i32,
+    wavelength_slots: *WavelengthSlot,
+    wl_slot_count:    i32,
+    bindings:         *ApplicationBinding,
+    binding_count:    i32,
+    binding_capacity: i32,
+    next_route_id:    i32,
+    next_binding_id:  i32,
+}
+
+struct RoutingSummary {
+    routes_active:    i32,
+    wavelengths_used: i32,
+    bindings_active:  i32,
+}
+
+// ── slot indexing ─────────────────────────────────────────────────────────────
+
+fn wl_slot_index(chamber_id: i32, channel_id: i32) i32 {
+    return chamber_id * (RAYOS_WDM_CHANNELS() as i32) + channel_id;
+}
+
+fn wl_slot_chamber(slot_idx: i32) i32 {
+    return slot_idx / (RAYOS_WDM_CHANNELS() as i32);
+}
+
+fn wl_slot_channel(slot_idx: i32) i32 {
+    return slot_idx - wl_slot_chamber(slot_idx) * (RAYOS_WDM_CHANNELS() as i32);
+}
+
+fn route_entry_empty(route_id: i32) RouteEntry {
+    return RouteEntry{
+        .route_id    = route_id,
+        .path        = WaveguidePath{
+            .slot_id     = 0 - 1,
+            .src_chamber = 0 - 1,
+            .dst_chamber = 0 - 1,
+            .channel_id  = 0 - 1,
+            .hop_count   = 0,
+            .freq_ghz    = 0,
+            .loss_db_x10 = 0,
+            .latched     = 0,
+        },
+        .src_chamber = 0 - 1,
+        .dst_chamber = 0 - 1,
+        .channel_id  = 0 - 1,
+        .active      = 0,
+        .binding_id  = 0 - 1,
+    };
+}
+
+fn binding_empty(binding_id: i32) ApplicationBinding {
+    return ApplicationBinding{
+        .binding_id = binding_id,
+        .app_id     = 0 - 1,
+        .route_id   = 0 - 1,
+        .chamber_id = 0 - 1,
+        .channel_id = 0 - 1,
+        .path_slot  = 0 - 1,
+        .active     = 0,
+    };
+}
+
+// ── lifecycle ───────────────────────────────────────────────────────────────
+
+fn routing_table_new() RoutingTable {
+    let route_cap: i32 = (RAYOS_MAX_ROUTES() as i32);
+    let bind_cap: i32 = (RAYOS_MAX_BINDINGS() as i32);
+    let wl_count: i32 = (RAYOS_WAVELENGTH_SLOT_COUNT() as i32);
+
+    let routes_raw: *i8 = _zag_malloc(route_cap * @sizeOf[RouteEntry]());
+    let routes: *RouteEntry = routes_raw as *RouteEntry;
+    let ri: i32 = 0;
+    while (ri < route_cap) {
+        routes[ri] = route_entry_empty(0 - 1);
+        ri = ri + 1;
+    }
+
+    let wl_raw: *i8 = _zag_malloc(wl_count * @sizeOf[WavelengthSlot]());
+    let wl: *WavelengthSlot = wl_raw as *WavelengthSlot;
+    let wi: i32 = 0;
+    while (wi < wl_count) {
+        let ch_id: i32 = wl_slot_chamber(wi);
+        let ch_ch: i32 = wl_slot_channel(wi);
+        wl[wi] = WavelengthSlot{
+            .chamber_id = ch_id,
+            .channel_id = ch_ch,
+            .occupied   = 0,
+            .route_id   = 0 - 1,
+            .binding_id = 0 - 1,
+            .freq_ghz   = wdm_channel_freq_ghz(ch_ch),
+        };
+        wi = wi + 1;
+    }
+
+    let bind_raw: *i8 = _zag_malloc(bind_cap * @sizeOf[ApplicationBinding]());
+    let bindings: *ApplicationBinding = bind_raw as *ApplicationBinding;
+    let bi: i32 = 0;
+    while (bi < bind_cap) {
+        bindings[bi] = binding_empty(0 - 1);
+        bi = bi + 1;
+    }
+
+    return RoutingTable{
+        .routes           = routes,
+        .route_count      = 0,
+        .route_capacity   = route_cap,
+        .wavelength_slots = wl,
+        .wl_slot_count    = wl_count,
+        .bindings         = bindings,
+        .binding_count    = 0,
+        .binding_capacity = bind_cap,
+        .next_route_id    = 1,
+        .next_binding_id  = 1,
+    };
+}
+
+fn routing_table_free(rt: *RoutingTable) void {
+    if (rt.*.routes != null) {
+        _zag_free(rt.*.routes as *i8);
+    }
+    if (rt.*.wavelength_slots != null) {
+        _zag_free(rt.*.wavelength_slots as *i8);
+    }
+    if (rt.*.bindings != null) {
+        _zag_free(rt.*.bindings as *i8);
+    }
+    rt.*.routes = null as *RouteEntry;
+    rt.*.wavelength_slots = null as *WavelengthSlot;
+    rt.*.bindings = null as *ApplicationBinding;
+    rt.*.route_count = 0;
+    rt.*.binding_count = 0;
+}
+
+// ── wavelength slot allocation ──────────────────────────────────────────────
+
+fn rt_wavelength_get(rt: RoutingTable, chamber_id: i32, channel_id: i32) ?WavelengthSlot {
+    if (chamber_id_valid(chamber_id) == 0 || wdm_channel_valid(channel_id) == 0) { return null; }
+    let idx: i32 = wl_slot_index(chamber_id, channel_id);
+    if (idx < 0 || idx >= rt.wl_slot_count) { return null; }
+    return rt.wavelength_slots[idx];
+}
+
+fn rt_allocate_wavelength(rt: *RoutingTable, chamber_id: i32, channel_id: i32, route_id: i32) i32 {
+    if (chamber_id_valid(chamber_id) == 0 || wdm_channel_valid(channel_id) == 0) { return 0; }
+    let idx: i32 = wl_slot_index(chamber_id, channel_id);
+    if (idx < 0 || idx >= rt.*.wl_slot_count) { return 0; }
+    if (rt.*.wavelength_slots[idx].occupied == 1) { return 0; }
+    rt.*.wavelength_slots[idx].occupied = 1;
+    rt.*.wavelength_slots[idx].route_id = route_id;
+    return 1;
+}
+
+fn rt_deallocate_wavelength(rt: *RoutingTable, chamber_id: i32, channel_id: i32) i32 {
+    if (chamber_id_valid(chamber_id) == 0 || wdm_channel_valid(channel_id) == 0) { return 0; }
+    let idx: i32 = wl_slot_index(chamber_id, channel_id);
+    if (idx < 0 || idx >= rt.*.wl_slot_count) { return 0; }
+    if (rt.*.wavelength_slots[idx].occupied == 0) { return 0; }
+    rt.*.wavelength_slots[idx].occupied = 0;
+    rt.*.wavelength_slots[idx].route_id = 0 - 1;
+    rt.*.wavelength_slots[idx].binding_id = 0 - 1;
+    return 1;
+}
+
+fn rt_find_free_wavelength(rt: RoutingTable, chamber_id: i32) i32 {
+    if (chamber_id_valid(chamber_id) == 0) { return 0 - 1; }
+    let ch: i32 = 0;
+    while (ch < (RAYOS_WDM_CHANNELS() as i32)) {
+        let idx: i32 = wl_slot_index(chamber_id, ch);
+        if (rt.wavelength_slots[idx].occupied == 0) { return ch; }
+        ch = ch + 1;
+    }
+    return 0 - 1;
+}
+
+// ── route allocation / deallocation ───────────────────────────────────────────
+
+fn rt_find_free_route_slot(rt: RoutingTable) i32 {
+    let i: i32 = 0;
+    while (i < rt.route_capacity) {
+        if (rt.routes[i].active == 0) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn rt_path_from_slot(
+    path_slot: i32,
+    src_chamber: i32,
+    dst_chamber: i32,
+    channel_id: i32,
+    loss_db_x10: i32,
+    latched: i32,
+) WaveguidePath {
+    let hops: i32 = wg_manhattan_chambers(src_chamber, dst_chamber);
+    return WaveguidePath{
+        .slot_id     = path_slot,
+        .src_chamber = src_chamber,
+        .dst_chamber = dst_chamber,
+        .channel_id  = channel_id,
+        .hop_count   = hops,
+        .freq_ghz    = wdm_channel_freq_ghz(channel_id),
+        .loss_db_x10 = loss_db_x10,
+        .latched     = latched,
+    };
+}
+
+fn rt_allocate_route(
+    rt: *RoutingTable,
+    src_chamber: i32,
+    dst_chamber: i32,
+    channel_id: i32,
+    path_slot: i32,
+    loss_db_x10: i32,
+) i32 {
+    if (chamber_id_valid(src_chamber) == 0 || chamber_id_valid(dst_chamber) == 0) { return 0 - 1; }
+    if (wdm_channel_valid(channel_id) == 0) { return 0 - 1; }
+    if (path_slot < 0 || path_slot >= (RAYOS_WAVEGUIDE_SLOTS() as i32)) { return 0 - 1; }
+
+    let slot: i32 = rt_find_free_route_slot(rt.*);
+    if (slot < 0) { return 0 - 1; }
+
+    let route_id: i32 = rt.*.next_route_id;
+    rt.*.next_route_id = rt.*.next_route_id + 1;
+
+    if (rt_allocate_wavelength(rt, src_chamber, channel_id, route_id) == 0) { return 0 - 1; }
+
+    let path: WaveguidePath = rt_path_from_slot(
+        path_slot, src_chamber, dst_chamber, channel_id, loss_db_x10, 0,
+    );
+    rt.*.routes[slot] = RouteEntry{
+        .route_id    = route_id,
+        .path        = path,
+        .src_chamber = src_chamber,
+        .dst_chamber = dst_chamber,
+        .channel_id  = channel_id,
+        .active      = 1,
+        .binding_id  = 0 - 1,
+    };
+    rt.*.route_count = rt.*.route_count + 1;
+    return route_id;
+}
+
+fn rt_deallocate_route(rt: *RoutingTable, route_id: i32) i32 {
+    let i: i32 = 0;
+    while (i < rt.*.route_capacity) {
+        if (rt.*.routes[i].active == 1 && rt.*.routes[i].route_id == route_id) {
+            rt_deallocate_wavelength(rt, rt.*.routes[i].src_chamber, rt.*.routes[i].channel_id);
+            rt.*.routes[i] = route_entry_empty(0 - 1);
+            rt.*.route_count = rt.*.route_count - 1;
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn rt_latch_route(rt: *RoutingTable, route_id: i32) i32 {
+    let i: i32 = 0;
+    while (i < rt.*.route_capacity) {
+        if (rt.*.routes[i].active == 1 && rt.*.routes[i].route_id == route_id) {
+            rt.*.routes[i].path.latched = 1;
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── route lookup ──────────────────────────────────────────────────────────────
+
+fn rt_lookup_route(rt: RoutingTable, route_id: i32) ?RouteEntry {
+    let i: i32 = 0;
+    while (i < rt.route_capacity) {
+        if (rt.routes[i].active == 1 && rt.routes[i].route_id == route_id) {
+            return rt.routes[i];
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+fn rt_lookup_route_by_endpoint(
+    rt: RoutingTable,
+    src_chamber: i32,
+    dst_chamber: i32,
+    channel_id: i32,
+) ?RouteEntry {
+    let i: i32 = 0;
+    while (i < rt.route_capacity) {
+        let r: RouteEntry = rt.routes[i];
+        if (r.active == 1
+            && r.src_chamber == src_chamber
+            && r.dst_chamber == dst_chamber
+            && r.channel_id == channel_id) {
+            return r;
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+fn rt_lookup_route_by_path_slot(rt: RoutingTable, path_slot: i32) ?RouteEntry {
+    let i: i32 = 0;
+    while (i < rt.route_capacity) {
+        if (rt.routes[i].active == 1 && rt.routes[i].path.slot_id == path_slot) {
+            return rt.routes[i];
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+// ── application bindings ──────────────────────────────────────────────────────
+
+fn rt_find_free_binding_slot(rt: RoutingTable) i32 {
+    let i: i32 = 0;
+    while (i < rt.binding_capacity) {
+        if (rt.bindings[i].active == 0) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn rt_bind_application(
+    rt: *RoutingTable,
+    app_id: i32,
+    route_id: i32,
+    chamber_id: i32,
+    channel_id: i32,
+    path_slot: i32,
+) i32 {
+    if (app_id < 0) { return 0 - 1; }
+    if (chamber_id_valid(chamber_id) == 0) { return 0 - 1; }
+    let route_ok: i32 = 0;
+    if (rt_lookup_route(rt.*, route_id)) |_| { route_ok = 1; }
+    if (route_ok == 0) { return 0 - 1; }
+
+    let slot: i32 = rt_find_free_binding_slot(rt.*);
+    if (slot < 0) { return 0 - 1; }
+
+    let binding_id: i32 = rt.*.next_binding_id;
+    rt.*.next_binding_id = rt.*.next_binding_id + 1;
+
+    rt.*.bindings[slot] = ApplicationBinding{
+        .binding_id = binding_id,
+        .app_id     = app_id,
+        .route_id   = route_id,
+        .chamber_id = chamber_id,
+        .channel_id = channel_id,
+        .path_slot  = path_slot,
+        .active     = 1,
+    };
+    rt.*.binding_count = rt.*.binding_count + 1;
+
+    let ri: i32 = 0;
+    let done: i32 = 0;
+    while (ri < rt.*.route_capacity && done == 0) {
+        if (rt.*.routes[ri].active == 1 && rt.*.routes[ri].route_id == route_id) {
+            rt.*.routes[ri].binding_id = binding_id;
+            let wl_idx: i32 = wl_slot_index(chamber_id, channel_id);
+            if (wl_idx >= 0 && wl_idx < rt.*.wl_slot_count) {
+                rt.*.wavelength_slots[wl_idx].binding_id = binding_id;
+            }
+            done = 1;
+        }
+        ri = ri + 1;
+    }
+    return binding_id;
+}
+
+fn rt_unbind_application(rt: *RoutingTable, binding_id: i32) i32 {
+    let i: i32 = 0;
+    while (i < rt.*.binding_capacity) {
+        if (rt.*.bindings[i].active == 1 && rt.*.bindings[i].binding_id == binding_id) {
+            let wl_idx: i32 = wl_slot_index(
+                rt.*.bindings[i].chamber_id,
+                rt.*.bindings[i].channel_id,
+            );
+            if (wl_idx >= 0 && wl_idx < rt.*.wl_slot_count) {
+                rt.*.wavelength_slots[wl_idx].binding_id = 0 - 1;
+            }
+            rt.*.bindings[i] = binding_empty(0 - 1);
+            rt.*.binding_count = rt.*.binding_count - 1;
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn rt_lookup_binding(rt: RoutingTable, binding_id: i32) ?ApplicationBinding {
+    let i: i32 = 0;
+    while (i < rt.binding_capacity) {
+        if (rt.bindings[i].active == 1 && rt.bindings[i].binding_id == binding_id) {
+            return rt.bindings[i];
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+fn rt_lookup_binding_by_app(rt: RoutingTable, app_id: i32) ?ApplicationBinding {
+    let i: i32 = 0;
+    while (i < rt.binding_capacity) {
+        if (rt.bindings[i].active == 1 && rt.bindings[i].app_id == app_id) {
+            return rt.bindings[i];
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+// ── diagnostics ───────────────────────────────────────────────────────────────
+
+fn routing_table_summary(rt: RoutingTable) RoutingSummary {
+    let wl_used: i32 = 0;
+    let wi: i32 = 0;
+    while (wi < rt.wl_slot_count) {
+        if (rt.wavelength_slots[wi].occupied == 1) { wl_used = wl_used + 1; }
+        wi = wi + 1;
+    }
+    return RoutingSummary{
+        .routes_active    = rt.route_count,
+        .wavelengths_used = wl_used,
+        .bindings_active  = rt.binding_count,
+    };
+}

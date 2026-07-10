@@ -1,0 +1,54 @@
+// scanout_live_test.flash — display chamber live mirror self-test.
+
+@import("../../flash/flash/driver/softgpu.flash")
+@import("../driver/display_chamber.flash")
+@import("../driver/scanout_live.flash")
+
+fn main() i32 {
+    _zag_println("scanout_live_test: running");
+
+    let w: i32 = 320;
+    let h: i32 = 200;
+    if (display_chamber_init(w, h) != 0) {
+        _zag_println("scanout_live_test: FAIL chamber init");
+        return 1;
+    }
+    if (scanout_live_init(w, h) != 0) {
+        _zag_println("scanout_live_test: FAIL live init");
+        return 1;
+    }
+
+    let fb: SoftFb = softgpu_new(w, h);
+    softgpu_clear(&fb, 48, 96, 160);
+    softgpu_fill_rect(&fb, 60, 40, 140, 90, 220, 80, 40);
+
+    if (scanout_blit(&fb) != 0) {
+        _zag_println("scanout_live_test: FAIL blit");
+        return 1;
+    }
+    scanout_clear_present_flag();
+    if (scanout_present() != 0) {
+        _zag_println("scanout_live_test: FAIL present");
+        return 1;
+    }
+    if (scanout_present_flag() != 1) {
+        _zag_println("scanout_live_test: FAIL present_flag");
+        return 1;
+    }
+
+    let live_path: []u8 = "desktop/live_frame.ppm";
+    if (scanout_live_present_once(live_path) != 0) {
+        _zag_println("scanout_live_test: FAIL present_once");
+        return 1;
+    }
+
+    if (_zag_file_exists("/dev/fb0") == 0) {
+        if (_zag_file_exists(live_path) == 0) {
+            _zag_println("scanout_live_test: FAIL missing live_frame.ppm");
+            return 1;
+        }
+    }
+
+    _zag_println("scanout_live_test: ok");
+    return 0;
+}

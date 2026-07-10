@@ -1,0 +1,132 @@
+// core/constants.zag — RayOS photonic hypervisor and SOH lattice constants
+//
+// Shared wire encodings and capacity limits for the binary-translation matrix,
+// guest register shadow, and SOH tile memory plane.
+
+// ── balanced-ternary phase wire values (i8) ─────────────────────────────────
+
+fn PHASE_NEG() i8 { return 0 - 1; }
+fn PHASE_ZERO() i8 { return 0; }
+fn PHASE_POS() i8 { return 1; }
+
+// ── guest register file layout ──────────────────────────────────────────────
+
+fn GUEST_GPR_COUNT() i32 { return 16; }
+fn GUEST_REG_FLAGS() i32 { return 16; }
+fn GUEST_REG_PC() i32 { return 17; }
+fn GUEST_REG_FILE_LEN() i32 { return 18; }
+
+// ── SOH tile memory plane ─────────────────────────────────────────────────────
+
+fn SOH_SLOTS_PER_TILE() i32 { return 64; }
+fn SOH_TRITS_PER_U64() i32 { return 64; }
+fn SOH_DEFAULT_TILES_X() i32 { return 6; }
+fn SOH_DEFAULT_TILES_Y() i32 { return 3; }
+
+// 8-slot SOH matrix tile grid (Megatryte/Gigatryte addressing plane)
+fn RAYOS_SOH_TILE_SLOTS() i32 { return 8; }
+fn RAYOS_MEGATRYTE_TRITS() i64 { return 1000000; }
+fn RAYOS_GIGATRYTE_TRITS() i64 { return 1000000000; }
+
+// ── JIT / instruction decode ──────────────────────────────────────────────────
+
+fn INSN_MAX_BYTES() i32 { return 15; }
+fn JIT_BLOCK_MAX_INSNS() i32 { return 32; }
+fn JIT_PHASE_BUF_LEN() i32 { return 512; }
+
+// ── single wave-channel brute-force emulator ──────────────────────────────────
+
+fn WAVE_CHANNEL_COUNT() i32 { return 1; }
+fn WAVE_BRUTE_LANES() i32 { return 64; }
+
+// ── spatial routing fabric (passive optical switchboard) ──────────────────────
+
+fn RAYOS_CHAMBER_COUNT() i32 { return 64; }
+fn RAYOS_WDM_CHANNELS() i32 { return 32; }
+fn RAYOS_WAVEGUIDE_SLOTS() i32 { return 256; }
+fn RAYOS_WDM_SPACING_GHZ() i32 { return 110; }
+fn RAYOS_BASE_FREQ_GHZ() i32 { return 193100; }   // C-band anchor (~1550 nm)
+
+fn RAYOS_CHAMBER_GRID_W() i32 { return 8; }
+fn RAYOS_CHAMBER_GRID_H() i32 { return 8; }
+fn RAYOS_CHAMBER_GRID_D() i32 { return 1; }
+
+fn RAYOS_MAX_ROUTES() i32 { return (RAYOS_WAVEGUIDE_SLOTS() as i32); }
+fn RAYOS_MAX_BINDINGS() i32 { return (RAYOS_WAVEGUIDE_SLOTS() as i32); }
+fn RAYOS_WAVELENGTH_SLOT_COUNT() i32 {
+    let chambers: i32 = RAYOS_CHAMBER_COUNT() as i32;
+    let wdm: i32 = RAYOS_WDM_CHANNELS() as i32;
+    return chambers * wdm;
+}
+
+// ── Phase-1 MMIO map (host bootstrap via mmap; bare-metal trap on RayOS HW) ───
+
+fn RAYOS_MMIO_BASE() i64 { return 3758096384; }        // 0xE0000000
+fn RAYOS_MMIO_MAP_BYTES() i64 { return 131072; }       // 128 KiB sim / devmem window
+fn RAYOS_CHAMBER_MMIO_STRIDE() i32 { return 64; }      // bytes per chamber register block
+fn RAYOS_SOH_MMIO_BASE() i64 { return 3758108672; }    // 0xE0003000 (base + 12 KiB)
+fn RAYOS_SOH_MMIO_TILES_X() i32 { return SOH_DEFAULT_TILES_X() as i32; }
+fn RAYOS_SOH_MMIO_TILES_Y() i32 { return SOH_DEFAULT_TILES_Y() as i32; }
+
+// ── photonic display chamber scanout + input ring (Phase-1 MMIO window) ─────
+
+fn RAYOS_SCANOUT_MMIO_BASE() i64 { return 3758129152; }   // 0xE0008000 (base + 32 KiB)
+fn RAYOS_INPUT_MMIO_BASE() i64 { return 3758145536; }     // 0xE000C000 (base + 48 KiB)
+
+// ── device enumeration + RTC chambers (same window; native controllers
+//    publish records here, Phase-1 hosts seed them from the host firmware) ──
+fn RAYOS_DEVICE_MMIO_BASE() i64 { return 3758149632; }    // 0xE000D000 (base + 52 KiB)
+fn RAYOS_DEVICE_MMIO_BYTES() i32 { return 10240; }        // 10 KiB record table (52K..62K)
+fn RAYOS_RTC_MMIO_BASE() i64 { return 3758159872; }       // 0xE000F800 (base + 62 KiB)
+
+// ── network chamber: NIC link status + TCP offload control (base + 64 KiB) ──
+// Native RayOS: the NIC controller / TCP offload engine services socket ops
+// and updates these counters. Phase-1 host: the socket driver services ops
+// via host sockets and publishes the same counters here.
+fn RAYOS_NET_MMIO_BASE() i64 { return 3758161920; }       // 0xE0010000 (base + 64 KiB)
+fn RAYOS_NET_MMIO_BYTES() i32 { return 4096; }
+fn SCANOUT_WIDTH() i32 { return 1280; }
+fn SCANOUT_HEIGHT() i32 { return 800; }
+fn SCANOUT_REGS_BYTES() i32 { return 32; }                 // ScanoutRegs i32 block
+
+// ── x86 real-mode guest boot ──────────────────────────────────────────────────
+
+fn GPA_BOOT_SECTOR() i32 { return 31744; }                  // 0x7C00
+
+// ── Linux bzImage boot protocol (Wave 3) ──────────────────────────────────────
+
+fn LINUX_BOOT_FLAG_MAGIC() i32 { return 43605; }            // 0xAA55
+fn LINUX_OFF_SETUP_SECTS() i32 { return 497; }               // 0x1F1
+fn LINUX_OFF_ROOT_FLAGS() i32 { return 498; }               // 0x1F2
+fn LINUX_OFF_SYSSIZE() i32 { return 500; }                  // 0x1F4
+fn LINUX_OFF_RAM_SIZE() i32 { return 502; }                  // 0x1F6
+fn LINUX_OFF_VID_MODE() i32 { return 504; }                 // 0x1F8
+fn LINUX_OFF_ROOT_DEV() i32 { return 506; }                  // 0x1FA
+fn LINUX_OFF_BOOT_FLAG() i32 { return 508; }                 // 0x1FC
+fn LINUX_OFF_HDR_SIG() i32 { return 514; }                  // 0x202 "HdrS"
+fn LINUX_OFF_HDR_VERSION() i32 { return 518; }               // 0x206
+fn LINUX_BOOT_SECTOR_BYTES() i32 { return 512; }
+fn GPA_LINUX_BOOT_PARAMS() i32 { return 589824; }             // 0x90000
+fn GPA_LINUX_SETUP() i32 { return 590336; }                  // 0x90200
+fn GPA_LINUX_KERNEL() i32 { return 1048576; }                // 0x100000
+fn GPA_LINUX_KERNEL_LOAD() i32 { return 1048576; }         // 0x100000 (alias)
+fn LINUX_BOOT_PARAMS_HDR_OFF() i32 { return 480; }           // 0x1E0 within boot_params
+fn RAYOS_VIRTIO_MMIO_GPA() i64 { return 268439552; }       // 0x10001000
+fn GUEST_RAM_DEFAULT_BYTES() i32 { return 16777216; }       // 16 MiB
+fn GPA_VGA_TEXT() i32 { return 753664; }                    // 0xB8000
+fn VGA_TEXT_COLS() i32 { return 80; }
+fn VGA_TEXT_ROWS() i32 { return 25; }
+
+// ── virtio-mmio block device (guest GPA; trapped via guest_ram, not host MMIO) ─
+
+fn GPA_VIRTIO_MMIO_BASE() i32 { return 268439552; }        // 0x10001000
+fn GPA_VIRTIO_MMIO_BYTES() i32 { return 4096; }             // 4 KiB virtio-mmio window
+
+// ── virtio-mmio net + gpu (Wave 4 guest GPA traps) ───────────────────────────
+
+fn GPA_VIRTIO_NET_BASE() i32 { return 268443648; }          // 0x10002000
+fn GPA_VIRTIO_GPU_BASE() i32 { return 268447744; }          // 0x10003000
+fn GPA_VIRTIO_GPU_FB() i32 { return 269484032; }            // 0x10100000 guest linear FB
+fn VIRTIO_GPU_FB_WIDTH() i32 { return 640; }
+fn VIRTIO_GPU_FB_HEIGHT() i32 { return 480; }
+fn VIRTIO_GPU_FB_BYTES() i32 { return 1228800; }              // 640*480*4

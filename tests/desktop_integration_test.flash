@@ -1,0 +1,24 @@
+// desktop_integration_test.flash — compositor + scanout + MMIO input (CI, 1 frame).
+
+@import("../desktop/rayos_desktop.flash")
+
+fn main() i32 {
+    _zag_println("desktop_integration_test: running");
+
+    scanout_clear_present_flag();
+    input_chamber_inject(640, 400, 1);
+
+    let rc: i32 = rayos_desktop_run(1);
+    if (rc != 0) {
+        _zag_print("desktop_integration_test: FAIL desktop rc=");
+        _zag_println(_zag_i64_to_str(rc as i64));
+        return 1;
+    }
+    if (scanout_present_flag() != 1) {
+        _zag_println("desktop_integration_test: FAIL present_flag");
+        return 1;
+    }
+
+    _zag_println("desktop_integration_test: ok");
+    return 0;
+}

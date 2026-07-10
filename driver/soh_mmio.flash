@@ -1,0 +1,99 @@
+// driver/soh_mmio.flash — SOH crystal tile MMIO plane (balanced-ternary slots).
+//
+// Tile trits are mapped at RAYOS_SOH_MMIO_BASE in a 6×3 tile grid with
+// SOH_SLOTS_PER_TILE bytes per tile.  u64 words span 64 consecutive slots.
+//
+//   @import("soh_mmio.flash")
+//   soh_mmio_write_trit(0, 0, 3, (PHASE_POS() as i8));
+//   let t: i8 = soh_mmio_read_trit(0, 0, 3);
+
+@import("hw_rt.flash")
+
+fn soh_mmio_tile_index(tile_x: i32, tile_y: i32) i32 {
+    if (tile_x < 0 || tile_y < 0) { return 0 - 1; }
+    if (tile_x >= (RAYOS_SOH_MMIO_TILES_X() as i32) || tile_y >= (RAYOS_SOH_MMIO_TILES_Y() as i32)) {
+        return 0 - 1;
+    }
+    return tile_y * (RAYOS_SOH_MMIO_TILES_X() as i32) + tile_x;
+}
+
+fn soh_mmio_slot_offset(tile_x: i32, tile_y: i32, slot: i32) i64 {
+    let tile_idx: i32 = soh_mmio_tile_index(tile_x, tile_y);
+    if (tile_idx < 0) { return 0 - 1; }
+    if (slot < 0 || slot >= (SOH_SLOTS_PER_TILE() as i32)) { return 0 - 2; }
+    let base: i64 = (RAYOS_SOH_MMIO_BASE() as i64);
+    let slots: i64 = SOH_SLOTS_PER_TILE() as i64;
+    return base + tile_idx as i64 * slots + slot as i64;
+}
+
+fn soh_mmio_write_trit(tile_x: i32, tile_y: i32, slot: i32, trit: i8) i32 {
+    let off: i64 = soh_mmio_slot_offset(tile_x, tile_y, slot);
+    if (off < 0) { return 1; }
+    if (hw_rt_ensure() != 0) { return 2; }
+    let st: *HwRtState = hw_rt_state_mut();
+    let rel: i64 = off - st.*.virt_base;
+    if (rel < 0 || rel + 1 > st.*.map_size) { return 3; }
+    let byte_ptr: *i8 = (st.*.map_base + rel) as *i8;
+    byte_ptr.* = trit;
+    hw_fence();
+    return 0;
+}
+
+fn soh_mmio_read_trit(tile_x: i32, tile_y: i32, slot: i32) i8 {
+    let off: i64 = soh_mmio_slot_offset(tile_x, tile_y, slot);
+    if (off < 0) { return (PHASE_ZERO() as i8); }
+    if (hw_rt_ensure() != 0) { return (PHASE_ZERO() as i8); }
+    let st: *HwRtState = hw_rt_state_mut();
+    let rel: i64 = off - st.*.virt_base;
+    if (rel < 0 || rel + 1 > st.*.map_size) { return (PHASE_ZERO() as i8); }
+    let byte_ptr: *i8 = (st.*.map_base + rel) as *i8;
+    return byte_ptr.*;
+}
+
+fn soh_mmio_store_u64(tile_x: i32, tile_y: i32, slot: i32, val: u64) i32 {
+    let end_slot: i32 = slot + (SOH_TRITS_PER_U64() as i32) - 1;
+    if (soh_mmio_tile_index(tile_x, tile_y) < 0) { return 1; }
+    if (slot < 0 || end_slot >= (SOH_SLOTS_PER_TILE() as i32)) { return 2; }
+    let bit: i32 = 0;
+    while (bit < (SOH_TRITS_PER_U64() as i32)) {
+        let shift: i32 = 63 - bit;
+        let shifted: u64 = val;
+        let i: i32 = 0;
+        while (i < shift) {
+            shifted = shifted / 2;
+            i = i + 1;
+        }
+        let tr: i8 = (PHASE_NEG() as i8);
+        if ((shifted % 2) != 0) {
+            tr = (PHASE_POS() as i8);
+        }
+        let rc: i32 = soh_mmio_write_trit(tile_x, tile_y, slot + bit, tr);
+        if (rc != 0) { return rc; }
+        bit = bit + 1;
+    }
+    return 0;
+}
+
+fn soh_mmio_load_u64(tile_x: i32, tile_y: i32, slot: i32) u64 {
+    let end_slot: i32 = slot + (SOH_TRITS_PER_U64() as i32) - 1;
+    if (soh_mmio_tile_index(tile_x, tile_y) < 0) { return 0; }
+    if (slot < 0 || end_slot >= (SOH_SLOTS_PER_TILE() as i32)) { return 0; }
+    let out: u64 = 0;
+    let bit: i32 = 0;
+    while (bit < (SOH_TRITS_PER_U64() as i32)) {
+        let tr: i8 = soh_mmio_read_trit(tile_x, tile_y, slot + bit);
+        let one: u64 = 1;
+        let shift: i32 = 63 - bit;
+        if (tr == (PHASE_POS() as i8)) {
+            let i: i32 = 0;
+            let acc: u64 = one;
+            while (i < shift) {
+                acc = acc * 2;
+                i = i + 1;
+            }
+            out = out + acc;
+        }
+        bit = bit + 1;
+    }
+    return out;
+}

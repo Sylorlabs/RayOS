@@ -1,0 +1,6 @@
+// tests/purge_ok.flash — P0 piggyback purge smoke stub
+
+fn main() i32 {
+    _zag_println("p0_purge: ok");
+    return 0;
+}

@@ -1,0 +1,136 @@
+// virtio_net_test.flash — virtio-mmio net RX inject "RAYOS\n" on queue notify.
+
+@import("../core/constants.flash")
+@import("../math/trit_core.flash")
+@import("../math/tekum.flash")
+@import("../math/offset_loop.flash")
+@import("../driver/hw_rt.flash")
+@import("../driver/virtio_block_mmio_nop.flash")
+@import("../driver/virtio_net_guest.flash")
+@import("../driver/virtio_gpu_mmio_nop.flash")
+@import("../hypervisor/guest_ram.flash")
+
+fn VIRTIO_NET_TEST_RAM_BYTES() i32 { return 24576; }        // 0x6000
+
+fn VIRTIO_NET_TEST_DESC_GPA() i32 { return 8192; }           // 0x2000
+fn VIRTIO_NET_TEST_AVAIL_GPA() i32 { return 12288; }         // 0x3000
+fn VIRTIO_NET_TEST_USED_GPA() i32 { return 16384; }          // 0x4000
+fn VIRTIO_NET_TEST_DATA_GPA() i32 { return 20480; }          // 0x5000
+
+fn test_fail(msg: []u8) void {
+    _zag_print("virtio_net_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn virtio_net_test_ram_fit(ram: *ArrayList[u8], end: i32) void {
+    while (len[u8](ram.*) < end) {
+        push[u8](ram, 0);
+    }
+}
+
+fn virtio_net_test_store32(ram: *ArrayList[u8], gpa: i32, val: i32) void {
+    virtio_net_test_ram_fit(ram, gpa + 4);
+    let pack: i64 = val as i64;
+    if (pack < 0) { pack = pack + 4294967296; }
+    let shift: i64 = pack;
+    let i: i32 = 0;
+    while (i < 4) {
+        let limb: i64 = shift - ((shift / 256) * 256);
+        set[u8](ram, gpa + i, limb as u8);
+        shift = shift / 256;
+        i = i + 1;
+    }
+}
+
+fn virtio_net_test_store16(ram: *ArrayList[u8], gpa: i32, val: i32) void {
+    virtio_net_test_ram_fit(ram, gpa + 2);
+    let pack: i32 = val;
+    if (pack < 0) { pack = pack + 65536; }
+    set[u8](ram, gpa, (pack - (pack / 256) * 256) as u8);
+    set[u8](ram, gpa + 1, (pack / 256) as u8);
+}
+
+fn virtio_net_test_store_desc(
+    ram: *ArrayList[u8],
+    idx: i32,
+    addr: i32,
+    dlen: i32,
+    flags: i32,
+    next: i32,
+) void {
+    let base: i32 = (VIRTIO_NET_TEST_DESC_GPA() as i32) + idx * 16;
+    virtio_net_test_store32(ram, base, addr);
+    virtio_net_test_store32(ram, base + 4, 0);
+    virtio_net_test_store32(ram, base + 8, dlen);
+    virtio_net_test_store16(ram, base + 12, flags);
+    virtio_net_test_store16(ram, base + 14, next);
+}
+
+fn virtio_net_test_setup_queue(ram: *ArrayList[u8]) void {
+    virtio_net_test_ram_fit(ram, (VIRTIO_NET_TEST_RAM_BYTES() as i32));
+
+    virtio_net_test_store_desc(ram, 0, (VIRTIO_NET_TEST_DATA_GPA() as i32), 64, 2, 0);
+
+    virtio_net_test_store16(ram, (VIRTIO_NET_TEST_AVAIL_GPA() as i32), 0);
+    virtio_net_test_store16(ram, (VIRTIO_NET_TEST_AVAIL_GPA() as i32) + 2, 1);
+    virtio_net_test_store16(ram, (VIRTIO_NET_TEST_AVAIL_GPA() as i32) + 4, 0);
+
+    virtio_net_test_store16(ram, (VIRTIO_NET_TEST_USED_GPA() as i32), 0);
+    virtio_net_test_store16(ram, (VIRTIO_NET_TEST_USED_GPA() as i32) + 2, 0);
+}
+
+fn virtio_net_test_mmio_write(gpa: i32, val: i32) void {
+    let _sink: i32 = guest_ram_mmio_trap(gpa, 1, val);
+}
+
+fn virtio_net_test_mmio_read(gpa: i32) i32 {
+    return guest_ram_mmio_trap(gpa, 0, 0);
+}
+
+fn virtio_net_test_program_virtio() void {
+    virtio_net_test_mmio_write((GPA_VIRTIO_NET_BASE() as i32) + 48, 8);
+    virtio_net_test_mmio_write((GPA_VIRTIO_NET_BASE() as i32) + 96, (VIRTIO_NET_TEST_DESC_GPA() as i32));
+    virtio_net_test_mmio_write((GPA_VIRTIO_NET_BASE() as i32) + 112, (VIRTIO_NET_TEST_AVAIL_GPA() as i32));
+    virtio_net_test_mmio_write((GPA_VIRTIO_NET_BASE() as i32) + 128, (VIRTIO_NET_TEST_USED_GPA() as i32));
+    virtio_net_test_mmio_write((GPA_VIRTIO_NET_BASE() as i32) + 52, 1);
+}
+
+fn virtio_net_test_expect_byte(ram: *ArrayList[u8], idx: i32, want: u8, msg: []u8) void {
+    if (get[u8](ram, idx) != want) { test_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("virtio_net_test: running");
+
+    if (hw_rt_init() != 0) { test_fail("hw_rt_init"); }
+    if (virtio_net_guest_init() != 0) { test_fail("virtio_net_guest_init"); }
+
+    let guest_ram: ArrayList[u8] = make[u8](0);
+    virtio_net_guest_attach_guest_ram(&guest_ram);
+    virtio_net_test_setup_queue(&guest_ram);
+    virtio_net_test_program_virtio();
+
+    let magic: i32 = virtio_net_test_mmio_read((GPA_VIRTIO_NET_BASE() as i32));
+    if (magic != 1952805748) { test_fail("virtio magic"); }
+
+    let dev_id: i32 = virtio_net_test_mmio_read((GPA_VIRTIO_NET_BASE() as i32) + 8);
+    if (dev_id != 1) { test_fail("device_id net"); }
+
+    virtio_net_test_mmio_write((GPA_VIRTIO_NET_BASE() as i32) + 56, 0);
+
+    virtio_net_test_expect_byte(&guest_ram, (VIRTIO_NET_TEST_DATA_GPA() as i32) + 0, 82, "byte R");
+    virtio_net_test_expect_byte(&guest_ram, (VIRTIO_NET_TEST_DATA_GPA() as i32) + 1, 65, "byte A");
+    virtio_net_test_expect_byte(&guest_ram, (VIRTIO_NET_TEST_DATA_GPA() as i32) + 2, 89, "byte Y");
+    virtio_net_test_expect_byte(&guest_ram, (VIRTIO_NET_TEST_DATA_GPA() as i32) + 3, 79, "byte O");
+    virtio_net_test_expect_byte(&guest_ram, (VIRTIO_NET_TEST_DATA_GPA() as i32) + 4, 83, "byte S");
+    virtio_net_test_expect_byte(&guest_ram, (VIRTIO_NET_TEST_DATA_GPA() as i32) + 5, 10, "byte nl");
+
+    let irq: i32 = virtio_net_test_mmio_read((GPA_VIRTIO_NET_BASE() as i32) + 68);
+    if (irq != 1) { test_fail("interrupt_status"); }
+
+    free[u8](&guest_ram);
+
+    _zag_println("virtio_net_test: ok");
+    return 0;
+}

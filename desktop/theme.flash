@@ -1,0 +1,411 @@
+// desktop/theme.flash — RayOS modern dark theme (glass morphism, purple/cyan accents).
+//
+// UiTheme extension with window chrome colors, multi-layer shadow parameters,
+// and Inter-like sizing for the RayOS desktop compositor.
+//
+//   @import("theme.flash")
+//   let th: RayOsTheme = rayos_theme();
+
+@import("../../flash/flash/ui/ui.flash")
+
+struct RayOsTheme {
+    base: UiTheme,
+
+    // frosted titlebar glass
+    chrome_tb_r: i32,
+    chrome_tb_g: i32,
+    chrome_tb_b: i32,
+    chrome_tb_a: i32,
+    chrome_tb_focus_r: i32,
+    chrome_tb_focus_g: i32,
+    chrome_tb_focus_b: i32,
+
+    // window body (frosted card behind client content)
+    chrome_body_r: i32,
+    chrome_body_g: i32,
+    chrome_body_b: i32,
+    chrome_body_a: i32,
+
+    chrome_border_r: i32,
+    chrome_border_g: i32,
+    chrome_border_b: i32,
+    chrome_border_a: i32,
+
+    // macOS-style traffic lights
+    tl_close_r: i32,
+    tl_close_g: i32,
+    tl_close_b: i32,
+    tl_min_r: i32,
+    tl_min_g: i32,
+    tl_min_b: i32,
+    tl_max_r: i32,
+    tl_max_g: i32,
+    tl_max_b: i32,
+
+    // Inter-like metrics (vg_text_vec at 13px cap height)
+    titlebar_h: i32,
+    title_size: f32,
+    title_weight: f32,
+    chrome_radius: f32,
+    traffic_r: f32,
+
+    // multi-layer drop shadow
+    shadow_layers: i32,
+    shadow_grow: f32,
+    shadow_offset_y: f32,
+    shadow_alpha: i32,
+
+    // bottom taskbar (compositor reserves 48px)
+    taskbar_h: i32,
+    taskbar_r: i32,
+    taskbar_g: i32,
+    taskbar_b: i32,
+    taskbar_a: i32,
+
+    // deep navy-purple wallpaper gradient
+    wall_r0: i32,
+    wall_g0: i32,
+    wall_b0: i32,
+    wall_r1: i32,
+    wall_g1: i32,
+    wall_b1: i32,
+}
+
+fn rayos_titlebar_h() i32 { return 28; }
+fn rayos_taskbar_h() i32 { return 48; }
+fn rayos_chrome_radius() f32 { return 12.0; }
+
+fn rayos_theme() RayOsTheme {
+    let base: UiTheme = UiTheme{
+        .bg_r = 10,
+        .bg_g = 12,
+        .bg_b = 28,
+        .bg2_r = 36,
+        .bg2_g = 22,
+        .bg2_b = 58,
+        .card_r = 32,
+        .card_g = 34,
+        .card_b = 52,
+        .ink_r = 235,
+        .ink_g = 236,
+        .ink_b = 245,
+        .mut_r = 148,
+        .mut_g = 152,
+        .mut_b = 178,
+        .acc_r = 56,
+        .acc_g = 214,
+        .acc_b = 230,
+        .acc2_r = 140,
+        .acc2_g = 92,
+        .acc2_b = 255,
+        .radius = rayos_chrome_radius(),
+    };
+    return RayOsTheme{
+        .base = base,
+
+        .chrome_tb_r = 42,
+        .chrome_tb_g = 44,
+        .chrome_tb_b = 68,
+        .chrome_tb_a = 210,
+        .chrome_tb_focus_r = 52,
+        .chrome_tb_focus_g = 48,
+        .chrome_tb_focus_b = 88,
+
+        .chrome_body_r = 28,
+        .chrome_body_g = 30,
+        .chrome_body_b = 48,
+        .chrome_body_a = 255,
+
+        .chrome_border_r = 88,
+        .chrome_border_g = 72,
+        .chrome_border_b = 140,
+        .chrome_border_a = 90,
+
+        .tl_close_r = 255,
+        .tl_close_g = 95,
+        .tl_close_b = 86,
+        .tl_min_r = 255,
+        .tl_min_g = 189,
+        .tl_min_b = 46,
+        .tl_max_r = 39,
+        .tl_max_g = 201,
+        .tl_max_b = 102,
+
+        .titlebar_h = rayos_titlebar_h(),
+        .title_size = 13.0,
+        .title_weight = 1.6,
+        .chrome_radius = rayos_chrome_radius(),
+        .traffic_r = 5.5,
+
+        .shadow_layers = 2,
+        .shadow_grow = 3.0,
+        .shadow_offset_y = 4.0,
+        .shadow_alpha = 26,
+
+        .taskbar_h = rayos_taskbar_h(),
+        .taskbar_r = 18,
+        .taskbar_g = 20,
+        .taskbar_b = 38,
+        .taskbar_a = 235,
+
+        .wall_r0 = 10,
+        .wall_g0 = 12,
+        .wall_b0 = 28,
+        .wall_r1 = 48,
+        .wall_g1 = 28,
+        .wall_b1 = 72,
+    };
+}
+
+fn rayos_theme_base(t: RayOsTheme) UiTheme {
+    return t.base;
+}
+
+// Multi-layer soft shadow (modern_demo / ui.flash card style).
+fn rayos_paint_shadow(
+    fb: *SoftFb,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    rad: f32,
+    th: RayOsTheme,
+) void {
+    // Only the ring OUTSIDE the body is ever visible — the body paints over
+    // the rest — so blend four strips instead of the whole rect (~14× fewer
+    // pixels per layer).
+    let i: i32 = 0;
+    while (i < th.shadow_layers) {
+        let grow: f32 = (i as f32) * th.shadow_grow;
+        let alpha: i32 = th.shadow_alpha;
+        if (i > 0) { alpha = alpha - (i * 4); }
+        if (alpha < 6) { alpha = 6; }
+        let sx: i32 = (x - grow) as i32;
+        let sy: i32 = (y + th.shadow_offset_y - grow) as i32;
+        let sw: i32 = (w + grow * 2.0) as i32;
+        let sh: i32 = (h + grow * 2.0) as i32;
+        let bx0: i32 = x as i32;
+        let by0: i32 = y as i32;
+        let bx1: i32 = (x + w) as i32;
+        let by1: i32 = (y + h) as i32;
+        // top strip
+        if (sy < by0) {
+            softgpu_blend_rect(fb, sx, sy, sw, by0 - sy, 0, 0, 0, alpha);
+        }
+        // bottom strip
+        if (sy + sh > by1) {
+            softgpu_blend_rect(fb, sx, by1, sw, sy + sh - by1, 0, 0, 0, alpha);
+        }
+        // left / right strips (between body top and bottom)
+        let mid_y: i32 = by0;
+        if (sy > mid_y) { mid_y = sy; }
+        let mid_h: i32 = by1 - mid_y;
+        if (sy + sh < by1) { mid_h = sy + sh - mid_y; }
+        if (mid_h > 0) {
+            if (sx < bx0) {
+                softgpu_blend_rect(fb, sx, mid_y, bx0 - sx, mid_h, 0, 0, 0, alpha);
+            }
+            if (sx + sw > bx1) {
+                softgpu_blend_rect(fb, bx1, mid_y, sx + sw - bx1, mid_h, 0, 0, 0, alpha);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn rayos_digit_ch(d: i32) []u8 {
+    if (d == 0) { return "0"; }
+    if (d == 1) { return "1"; }
+    if (d == 2) { return "2"; }
+    if (d == 3) { return "3"; }
+    if (d == 4) { return "4"; }
+    if (d == 5) { return "5"; }
+    if (d == 6) { return "6"; }
+    if (d == 7) { return "7"; }
+    if (d == 8) { return "8"; }
+    return "9";
+}
+
+fn rayos_glyph_advance(size: f32) f32 { return size * 0.94; }
+
+fn rayos_paint_u32(
+    fb: *SoftFb,
+    x: f32,
+    y: f32,
+    v: i32,
+    size: f32,
+    weight: f32,
+    r: i32,
+    g: i32,
+    b: i32,
+    a: i32,
+) void {
+    if (v < 0) { v = 0; }
+    if (v == 0) {
+        vg_text_vec(fb, x, y, "0", size, weight, r, g, b, a);
+        return;
+    }
+    let div: i32 = 1000000000;
+    let started: i32 = 0;
+    while (div > 0) {
+        let d: i32 = (v / div) % 10;
+        if (d != 0 || started == 1) {
+            started = 1;
+            vg_text_vec(fb, x, y, rayos_digit_ch(d), size, weight, r, g, b, a);
+            x = x + rayos_glyph_advance(size);
+        }
+        div = div / 10;
+    }
+}
+
+fn rayos_paint_clock(
+    fb: *SoftFb,
+    x: f32,
+    y: f32,
+    secs: i64,
+    size: f32,
+    weight: f32,
+    r: i32,
+    g: i32,
+    b: i32,
+    a: i32,
+) void {
+    let h: i32 = ((secs / 3600) % 24) as i32;
+    let m: i32 = ((secs / 60) % 60) as i32;
+    let hh: i32 = h / 10;
+    let hl: i32 = h % 10;
+    let mh: i32 = m / 10;
+    let ml: i32 = m % 10;
+    vg_text_vec(fb, x, y, rayos_digit_ch(hh), size, weight, r, g, b, a);
+    vg_text_vec(fb, x + size * 0.94, y, rayos_digit_ch(hl), size, weight, r, g, b, a);
+    vg_text_vec(fb, x + size * 1.88, y, ":", size, weight, r, g, b, a);
+    vg_text_vec(fb, x + size * 2.82, y, rayos_digit_ch(mh), size, weight, r, g, b, a);
+    vg_text_vec(fb, x + size * 3.76, y, rayos_digit_ch(ml), size, weight, r, g, b, a);
+}
+
+fn rayos_clock_width(size: f32) f32 {
+    return size * 4.8;
+}
+
+fn rayos_paint_vm_count(
+    fb: *SoftFb,
+    x: f32,
+    y: f32,
+    count: i32,
+    size: f32,
+    weight: f32,
+    r: i32,
+    g: i32,
+    b: i32,
+    a: i32,
+) void {
+    vg_text_vec(fb, x, y, "VM:", size, weight, r, g, b, a);
+    rayos_paint_u32(fb, x + size * 2.9, y, count, size, weight, r, g, b, a);
+}
+
+fn rayos_vm_width(count: i32, size: f32) i32 {
+    let digits: i32 = 1;
+    let v: i32 = count;
+    if (v < 0) { v = 0; }
+    if (v == 0) { return ((4.0 * size * 0.94) as i32) + 12; }
+    while (v >= 10) {
+        digits = digits + 1;
+        v = v / 10;
+    }
+    return ((((3 + digits) as f32) * size * 0.94) as i32) + 12;
+}
+
+fn rayos_paint_orb(fb: *SoftFb, cx: f32, cy: f32, rad: f32, th: RayOsTheme) void {
+    rayos_paint_shadow(fb, cx - rad, cy - rad, rad * 2.0, rad * 2.0, rad, th);
+    let orb: VPath = vg_path_new();
+    vg_circle(&orb, cx, cy, rad);
+    vg_fill_linear(
+        fb,
+        &orb,
+        cx - rad,
+        cy - rad,
+        cx + rad,
+        cy + rad,
+        th.base.acc_r,
+        th.base.acc_g,
+        th.base.acc_b,
+        255,
+        th.base.acc2_r,
+        th.base.acc2_g,
+        th.base.acc2_b,
+        255,
+    );
+    let core: VPath = vg_path_new();
+    vg_circle(&core, cx - rad * 0.15, cy - rad * 0.15, rad * 0.35);
+    vg_fill(fb, &core, 255, 255, 255, 90);
+}
+
+fn rayos_paint_status_dot(fb: *SoftFb, cx: f32, cy: f32, rad: f32, on: i32, th: RayOsTheme) void {
+    let rr: i32 = th.base.mut_r;
+    let rg: i32 = th.base.mut_g;
+    let rb: i32 = th.base.mut_b;
+    if (on == 1) {
+        rr = 64;
+        rg = 210;
+        rb = 120;
+    }
+    let glow: VPath = vg_path_new();
+    vg_circle(&glow, cx, cy, rad + 2.0);
+    vg_fill(fb, &glow, rr, rg, rb, 60);
+    let dot: VPath = vg_path_new();
+    vg_circle(&dot, cx, cy, rad);
+    vg_fill(fb, &dot, rr, rg, rb, 255);
+}
+
+fn rayos_paint_text_trunc(
+    fb: *SoftFb,
+    x: f32,
+    y: f32,
+    s: []u8,
+    max_px: i32,
+    size: f32,
+    weight: f32,
+    r: i32,
+    g: i32,
+    b: i32,
+    a: i32,
+) void {
+    let char_w: i32 = rayos_glyph_advance(size) as i32;
+    if (char_w < 1) { char_w = 1; }
+    let max_chars: i32 = max_px / char_w;
+    if (max_chars < 1) { return; }
+    let draw_n: i32 = s.len;
+    if (s.len > max_chars) {
+        draw_n = max_chars - 3;
+        if (draw_n < 0) { draw_n = 0; }
+    }
+    let i: i32 = 0;
+    while (i < draw_n) {
+        let ch: []u8 = s[i..i + 1];
+        vg_text_vec(fb, x + (i as f32) * rayos_glyph_advance(size), y, ch, size, weight, r, g, b, a);
+        i = i + 1;
+    }
+    if (s.len > max_chars) {
+        let ex: f32 = x + (draw_n as f32) * rayos_glyph_advance(size);
+        vg_text_vec(fb, ex, y, "...", size, weight, r, g, b, a);
+    }
+}
+
+fn rayos_paint_frosted_panel(
+    fb: *SoftFb,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    rad: f32,
+    th: RayOsTheme,
+) void {
+    rayos_paint_shadow(fb, x, y, w, h, rad, th);
+    softgpu_blend_round_rect(
+        fb, x as i32, y as i32, w as i32, h as i32, rad as i32,
+        th.chrome_body_r + 200, th.chrome_body_g + 200, th.chrome_body_b + 200, 236,
+    );
+    let rim: VPath = vg_path_new();
+    vg_rounded_rect(&rim, x + 0.5, y + 0.5, w - 1.0, h - 1.0, rad);
+    vg_stroke(fb, &rim, 1.0, 255, 255, 255, 48);
+}

@@ -1,0 +1,242 @@
+// hypervisor/guest_ram.flash — guest physical RAM (ArrayList[u8]) + GPA helpers
+//
+// Virtio-mmio traps at block/net/gpu GPA windows dispatch via guest_ram_mmio_trap.
+// Splice virtio_guest + virtio_net_guest + virtio_gpu_guest (or virtio_mmio_nop for
+// init-only builds).  Imported via core/init.flash (no @import here).
+
+fn GUEST_RAM_FAULT_MMIO() i32 { return 0 - 1; }
+fn GUEST_RAM_FAULT_OOB() i32 { return 0 - 2; }
+
+fn guest_ram_new(size: i32) ArrayList[u8] {
+    let ram: ArrayList[u8] = make[u8](0);
+    let i: i32 = 0;
+    while (i < size) {
+        push[u8](&ram, 0);
+        i = i + 1;
+    }
+    return ram;
+}
+
+fn guest_ram_new_default() ArrayList[u8] {
+    return guest_ram_new(GUEST_RAM_DEFAULT_BYTES() as i32);
+}
+
+fn guest_ram_ensure(guest_ram: *ArrayList[u8], end: i32) i32 {
+    if (end < 0) { return 0; }
+    while (len[u8](guest_ram.*) < end) {
+        push[u8](guest_ram, 0);
+    }
+    return 1;
+}
+
+fn guest_ram_ensure_span(guest_ram: *ArrayList[u8], gpa: i32, nbytes: i32) i32 {
+    if (gpa < 0) { return 0 - 1; }
+    let end: i32 = gpa + nbytes;
+    if (guest_ram_ensure(guest_ram, end) == 0) { return 0 - 1; }
+    return 0;
+}
+
+fn guest_ram_gpa_in_virtio_block(gpa: i32) i32 {
+    let base: i32 = GPA_VIRTIO_MMIO_BASE();
+    let end: i32 = base + GPA_VIRTIO_MMIO_BYTES();
+    if (gpa >= base) {
+        if (gpa < end) { return 1; }
+    }
+    return 0;
+}
+
+fn guest_ram_gpa_in_virtio_net(gpa: i32) i32 {
+    let base: i32 = GPA_VIRTIO_NET_BASE();
+    let end: i32 = base + GPA_VIRTIO_MMIO_BYTES();
+    if (gpa >= base) {
+        if (gpa < end) { return 1; }
+    }
+    return 0;
+}
+
+fn guest_ram_gpa_in_virtio_gpu(gpa: i32) i32 {
+    let base: i32 = GPA_VIRTIO_GPU_BASE();
+    let end: i32 = base + GPA_VIRTIO_MMIO_BYTES();
+    if (gpa >= base) {
+        if (gpa < end) { return 1; }
+    }
+    return 0;
+}
+
+fn guest_ram_is_virtio_mmio(gpa: i32) i32 {
+    if (guest_ram_gpa_in_virtio_block(gpa) == 1) { return 1; }
+    if (guest_ram_gpa_in_virtio_net(gpa) == 1) { return 1; }
+    if (guest_ram_gpa_in_virtio_gpu(gpa) == 1) { return 1; }
+    return 0;
+}
+
+fn guest_ram_mmio_trap(gpa: i32, is_write: i32, val: i32) i32 {
+    if (guest_ram_gpa_in_virtio_block(gpa) == 1) {
+        let off: i32 = gpa - GPA_VIRTIO_MMIO_BASE();
+        if (is_write == 1) {
+            virtio_guest_mmio_write32(off, val);
+            return 0;
+        }
+        return virtio_guest_mmio_read32(off);
+    }
+    if (guest_ram_gpa_in_virtio_net(gpa) == 1) {
+        let off: i32 = gpa - GPA_VIRTIO_NET_BASE();
+        if (is_write == 1) {
+            virtio_net_guest_mmio_write32(off, val);
+            return 0;
+        }
+        return virtio_net_guest_mmio_read32(off);
+    }
+    if (guest_ram_gpa_in_virtio_gpu(gpa) == 1) {
+        let off: i32 = gpa - GPA_VIRTIO_GPU_BASE();
+        if (is_write == 1) {
+            virtio_gpu_guest_mmio_write32(off, val);
+            return 0;
+        }
+        return virtio_gpu_guest_mmio_read32(off);
+    }
+    return 0;
+}
+
+fn guest_ram_read8(ram: ArrayList[u8], gpa: i32) u8 {
+    if (guest_ram_is_virtio_mmio(gpa) == 1) { return 0; }
+    if (gpa < 0 || gpa >= len[u8](ram)) { return 0; }
+    return get[u8](&ram, gpa);
+}
+
+fn guest_ram_read32(ram: *ArrayList[u8], gpa: i32) i64 {
+    if (virtio_gpu_guest_fb_gpa_in_range(gpa) == 1) {
+        return virtio_gpu_guest_fb_read32(gpa);
+    }
+    if (guest_ram_is_virtio_mmio(gpa) == 1) {
+        return (GUEST_RAM_FAULT_MMIO() as i64);
+    }
+    if (guest_ram_ensure_span(ram, gpa, 4) != 0) { return (GUEST_RAM_FAULT_OOB() as i64); }
+    let b0: u8 = get[u8](ram, gpa);
+    let b1: u8 = get[u8](ram, gpa + 1);
+    let b2: u8 = get[u8](ram, gpa + 2);
+    let b3: u8 = get[u8](ram, gpa + 3);
+    let v: u32 = (b0 as u32)
+        + ((b1 as u32) * 256)
+        + ((b2 as u32) * 65536)
+        + ((b3 as u32) * 16777216);
+    return v as i64;
+}
+
+fn guest_ram_write8(ram: *ArrayList[u8], gpa: i32, v: u8) void {
+    if (guest_ram_is_virtio_mmio(gpa) == 1) { return; }
+    if (guest_ram_ensure_span(ram, gpa, 1) != 0) { return; }
+    set[u8](ram, gpa, v);
+}
+
+fn guest_ram_write32(ram: *ArrayList[u8], gpa: i32, val: u32) i32 {
+    if (virtio_gpu_guest_fb_gpa_in_range(gpa) == 1) {
+        return virtio_gpu_guest_fb_write32(gpa, val);
+    }
+    if (guest_ram_is_virtio_mmio(gpa) == 1) { return GUEST_RAM_FAULT_MMIO(); }
+    if (guest_ram_ensure_span(ram, gpa, 4) != 0) { return GUEST_RAM_FAULT_OOB(); }
+    set[u8](ram, gpa, (val % 256) as u8);
+    set[u8](ram, gpa + 1, ((val / 256) % 256) as u8);
+    set[u8](ram, gpa + 2, ((val / 65536) % 256) as u8);
+    set[u8](ram, gpa + 3, ((val / 16777216) % 256) as u8);
+    return 0;
+}
+
+fn guest_ram_write_u32_le(guest_ram: *ArrayList[u8], gpa: i32, val: i32) i32 {
+    let pack: u32 = val as u32;
+    if (val < 0) { pack = (val as i64 + 4294967296) as u32; }
+    return guest_ram_write32(guest_ram, gpa, pack);
+}
+
+fn guest_ram_write_u8(guest_ram: *ArrayList[u8], gpa: i32, val: u8) i32 {
+    guest_ram_write8(guest_ram, gpa, val);
+    return 0;
+}
+
+fn guest_ram_read_u8(guest_ram: ArrayList[u8], gpa: i32) u8 {
+    return guest_ram_read8(guest_ram, gpa);
+}
+
+fn guest_ram_read_u16_le(guest_ram: ArrayList[u8], gpa: i32) i32 {
+    let lo: u8 = guest_ram_read_u8(guest_ram, gpa);
+    let hi: u8 = guest_ram_read_u8(guest_ram, gpa + 1);
+    return (hi as i32) * 256 + (lo as i32);
+}
+
+fn guest_ram_write_u16_le(guest_ram: *ArrayList[u8], gpa: i32, val: i32) i32 {
+    let lo: u8 = (val - (val / 256) * 256) as u8;
+    let hi: u8 = (val / 256) as u8;
+    if (guest_ram_write_u8(guest_ram, gpa, lo) != 0) { return 0 - 1; }
+    if (guest_ram_write_u8(guest_ram, gpa + 1, hi) != 0) { return 0 - 1; }
+    return 0;
+}
+
+fn guest_ram_copy(guest_ram: *ArrayList[u8], gpa: i32, src: []u8, nbytes: i32) i32 {
+    let end: i32 = gpa + nbytes;
+    if (guest_ram_ensure(guest_ram, end) == 0) { return 0 - 1; }
+    let i: i32 = 0;
+    while (i < nbytes) {
+        set[u8](guest_ram, gpa + i, src[i]);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn guest_ram_slice(ram: ArrayList[u8], gpa: i32, nbytes: i32) []u8 {
+    let end: i32 = gpa + nbytes;
+    let tmp: ArrayList[u8] = ram;
+    guest_ram_ensure(&tmp, end);
+    if (gpa < 0) { return ram.data[0..0]; }
+    if (end > len[u8](ram)) { return ram.data[0..0]; }
+    return ram.data[gpa..end];
+}
+
+fn guest_ram_vga_attr_rgb(attr: u8, ch: u8, pc_mix: i32, r: *i32, g: *i32, b: *i32) void {
+    let fg: i32 = (attr % 16) as i32;
+    let pal_r: i32 = 0;
+    let pal_g: i32 = 0;
+    let pal_b: i32 = 0;
+    if (fg == 0) { pal_r = 0; pal_g = 0; pal_b = 0; }
+    if (fg == 1) { pal_r = 0; pal_g = 0; pal_b = 170; }
+    if (fg == 2) { pal_r = 0; pal_g = 170; pal_b = 0; }
+    if (fg == 3) { pal_r = 0; pal_g = 170; pal_b = 170; }
+    if (fg == 4) { pal_r = 170; pal_g = 0; pal_b = 0; }
+    if (fg == 5) { pal_r = 170; pal_g = 0; pal_b = 170; }
+    if (fg == 6) { pal_r = 170; pal_g = 85; pal_b = 0; }
+    if (fg == 7) { pal_r = 170; pal_g = 170; pal_b = 170; }
+    if (fg == 8) { pal_r = 85; pal_g = 85; pal_b = 85; }
+    if (fg == 9) { pal_r = 85; pal_g = 85; pal_b = 255; }
+    if (fg == 10) { pal_r = 85; pal_g = 255; pal_b = 85; }
+    if (fg == 11) { pal_r = 85; pal_g = 255; pal_b = 255; }
+    if (fg == 12) { pal_r = 255; pal_g = 85; pal_b = 85; }
+    if (fg == 13) { pal_r = 255; pal_g = 85; pal_b = 255; }
+    if (fg == 14) { pal_r = 255; pal_g = 255; pal_b = 85; }
+    if (fg == 15) { pal_r = 255; pal_g = 255; pal_b = 255; }
+    let ch_boost: i32 = (ch as i32) % 64;
+    r.* = pal_r + ch_boost + (pc_mix % 48);
+    g.* = pal_g + ((pc_mix / 3) % 48);
+    b.* = pal_b + ((pc_mix / 7) % 48);
+    if (r.* > 255) { r.* = 255; }
+    if (g.* > 255) { g.* = 255; }
+    if (b.* > 255) { b.* = 255; }
+}
+
+fn guest_ram_seed_vga_line(guest_ram: *ArrayList[u8], row: i32, text: []u8, attr: u8) void {
+    if (row < 0 || row >= VGA_TEXT_ROWS()) { return; }
+    let base: i32 = GPA_VGA_TEXT() + row * VGA_TEXT_COLS() * 2;
+    guest_ram_ensure_span(guest_ram, base, VGA_TEXT_COLS() * 2);
+    let col: i32 = 0;
+    while (col < VGA_TEXT_COLS()) {
+        let ch: u8 = 32;
+        if (col < text.len) { ch = text[col]; }
+        set[u8](guest_ram, base + col * 2, ch);
+        set[u8](guest_ram, base + col * 2 + 1, attr);
+        col = col + 1;
+    }
+}
+
+fn guest_ram_seed_vga_demo(guest_ram: *ArrayList[u8]) void {
+    guest_ram_seed_vga_line(guest_ram, 0, "RayOS Linux Guest", 15);
+    guest_ram_seed_vga_line(guest_ram, 2, "BTM stepping via SOH matrix", 11);
+    guest_ram_seed_vga_line(guest_ram, 4, "VGA 0xB8000 text mode", 10);
+}

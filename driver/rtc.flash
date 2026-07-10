@@ -1,0 +1,215 @@
+// driver/rtc.flash — wall-clock time via the RTC chamber.
+//
+// The chamber registers are the driver ABI on both targets: native RayOS
+// hardware ticks EPOCH and publishes UTC_OFFSET itself; Phase-1 hosts seed
+// the same registers from the kernel clock and IANA tzdata (TZif v1/v2+,
+// DST-correct), then read them back through the identical MMIO path.
+//
+//   let off: i64 = rtc_utc_offset_secs(rtc_now_epoch());
+//   let clock: i64 = rtc_secs_of_day(rtc_now_epoch() + off);
+
+@import("../core/constants.flash")
+@import("hw_rt.flash")
+
+// ── RTC chamber (MMIO) ───────────────────────────────────────────────────────
+//
+// Native RayOS hardware ticks EPOCH and publishes UTC_OFFSET in this register
+// block; the functions below only read it. Phase-1 hosts seed the block from
+// the host clock/tzdata, then read it back through the same registers.
+//
+//   +0  MAGIC "RTCC"   +4 UTC_OFFSET (s)   +8 OFFSET_VALID   +16 EPOCH (i64)
+
+fn RTC_CHAMBER_MAGIC() i32 { return 1381323587; }   // "RTCC"
+
+fn rtc_chamber_init() i32 {
+    if (hw_rt_init() != 0) { return 0 - 1; }
+    let base: i64 = RAYOS_RTC_MMIO_BASE();
+    if (mmio_read32(base) != RTC_CHAMBER_MAGIC()) {
+        mmio_write32(base, RTC_CHAMBER_MAGIC());
+        mmio_write32(base + 4, 0);
+        mmio_write32(base + 8, 0);
+    }
+    return 0;
+}
+
+fn rtc_chamber_epoch_ptr() *i64 {
+    let p: *i8 = hw_mmio_ptr(RAYOS_RTC_MMIO_BASE() + 16, 8);
+    if (p == null) { return null; }
+    return p as *i64;
+}
+
+fn RTC_SYS_READ() i64 { return 0; }
+fn RTC_SYS_OPEN() i64 { return 2; }
+fn RTC_SYS_CLOSE() i64 { return 3; }
+fn RTC_SYS_TIME() i64 { return 201; }
+fn RTC_TZFILE_MAX() i32 { return 65536; }
+fn RTC_TZIF_HEADER() i32 { return 44; }
+
+// Epoch seconds from the RTC chamber. Hosts seed the register from the
+// kernel clock each read; native hardware ticks it autonomously.
+fn rtc_now_epoch() i64 {
+    if (rtc_chamber_init() != 0) { return 0; }
+    if (rtc_chamber_epoch_ptr()) |ep| {
+        if (hw_rt_backend_host() == 1) {
+            ep.* = _zag_raw_syscall(RTC_SYS_TIME(), 0, 0, 0, 0, 0, 0);
+        }
+        return ep.*;
+    }
+    return 0;
+}
+
+fn rtc_secs_of_day(local: i64) i64 {
+    let s: i64 = local % 86400;
+    if (s < 0) { s = s + 86400; }
+    return s;
+}
+
+fn rtc_byte(buf: *i8, off: i32) i64 {
+    return ((buf[off] as u8) as i64);
+}
+
+// big-endian u32 (TZif header counts)
+fn rtc_be32u(buf: *i8, off: i32) i64 {
+    let v: i64 = rtc_byte(buf, off);
+    v = v * 256 + rtc_byte(buf, off + 1);
+    v = v * 256 + rtc_byte(buf, off + 2);
+    v = v * 256 + rtc_byte(buf, off + 3);
+    return v;
+}
+
+// big-endian i32 (utoff, v1 transition times)
+fn rtc_be32(buf: *i8, off: i32) i64 {
+    let v: i64 = rtc_be32u(buf, off);
+    if (v >= 2147483648) { v = v - 4294967296; }
+    return v;
+}
+
+// big-endian i64 (v2+ transition times); wraps into the sign bit naturally
+fn rtc_be64(buf: *i8, off: i32) i64 {
+    let v: i64 = 0;
+    let i: i32 = 0;
+    while (i < 8) {
+        v = v * 256 + rtc_byte(buf, off + i);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn rtc_tzif_magic_at(buf: *i8, n: i32, off: i32) i32 {
+    if (off + RTC_TZIF_HEADER() > n) { return 0; }
+    if (rtc_byte(buf, off + 0) != 84) { return 0; }   // 'T'
+    if (rtc_byte(buf, off + 1) != 90) { return 0; }   // 'Z'
+    if (rtc_byte(buf, off + 2) != 105) { return 0; }  // 'i'
+    if (rtc_byte(buf, off + 3) != 102) { return 0; }  // 'f'
+    return 1;
+}
+
+// UTC offset in seconds for `now`, from one TZif data block at `off`.
+fn rtc_tzif_block_offset(buf: *i8, n: i32, off: i32, tsize: i32, now: i64) i64 {
+    let isutcnt: i64 = rtc_be32u(buf, off + 20);
+    let isstdcnt: i64 = rtc_be32u(buf, off + 24);
+    let leapcnt: i64 = rtc_be32u(buf, off + 28);
+    let timecnt: i64 = rtc_be32u(buf, off + 32);
+    let typecnt: i64 = rtc_be32u(buf, off + 36);
+    if (typecnt < 1) { return 0; }
+
+    let data: i32 = off + RTC_TZIF_HEADER();
+    let types_off: i32 = data + (timecnt as i32) * tsize;
+    let ttinfo_off: i32 = types_off + (timecnt as i32);
+    if (ttinfo_off + (typecnt as i32) * 6 > n) { return 0; }
+    let _lc: i64 = leapcnt;
+    let _sc: i64 = isstdcnt;
+    let _uc: i64 = isutcnt;
+
+    // transitions are sorted ascending: remember the last one <= now
+    let idx: i32 = 0 - 1;
+    let i: i32 = 0;
+    while (i < (timecnt as i32)) {
+        let t: i64 = 0;
+        if (tsize == 8) {
+            t = rtc_be64(buf, data + i * tsize);
+        } else {
+            t = rtc_be32(buf, data + i * tsize);
+        }
+        if (t <= now) { idx = i; }
+        i = i + 1;
+    }
+
+    let type_i: i32 = 0;
+    if (idx >= 0) {
+        type_i = rtc_byte(buf, types_off + idx) as i32;
+    }
+    if (type_i >= (typecnt as i32)) { type_i = 0; }
+    return rtc_be32(buf, ttinfo_off + type_i * 6);
+}
+
+// Total byte size of a TZif data block (header + payload) at `off`.
+fn rtc_tzif_block_size(buf: *i8, off: i32, tsize: i32) i32 {
+    let isutcnt: i32 = rtc_be32u(buf, off + 20) as i32;
+    let isstdcnt: i32 = rtc_be32u(buf, off + 24) as i32;
+    let leapcnt: i32 = rtc_be32u(buf, off + 28) as i32;
+    let timecnt: i32 = rtc_be32u(buf, off + 32) as i32;
+    let typecnt: i32 = rtc_be32u(buf, off + 36) as i32;
+    let charcnt: i32 = rtc_be32u(buf, off + 40) as i32;
+    return RTC_TZIF_HEADER()
+        + timecnt * (tsize + 1)
+        + typecnt * 6
+        + charcnt
+        + leapcnt * (tsize + 4)
+        + isstdcnt
+        + isutcnt;
+}
+
+fn rtc_tzif_offset(buf: *i8, n: i32, now: i64) i64 {
+    if (rtc_tzif_magic_at(buf, n, 0) == 0) { return 0; }
+    let ver: i64 = rtc_byte(buf, 4);
+    if (ver >= 50) {
+        // version '2'+: authoritative 64-bit block follows the legacy one
+        let off2: i32 = rtc_tzif_block_size(buf, 0, 4);
+        if (rtc_tzif_magic_at(buf, n, off2) == 1) {
+            return rtc_tzif_block_offset(buf, n, off2, 8, now);
+        }
+    }
+    return rtc_tzif_block_offset(buf, n, 0, 4, now);
+}
+
+fn rtc_read_tzfile(buf: *i8, cap: i32) i32 {
+    let path: []u8 = "/etc/localtime";
+    let fd: i64 = _zag_raw_syscall(RTC_SYS_OPEN(), hw_rt_path_cstr(path), 0, 0, 0, 0, 0);
+    if (fd < 0) { return 0; }
+    let total: i32 = 0;
+    let done: i32 = 0;
+    while (total < cap && done == 0) {
+        let n: i64 = _zag_raw_syscall(
+            RTC_SYS_READ(), fd, (buf as i64) + (total as i64), (cap - total) as i64, 0, 0, 0,
+        );
+        if (n <= 0) {
+            done = 1;
+        } else {
+            total = total + (n as i32);
+        }
+    }
+    let _rc: i64 = _zag_raw_syscall(RTC_SYS_CLOSE(), fd, 0, 0, 0, 0, 0);
+    return total;
+}
+
+// Phase-1 seeder: parse host tzdata for the local offset.
+fn rtc_host_utc_offset(now: i64) i64 {
+    let buf: *i8 = _zag_malloc(RTC_TZFILE_MAX());
+    let n: i32 = rtc_read_tzfile(buf, RTC_TZFILE_MAX());
+    if (n < RTC_TZIF_HEADER()) { return 0; }
+    return rtc_tzif_offset(buf, n, now);
+}
+
+// Local-time UTC offset from the RTC chamber; hosts publish it from tzdata
+// on first use, native firmware sets the register at boot.
+fn rtc_utc_offset_secs(now: i64) i64 {
+    if (rtc_chamber_init() != 0) { return 0; }
+    let base: i64 = RAYOS_RTC_MMIO_BASE();
+    if (mmio_read32(base + 8) == 0 && hw_rt_backend_host() == 1) {
+        mmio_write32(base + 4, rtc_host_utc_offset(now) as i32);
+        mmio_write32(base + 8, 1);
+        hw_fence();
+    }
+    return mmio_read32(base + 4) as i64;
+}

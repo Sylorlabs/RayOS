@@ -1,0 +1,164 @@
+// desktop/desktop.flash — RayOS desktop wallpaper and icon grid layer.
+//
+// Paints beneath wm windows; shell taskbar and launcher composite on top.
+//
+//   let desk: DesktopState = desktop_new(1280, 720);
+//   desktop_paint(&desk, &fb, &wm);
+
+@import("theme.flash")
+@import("wm.flash")
+
+fn desktop_icon_none() i32  { return -1; }
+fn desktop_icon_home() i32  { return 0; }
+fn desktop_icon_files() i32 { return 1; }
+fn desktop_icon_trash() i32 { return 2; }
+
+fn desktop_icon_tile() i32 { return 64; }
+
+struct DesktopIcon {
+    id: i32,
+    label: []u8,
+    icon: i32,
+    x: i32,
+    y: i32,
+}
+
+struct DesktopState {
+    screen_w: i32,
+    screen_h: i32,
+    icons: ArrayList[DesktopIcon],
+}
+
+fn desktop_new(w: i32, h: i32) DesktopState {
+    let st: DesktopState = DesktopState{
+        .screen_w = w,
+        .screen_h = h,
+        .icons = make[DesktopIcon](4),
+    };
+    push[DesktopIcon](&st.icons, DesktopIcon{
+        .id = desktop_icon_home(),
+        .label = "Home",
+        .icon = wm_icon_home(),
+        .x = 24,
+        .y = 24,
+    });
+    push[DesktopIcon](&st.icons, DesktopIcon{
+        .id = desktop_icon_files(),
+        .label = "Files",
+        .icon = wm_icon_files(),
+        .x = 24,
+        .y = 104,
+    });
+    push[DesktopIcon](&st.icons, DesktopIcon{
+        .id = desktop_icon_trash(),
+        .label = "Trash",
+        .icon = wm_icon_trash(),
+        .x = 24,
+        .y = 184,
+    });
+    return st;
+}
+
+fn desktop_work_h(st: DesktopState, th: RayOsTheme) i32 {
+    let wh: i32 = st.screen_h - th.taskbar_h;
+    if (wh < 1) { wh = 1; }
+    return wh;
+}
+
+fn desktop_paint_wallpaper(st: DesktopState, fb: *SoftFb, th: RayOsTheme) void {
+    let work_h: i32 = desktop_work_h(st, th);
+    let bg: VPath = vg_path_new();
+    vg_move_to(&bg, 0.0, 0.0);
+    vg_line_to(&bg, st.screen_w as f32, 0.0);
+    vg_line_to(&bg, st.screen_w as f32, work_h as f32);
+    vg_line_to(&bg, 0.0, work_h as f32);
+    vg_close(&bg);
+    vg_fill_linear(
+        fb,
+        &bg,
+        0.0,
+        0.0,
+        0.0,
+        work_h as f32,
+        th.wall_r0,
+        th.wall_g0,
+        th.wall_b0,
+        255,
+        th.wall_r1,
+        th.wall_g1,
+        th.wall_b1,
+        255,
+    );
+    let i: i32 = 0;
+    while (i < 6) {
+        let cx: f32 = (80 + i * 140) as f32;
+        let cy: f32 = (work_h - 60 - (i % 3) * 40) as f32;
+        let orb: VPath = vg_path_new();
+        vg_circle(&orb, cx, cy, 28.0 + (i as f32) * 4.0);
+        vg_fill(fb, &orb, th.base.acc2_r, th.base.acc2_g, th.base.acc2_b, 18 + i * 4);
+        i = i + 1;
+    }
+}
+
+fn desktop_paint_icon_tile(st: DesktopState, fb: *SoftFb, ic: DesktopIcon, th: RayOsTheme) void {
+    let x: f32 = ic.x as f32;
+    let y: f32 = ic.y as f32;
+    let tile: f32 = desktop_icon_tile() as f32;
+    let sel: VPath = vg_path_new();
+    vg_rounded_rect(&sel, x - 4.0, y - 4.0, tile + 8.0, tile + 22.0, 10.0);
+    vg_fill(fb, &sel, 255, 255, 255, 24);
+    wm_paint_taskbar_icon(fb, ic.icon, x + 8.0, y + 4.0, 48.0, th);
+    let tw: f32 = vg_text_width(ic.label, 10.0);
+    vg_text_vec(
+        fb,
+        x + (tile - tw) * 0.5,
+        y + tile - 8.0,
+        ic.label,
+        10.0,
+        0.55,
+        th.base.ink_r,
+        th.base.ink_g,
+        th.base.ink_b,
+        255,
+    );
+}
+
+fn desktop_paint(st: *DesktopState, fb: *SoftFb, wm: *WmState) void {
+    let th: RayOsTheme = wm.*.theme;
+    desktop_paint_wallpaper(st.*, fb, th);
+    let i: i32 = 0;
+    while (i < len[DesktopIcon](st.*.icons)) {
+        let ic: DesktopIcon = get[DesktopIcon](st.*.icons, i);
+        desktop_paint_icon_tile(st.*, fb, ic, th);
+        i = i + 1;
+    }
+}
+
+fn desktop_hit_test(st: DesktopState, wm: *WmState, x: i32, y: i32) i32 {
+    let th: RayOsTheme = wm.*.theme;
+    if (y >= desktop_work_h(st, th)) { return desktop_icon_none(); }
+    let i: i32 = 0;
+    while (i < len[DesktopIcon](st.icons)) {
+        let ic: DesktopIcon = get[DesktopIcon](st.icons, i);
+        let tile: i32 = desktop_icon_tile();
+        if (x >= ic.x && x < ic.x + tile && y >= ic.y && y < ic.y + tile + 16) {
+            return ic.id;
+        }
+        i = i + 1;
+    }
+    return desktop_icon_none();
+}
+
+fn desktop_icon_label(icon_id: i32) []u8 {
+    if (icon_id == desktop_icon_home()) { return "Home"; }
+    if (icon_id == desktop_icon_files()) { return "Files"; }
+    if (icon_id == desktop_icon_trash()) { return "Trash"; }
+    return "";
+}
+
+fn desktop_icon_kind(icon_id: i32) i32 {
+    if (icon_id == desktop_icon_home()) { return wm_icon_home(); }
+    if (icon_id == desktop_icon_files()) { return wm_icon_files(); }
+    if (icon_id == desktop_icon_trash()) { return wm_icon_trash(); }
+    return wm_icon_generic();
+}

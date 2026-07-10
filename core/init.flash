@@ -1,0 +1,113 @@
+// init.zag — RayOS core initialization: Spatial Routing Fabric + BTM hypervisor
+//
+// RayOS has no kernel.  Boot wires the passive optical switchboard, seeds the
+// SOH matrix tile plane, and arms the Binary Translation Matrix for guest hosts.
+// Native Flash math (Tekum) drives all memory offset calculations.
+
+@import("constants.flash")
+@import("../math/trit_core.flash")
+@import("../fabric/waveguide.flash")
+@import("../fabric/routing_table.flash")
+@import("../fabric/fabric.flash")
+@import("../memory/soh_matrix.flash")
+@import("../math/tekum.flash")
+@import("../math/offset_loop.flash")
+@import("../hypervisor/guest_regs.flash")
+@import("../hypervisor/x86_decode.flash")
+@import("../hypervisor/jit_translator.flash")
+@import("../hypervisor/guest_ram.flash")
+@import("../driver/virtio_net_mmio_nop.flash")
+@import("../hypervisor/binary_matrix.flash")
+@import("../hypervisor/guest_boot.flash")
+@import("../hypervisor/linux_boot.flash")
+
+struct RayOSBootStats {
+    fabric_bindings:  i32,
+    soh_tiles:        i32,
+    soh_capacity:     i32,
+    tekum_width:      i32,
+    offset_probe:     i64,
+    btm_attached:     i32,
+}
+
+struct RayOS {
+    fabric:   SpatialRoutingFabric,
+    btm:      *BinaryTranslationMatrix,
+    soh:      *SOHMatrix,
+    boot:     RayOSBootStats,
+    ready:    i32,
+}
+
+fn rayos_chamber_count() i32 { return (RAYOS_CHAMBER_COUNT() as i32); }
+fn rayos_wdm_channels() i32 { return (RAYOS_WDM_CHANNELS() as i32); }
+fn rayos_waveguide_slots() i32 { return (RAYOS_WAVEGUIDE_SLOTS() as i32); }
+
+fn rayos_probe_offset() i64 {
+    let base: TekumValue = tekum_from_i64(0);
+    let stride: TekumValue = tekum_from_i64((FLASH_CHAMBER_STRIDE_TRITS() as i32));
+    let off: TekumValue = flash_offset_compute(base, stride, 3);
+    return tekum_to_i64(off);
+}
+
+fn rayos_init() RayOS {
+    let f: SpatialRoutingFabric = fabric_new();
+    let sys_bind: i32 = fabric_bind_application(&f, 0, 0, 1, 0);
+
+    let matrix: *SOHMatrix = soh_new(
+        (SOH_DEFAULT_TILES_X() as i32),
+        (SOH_DEFAULT_TILES_Y() as i32),
+    );
+
+    let hv: *BinaryTranslationMatrix = btm_new();
+    btm_attach_guest(hv, GuestArch.X86_64);
+
+    let probe: i64 = rayos_probe_offset();
+    let tw: TekumValue = tekum_from_i64(probe);
+    let binds: i32 = 0;
+    if (sys_bind >= 0) { binds = 1; }
+
+    return RayOS{
+        .fabric = f,
+        .btm    = hv,
+        .soh    = matrix,
+        .boot   = RayOSBootStats{
+            .fabric_bindings = binds,
+            .soh_tiles       = matrix.*.tiles_x * matrix.*.tiles_y,
+            .soh_capacity    = matrix.*.capacity,
+            .tekum_width     = tw.width,
+            .offset_probe    = probe,
+            .btm_attached    = 1,
+        },
+        .ready = 1,
+    };
+}
+
+fn rayos_shutdown(sys: *RayOS) void {
+    if (sys.*.ready == 0) { return; }
+    fabric_free(&sys.*.fabric);
+    btm_free(sys.*.btm);
+    soh_free(sys.*.soh);
+    sys.*.btm = null;
+    sys.*.soh = null;
+    sys.*.ready = 0;
+}
+
+fn rayos_bind_app(
+    sys: *RayOS,
+    app_id: i32,
+    src_chamber: i32,
+    dst_chamber: i32,
+    channel_id: i32,
+) i32 {
+    return fabric_bind_application(
+        &sys.*.fabric, app_id, src_chamber, dst_chamber, channel_id,
+    );
+}
+
+fn rayos_release_app(sys: *RayOS, app_id: i32) i32 {
+    return fabric_release_by_app(&sys.*.fabric, app_id);
+}
+
+fn rayos_guest_step(sys: *RayOS, guest_bytes: []u8) i32 {
+    return btm_step(sys.*.btm, guest_bytes);
+}

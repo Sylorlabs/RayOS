@@ -1,0 +1,234 @@
+// offset_loop.zag — RayOS Flash native memory offset calculation loop.
+//
+// Computes logical byte offsets into SOH matrix tile storage using Tekum
+// balanced-ternary ripple arithmetic. Chamber × channel addressing follows
+// the Flash stripe-pool layout (chamber-linear index, lane channel, SOH face).
+//
+//   @import("offset_loop.flash")
+//   let addr: TekumValue = flash_offset_compute(base, stride, 4);
+
+// ── Flash / SOH layout constants (aligned with zag-spatial stripe_pool) ─────
+
+fn FLASH_NANO_VOXELS_EDGE() i32 { return 8; }
+fn FLASH_VOXELS_PER_CHAMBER() i32 {
+    let e: i32 = FLASH_NANO_VOXELS_EDGE() as i64;
+    return e * e * e;
+}
+
+fn FLASH_SOH_FACE_COUNT() i32 { return 4; }   // ±X, ±Z face-adjacent tiles
+fn FLASH_DEFAULT_CHANNELS() i32 { return 4; } // stripe width / WDM lanes
+
+// Tekum trit lanes per SOH tile word (one tapered precision cell).
+fn FLASH_SOH_TILE_TRITS() i32 { return (TEKUM_MIN_TRITS() as i32); }
+
+// Stride between consecutive chambers in the linear chamber index.
+fn FLASH_CHAMBER_STRIDE_TRITS() i32 { return (FLASH_VOXELS_PER_CHAMBER() as i32); }
+
+// Stride between WDM / stripe-lane channels within one chamber row.
+fn FLASH_CHANNEL_STRIDE_TRITS() i32 { return 1; }
+
+// Stride between SOH face slots on a single chamber boundary.
+fn FLASH_SOH_FACE_STRIDE_TRITS() i32 { return (FLASH_SOH_TILE_TRITS() as i32); }
+
+struct FlashChamberAddr {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+struct FlashOffsetSlot {
+    chamber: FlashChamberAddr,
+    channel: i32,
+    soh_face: i32,
+    offset: TekumValue,
+}
+
+struct FlashOffsetLoopState {
+    base: TekumValue,
+    grid_w: i32,
+    grid_h: i32,
+    grid_d: i32,
+    channel_count: i32,
+    soh_faces: i32,
+    cursor: i32,
+    total: i32,
+}
+
+// ── chamber linearization (matches zag-spatial/grid.zag) ─────────────────────
+
+fn flash_chamber_linear(w: i32, h: i32, c: FlashChamberAddr) i32 {
+    return c.z * w * h + c.y * w + c.x;
+}
+
+fn flash_chamber_from_linear(w: i32, h: i32, idx: i32) FlashChamberAddr {
+    let plane: i32 = w * h;
+    let z: i32 = idx / plane;
+    let rem: i32 = idx - z * plane;
+    let y: i32 = rem / w;
+    let x: i32 = rem - y * w;
+    return FlashChamberAddr{ .x = x, .y = y, .z = z };
+}
+
+// ── core offset: base + stride * index (Tekum ripple path) ───────────────────
+
+fn flash_offset_compute(base: TekumValue, stride: TekumValue, index: i32) TekumValue {
+    let idx_val: TekumValue = tekum_from_i64(index as i64);
+    let product: TekumValue = tekum_mul(stride, idx_val);
+    let sum: TekumValue = tekum_add(base, product);
+    return tekum_taper(sum);
+}
+
+fn flash_offset_compute_i64(base: i64, stride: i64, index: i32) i64 {
+    return tekum_to_i64(flash_offset_compute(
+        tekum_from_i64(base),
+        tekum_from_i64(stride),
+        index,
+    ));
+}
+
+// ── chamber × channel × SOH face addressing ────────────────────────────────
+
+fn flash_soh_tile_offset(
+    base: TekumValue,
+    chamber_idx: i32,
+    channel: i32,
+    soh_face: i32,
+) TekumValue {
+    let chamber_stride: TekumValue = tekum_from_i64(
+        FLASH_CHAMBER_STRIDE_TRITS() as i64,
+    );
+    let channel_stride: TekumValue = tekum_from_i64(
+        FLASH_CHANNEL_STRIDE_TRITS() as i64,
+    );
+    let face_stride: TekumValue = tekum_from_i64(
+        FLASH_SOH_FACE_STRIDE_TRITS() as i64,
+    );
+
+    let off0: TekumValue = flash_offset_compute(base, chamber_stride, chamber_idx);
+    let off1: TekumValue = flash_offset_compute(off0, channel_stride, channel);
+    let off2: TekumValue = flash_offset_compute(off1, face_stride, soh_face);
+    return tekum_taper(off2);
+}
+
+fn flash_offset_loop_init(
+    base: TekumValue,
+    grid_w: i32,
+    grid_h: i32,
+    grid_d: i32,
+    channel_count: i32,
+    soh_faces: i32,
+) FlashOffsetLoopState {
+    let gw: i32 = grid_w;
+    let gh: i32 = grid_h;
+    let gd: i32 = grid_d;
+    if (gw < 1) { gw = 1; }
+    if (gh < 1) { gh = 1; }
+    if (gd < 1) { gd = 1; }
+    let ch: i32 = channel_count;
+    if (ch < 1) { ch = (FLASH_DEFAULT_CHANNELS() as i32); }
+    let faces: i32 = soh_faces;
+    if (faces < 1) { faces = (FLASH_SOH_FACE_COUNT() as i32); }
+    let chambers: i32 = gw * gh * gd;
+    return FlashOffsetLoopState{
+        .base = base,
+        .grid_w = gw,
+        .grid_h = gh,
+        .grid_d = gd,
+        .channel_count = ch,
+        .soh_faces = faces,
+        .cursor = 0,
+        .total = chambers * ch * faces,
+    };
+}
+
+// Iterate chamber*channel*SOH-face slots; returns 1 while slots remain, 0 when done.
+fn flash_offset_loop_step(
+    st: *FlashOffsetLoopState,
+    out: *FlashOffsetSlot,
+) i32 {
+    if (st.*.cursor >= st.*.total) { return 0; }
+
+    let slots_per_chamber: i32 = st.*.channel_count * st.*.soh_faces;
+    let chamber_idx: i32 = st.*.cursor / slots_per_chamber;
+    let rem: i32 = st.*.cursor - chamber_idx * slots_per_chamber;
+    let channel: i32 = rem / st.*.soh_faces;
+    let soh_face: i32 = rem - channel * st.*.soh_faces;
+
+    let addr: FlashChamberAddr = flash_chamber_from_linear(
+        st.*.grid_w,
+        st.*.grid_h,
+        chamber_idx,
+    );
+    let offset: TekumValue = flash_soh_tile_offset(
+        st.*.base,
+        chamber_idx,
+        channel,
+        soh_face,
+    );
+
+    out.* = FlashOffsetSlot{
+        .chamber = addr,
+        .channel = channel,
+        .soh_face = soh_face,
+        .offset = offset,
+    };
+    st.*.cursor = st.*.cursor + 1;
+    return 1;
+}
+
+// Materialize up to `max_out` slots into a caller buffer; returns count written.
+fn flash_offset_loop(
+    base: TekumValue,
+    grid_w: i32,
+    grid_h: i32,
+    grid_d: i32,
+    channel_count: i32,
+    soh_faces: i32,
+    out_slots: *FlashOffsetSlot,
+    max_out: i32,
+) i32 {
+    let st: FlashOffsetLoopState = flash_offset_loop_init(
+        base,
+        grid_w,
+        grid_h,
+        grid_d,
+        channel_count,
+        soh_faces,
+    );
+    let written: i32 = 0;
+    let slot: FlashOffsetSlot = FlashOffsetSlot{
+        .chamber = FlashChamberAddr{ .x = 0, .y = 0, .z = 0 },
+        .channel = 0,
+        .soh_face = 0,
+        .offset = tekum_zero(),
+    };
+    let mut_st: FlashOffsetLoopState = st;
+    let done: i32 = 0;
+    while (written < max_out && done == 0) {
+        if (flash_offset_loop_step(&mut_st, &slot) == 0) {
+            done = 1;
+        } else {
+            out_slots[written] = slot;
+            written = written + 1;
+        }
+    }
+    return written;
+}
+
+fn flash_offset_loop_total(
+    grid_w: i32,
+    grid_h: i32,
+    grid_d: i32,
+    channel_count: i32,
+    soh_faces: i32,
+) i32 {
+    let st: FlashOffsetLoopState = flash_offset_loop_init(
+        tekum_zero(),
+        grid_w,
+        grid_h,
+        grid_d,
+        channel_count,
+        soh_faces,
+    );
+    return st.total;
+}

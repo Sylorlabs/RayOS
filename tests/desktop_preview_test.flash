@@ -1,0 +1,28 @@
+// desktop_preview_test.flash — animate launcher + dump PPM preview frame.
+
+@import("../desktop/rayos_desktop.flash")
+
+fn main() i32 {
+    _zag_println("desktop_preview_test: running");
+
+    scanout_clear_present_flag();
+    input_chamber_inject(96, 776, 1);
+
+    let rc: i32 = rayos_desktop_run_dump(10, "desktop/preview.ppm");
+    if (rc != 0) {
+        _zag_print("desktop_preview_test: FAIL desktop rc=");
+        _zag_println(_zag_i64_to_str(rc as i64));
+        return 1;
+    }
+    if (_zag_file_exists("desktop/preview.ppm") == 0) {
+        _zag_println("desktop_preview_test: FAIL missing preview.ppm");
+        return 1;
+    }
+    if (scanout_present_flag() != 1) {
+        _zag_println("desktop_preview_test: FAIL present_flag");
+        return 1;
+    }
+
+    _zag_println("desktop_preview_test: ok (wrote desktop/preview.ppm)");
+    return 0;
+}

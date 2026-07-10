@@ -1,0 +1,66 @@
+// linux_boot_protocol_test.flash — Linux bzImage boot protocol via RayOS BTM
+
+@import("../core/init.flash")
+@import("../driver/virtio_block_mmio_nop.flash")
+@import("../driver/virtio_gpu_mmio_nop.flash")
+@import("../driver/hw_rt.flash")
+@import("../hypervisor/linux_boot.flash")
+@import("../storage/linux_image.flash")
+
+fn test_fail(msg: []u8) void {
+    _zag_print("linux_boot_protocol_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn test_expect_u64(got: u64, want_min: u64, msg: []u8) void {
+    if (got <= want_min) { test_fail(msg); }
+}
+
+fn test_expect_i32(got: i32, want: i32, msg: []u8) void {
+    if (got != want) { test_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("linux_boot_protocol_test: running");
+
+    if (hw_rt_init() != 0) { test_fail("hw_rt_init"); }
+
+    let guest_ram: ArrayList[u8] = guest_ram_new_default();
+
+    let rc: i32 = linux_image_load_bzimage(&guest_ram);
+    if (rc != 0) { test_fail("linux_image_load_bzimage"); }
+
+    let magic: i32 = linux_boot_magic_at_boot_sector(guest_ram);
+    test_expect_i32(magic, LINUX_BOOT_FLAG_MAGIC() as i32, "boot sector magic 0xAA55");
+
+    if (linux_boot_params_valid(guest_ram) != 1) { test_fail("boot_params magic"); }
+
+    let boot_off: i32 = GPA_BOOT_SECTOR() as i32;
+    if (get[u8](&guest_ram, boot_off + 510) != 85) { test_fail("boot sig lo"); }
+    if (get[u8](&guest_ram, boot_off + 511) != 170) { test_fail("boot sig hi"); }
+
+    let hdr_off: i32 = (GPA_LINUX_SETUP() as i32)
+        + (LINUX_OFF_HDR_SIG() as i32)
+        - (LINUX_BOOT_SECTOR_BYTES() as i32);
+    if (get[u8](&guest_ram, hdr_off + 0) != 72) { test_fail("setup HdrS[0]"); }
+    if (get[u8](&guest_ram, hdr_off + 3) != 83) { test_fail("setup HdrS[3]"); }
+
+    let hv: *BinaryTranslationMatrix = btm_new();
+    linux_boot_attach(hv, &guest_ram);
+
+    let pc0: u64 = linux_boot_pc(hv);
+    if (pc0 != (GPA_BOOT_SECTOR() as u64)) { test_fail("linux_boot_attach pc"); }
+
+    let stepped: i32 = linux_boot_step_n(hv, guest_ram, 3);
+    if (stepped < 1) { test_fail("linux_boot_step_n"); }
+
+    let pc1: u64 = linux_boot_pc(hv);
+    if (pc1 == 0) { test_fail("guest pc zero after step"); }
+
+    free[u8](&guest_ram);
+    btm_free(hv);
+
+    _zag_println("linux_boot_protocol_test: ok");
+    return 0;
+}

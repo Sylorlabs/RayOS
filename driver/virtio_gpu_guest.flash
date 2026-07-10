@@ -1,0 +1,262 @@
+// driver/virtio_gpu_guest.flash — virtio-gpu MMIO stub + guest linear framebuffer (Wave 4).
+//
+// MMIO window at GPA_VIRTIO_GPU_BASE (0x10003000).  Guest pixels live at
+// GPA_VIRTIO_GPU_FB (0x10100000), 640x480x32 ARGB.  Scanout via
+// virtio_gpu_blit_from_guest_ram copies into an RGB24 compositor pool.
+//
+// Import chain (no @import here — splice from test / init entry):
+//   @import("virtio_gpu_guest.flash")
+
+fn VIRTIO_GPU_GUEST_MAGIC() i32 { return 1196578647; }        // "VTGP"
+
+fn VIRTIO_GPU_MMIO_MAGIC_VALUE() i32 { return 1952805748; }   // 0x74726976 "virt"
+fn VIRTIO_GPU_MMIO_VERSION() i32 { return 2; }
+fn VIRTIO_GPU_MMIO_VENDOR_ID() i32 { return 1381259075; }     // "RAYO"
+fn VIRTIO_GPU_MMIO_DEVICE_ID_GPU() i32 { return 16; }
+
+fn VIRTIO_GPU_MMIO_MAGIC() i32 { return 0; }
+fn VIRTIO_GPU_MMIO_VERSION_REG() i32 { return 4; }
+fn VIRTIO_GPU_MMIO_DEVICE_ID() i32 { return 8; }
+fn VIRTIO_GPU_MMIO_VENDOR_ID_REG() i32 { return 12; }
+fn VIRTIO_GPU_MMIO_DEVICE_FEATURES() i32 { return 16; }
+fn VIRTIO_GPU_MMIO_INTERRUPT_STATUS() i32 { return 68; }
+fn VIRTIO_GPU_MMIO_INTERRUPT_ACK() i32 { return 72; }
+fn VIRTIO_GPU_MMIO_STATUS() i32 { return 80; }
+
+struct VirtioGpuGuestState {
+    magic: i32,
+    pid: i64,
+    ready: i32,
+    status: i32,
+    interrupt_status: i32,
+    fb_ptr: i64,
+    fb_bytes: i32,
+}
+
+fn virtio_gpu_guest_cache_path() []u8 {
+    let pid: []u8 = _zag_i64_to_str(hw_rt_getpid());
+    return _zag_str_concat(_zag_str_concat("/tmp/rayos_virtio_gpu_guest.", pid), ".ptr");
+}
+
+fn virtio_gpu_guest_state_new() VirtioGpuGuestState {
+    return VirtioGpuGuestState{
+        .magic = (VIRTIO_GPU_GUEST_MAGIC() as i32),
+        .pid = hw_rt_getpid(),
+        .ready = 0,
+        .status = 0,
+        .interrupt_status = 0,
+        .fb_ptr = 0,
+        .fb_bytes = 0,
+    };
+}
+
+fn virtio_gpu_guest_state_from_cache() ?*VirtioGpuGuestState {
+    let path: []u8 = virtio_gpu_guest_cache_path();
+    if (_zag_file_exists(path) == 0) { return null; }
+    let text: []u8 = _zag_read_file(path);
+    if (text.len < 1) { return null; }
+    let addr: i64 = _zag_str_to_i64(text);
+    if (addr == 0) { return null; }
+    let st: *VirtioGpuGuestState = addr as *VirtioGpuGuestState;
+    if (st.*.magic != (VIRTIO_GPU_GUEST_MAGIC() as i32)) { return null; }
+    if (st.*.pid != hw_rt_getpid()) { return null; }
+    return st;
+}
+
+fn virtio_gpu_guest_state_to_cache(st: *VirtioGpuGuestState) void {
+    let path: []u8 = virtio_gpu_guest_cache_path();
+    let text: []u8 = _zag_i64_to_str(st as i64);
+    _zag_write_file(path, text);
+}
+
+fn virtio_gpu_guest_state_mut() *VirtioGpuGuestState {
+    if (virtio_gpu_guest_state_from_cache()) |cached| {
+        return cached;
+    }
+    let raw: *i8 = _zag_malloc(@sizeOf[VirtioGpuGuestState]());
+    let st: *VirtioGpuGuestState = raw as *VirtioGpuGuestState;
+    st.* = virtio_gpu_guest_state_new();
+    virtio_gpu_guest_state_to_cache(st);
+    return st;
+}
+
+fn virtio_gpu_guest_gpa_in_window(gpa: i32) i32 {
+    let base: i32 = GPA_VIRTIO_GPU_BASE();
+    let end: i32 = base + GPA_VIRTIO_MMIO_BYTES();
+    if (gpa < base) { return 0; }
+    if (gpa >= end) { return 0; }
+    return 1;
+}
+
+fn virtio_gpu_guest_mmio_read32(gpa_off: i32) i32 {
+    if (gpa_off == VIRTIO_GPU_MMIO_MAGIC()) {
+        return (VIRTIO_GPU_MMIO_MAGIC_VALUE() as i32);
+    }
+    if (gpa_off == VIRTIO_GPU_MMIO_VERSION_REG()) {
+        return (VIRTIO_GPU_MMIO_VERSION() as i32);
+    }
+    if (gpa_off == VIRTIO_GPU_MMIO_DEVICE_ID()) {
+        return (VIRTIO_GPU_MMIO_DEVICE_ID_GPU() as i32);
+    }
+    if (gpa_off == VIRTIO_GPU_MMIO_VENDOR_ID_REG()) {
+        return (VIRTIO_GPU_MMIO_VENDOR_ID() as i32);
+    }
+    let st: *VirtioGpuGuestState = virtio_gpu_guest_state_mut();
+    if (gpa_off == VIRTIO_GPU_MMIO_DEVICE_FEATURES()) { return 0; }
+    if (gpa_off == VIRTIO_GPU_MMIO_INTERRUPT_STATUS()) { return st.*.interrupt_status; }
+    if (gpa_off == VIRTIO_GPU_MMIO_STATUS()) { return st.*.status; }
+    return 0;
+}
+
+fn virtio_gpu_guest_mmio_write32(gpa_off: i32, val: i32) void {
+    let st: *VirtioGpuGuestState = virtio_gpu_guest_state_mut();
+    if (gpa_off == VIRTIO_GPU_MMIO_INTERRUPT_ACK()) {
+        st.*.interrupt_status = 0;
+        virtio_gpu_guest_state_to_cache(st);
+        return;
+    }
+    if (gpa_off == VIRTIO_GPU_MMIO_STATUS()) {
+        st.*.status = val;
+        virtio_gpu_guest_state_to_cache(st);
+        return;
+    }
+}
+
+fn virtio_gpu_guest_fb_ptr() ?*ArrayList[u8] {
+    let st: *VirtioGpuGuestState = virtio_gpu_guest_state_mut();
+    if (st.*.fb_ptr == 0) { return null; }
+    return st.*.fb_ptr as *ArrayList[u8];
+}
+
+fn virtio_gpu_guest_fb_ensure(st: *VirtioGpuGuestState) i32 {
+    if (st.*.fb_ptr != 0) { return 0; }
+    let raw: *i8 = _zag_malloc(@sizeOf[ArrayList[u8]]());
+    let fb: *ArrayList[u8] = raw as *ArrayList[u8];
+    fb.* = make[u8](0);
+    let need: i32 = (VIRTIO_GPU_FB_BYTES() as i32);
+    let i: i32 = 0;
+    while (i < need) {
+        push[u8](fb, 0);
+        i = i + 1;
+    }
+    st.*.fb_ptr = fb as i64;
+    st.*.fb_bytes = need;
+    virtio_gpu_guest_state_to_cache(st);
+    return 0;
+}
+
+fn virtio_gpu_guest_init() i32 {
+    let raw: *i8 = _zag_malloc(@sizeOf[VirtioGpuGuestState]());
+    let st: *VirtioGpuGuestState = raw as *VirtioGpuGuestState;
+    st.* = virtio_gpu_guest_state_new();
+    st.*.pid = hw_rt_getpid();
+    st.*.ready = 1;
+    st.*.interrupt_status = 0;
+    if (virtio_gpu_guest_fb_ensure(st) != 0) { return 0 - 1; }
+    virtio_gpu_guest_state_to_cache(st);
+    return 0;
+}
+
+fn virtio_gpu_guest_fb_gpa_in_range(gpa: i32) i32 {
+    if (gpa < (GPA_VIRTIO_GPU_FB() as i32)) { return 0; }
+    let end: i32 = (GPA_VIRTIO_GPU_FB() as i32) + (VIRTIO_GPU_FB_BYTES() as i32);
+    if (gpa >= end) { return 0; }
+    return 1;
+}
+
+fn virtio_gpu_guest_fb_off(gpa: i32) i32 {
+    return gpa - (GPA_VIRTIO_GPU_FB() as i32);
+}
+
+fn virtio_gpu_guest_fb_write32(gpa: i32, val: u32) i32 {
+    if (virtio_gpu_guest_fb_gpa_in_range(gpa) == 0) { return 0 - 1; }
+    let st: *VirtioGpuGuestState = virtio_gpu_guest_state_mut();
+    if (virtio_gpu_guest_fb_ensure(st) != 0) { return 0 - 2; }
+    if (virtio_gpu_guest_fb_ptr()) |fb| {
+        let off: i32 = virtio_gpu_guest_fb_off(gpa);
+        if (off + 3 >= st.*.fb_bytes) { return 0 - 3; }
+        set[u8](fb, off, (val % 256) as u8);
+        set[u8](fb, off + 1, ((val / 256) % 256) as u8);
+        set[u8](fb, off + 2, ((val / 65536) % 256) as u8);
+        set[u8](fb, off + 3, ((val / 16777216) % 256) as u8);
+        return 0;
+    }
+    return 0 - 4;
+}
+
+fn virtio_gpu_guest_fb_read32(gpa: i32) i64 {
+    if (virtio_gpu_guest_fb_gpa_in_range(gpa) == 0) { return 0; }
+    let st: *VirtioGpuGuestState = virtio_gpu_guest_state_mut();
+    if (virtio_gpu_guest_fb_ensure(st) != 0) { return 0; }
+    if (virtio_gpu_guest_fb_ptr()) |fb| {
+        let off: i32 = virtio_gpu_guest_fb_off(gpa);
+        if (off + 3 >= st.*.fb_bytes) { return 0; }
+        let b0: u8 = get[u8](fb, off);
+        let b1: u8 = get[u8](fb, off + 1);
+        let b2: u8 = get[u8](fb, off + 2);
+        let b3: u8 = get[u8](fb, off + 3);
+        let v: u32 = (b0 as u32)
+            + ((b1 as u32) * 256)
+            + ((b2 as u32) * 65536)
+            + ((b3 as u32) * 16777216);
+        return v as i64;
+    }
+    return 0;
+}
+
+fn virtio_gpu_guest_read_argb_pixel(fb: *ArrayList[u8], off: i32) i32 {
+    if (off < 0) { return 0; }
+    if (off + 3 >= len[u8](fb.*)) { return 0; }
+    let b0: u8 = get[u8](fb, off);
+    let b1: u8 = get[u8](fb, off + 1);
+    let b2: u8 = get[u8](fb, off + 2);
+    let b3: u8 = get[u8](fb, off + 3);
+    let v: u32 = (b0 as u32)
+        + ((b1 as u32) * 256)
+        + ((b2 as u32) * 65536)
+        + ((b3 as u32) * 16777216);
+    return v as i32;
+}
+
+fn virtio_gpu_blit_from_guest_ram(
+    guest_ram: *ArrayList[u8],
+    guest_pool: *ArrayList[u8],
+    off: i32,
+    w: i32,
+    h: i32,
+) void {
+    let _ram: *ArrayList[u8] = guest_ram;
+    if (w < 1) { return; }
+    if (h < 1) { return; }
+    let st: *VirtioGpuGuestState = virtio_gpu_guest_state_mut();
+    if (virtio_gpu_guest_fb_ensure(st) != 0) { return; }
+    if (virtio_gpu_guest_fb_ptr()) |fb| {
+        let src_w: i32 = (VIRTIO_GPU_FB_WIDTH() as i32);
+        let src_h: i32 = (VIRTIO_GPU_FB_HEIGHT() as i32);
+        let need: i32 = off + w * h * 3;
+        if (guest_ram_ensure(guest_pool, need) == 0) { return; }
+        let y: i32 = 0;
+        while (y < h) {
+            let sy: i32 = (y * src_h) / h;
+            let x: i32 = 0;
+            while (x < w) {
+                let sx: i32 = (x * src_w) / w;
+                let src_off: i32 = (sy * src_w + sx) * 4;
+                let argb: i32 = virtio_gpu_guest_read_argb_pixel(fb, src_off);
+                let bb: i32 = argb - (argb / 256) * 256;
+                let gg: i32 = (argb / 256) - ((argb / 256) / 256) * 256;
+                let rr: i32 = (argb / 65536) - ((argb / 65536) / 256) * 256;
+                let di: i32 = off + (y * w + x) * 3;
+                if (di >= 0) {
+                    if (di + 2 < len[u8](guest_pool.*)) {
+                        set[u8](guest_pool, di, rr as u8);
+                        set[u8](guest_pool, di + 1, gg as u8);
+                        set[u8](guest_pool, di + 2, bb as u8);
+                    }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+    }
+}

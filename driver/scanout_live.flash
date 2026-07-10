@@ -1,0 +1,170 @@
+// driver/scanout_live.flash — live scanout viewer (display chamber FB → PPM/fb0).
+//
+// Attaches to the display chamber backing store, polls present_flag /
+// frame_seq, and mirrors new frames to the host display. The present path is
+// zero-copy on the compose side: PPM header + pixels are staged in one
+// persistent buffer and written with a single file write per frame.
+//
+//   @import("scanout_live.flash")
+//   scanout_live_init(1280, 800);
+//   scanout_live_present_once("desktop/live_frame.ppm");
+//   scanout_live_present_loop(60);
+
+@import("display.flash")
+@import("display_chamber.flash")
+
+fn SCANOUT_LIVE_MAGIC() i32 { return 1381260116; }   // "SLIV"
+
+struct ScanoutLiveState {
+    magic: i32,
+    width: i32,
+    height: i32,
+    fb_ptr: i64,
+    fb_bytes: i32,
+    last_seq: i32,
+    ready: i32,
+    out_ptr: i64,     // persistent PPM staging buffer (header + pixels)
+    out_hdr: i32,     // header length within out_ptr
+}
+
+fn scanout_live_state_new() ScanoutLiveState {
+    return ScanoutLiveState{
+        .magic = (SCANOUT_LIVE_MAGIC() as i32),
+        .width = 0,
+        .height = 0,
+        .fb_ptr = 0,
+        .fb_bytes = 0,
+        .last_seq = 0,
+        .ready = 0,
+        .out_ptr = 0,
+        .out_hdr = 0,
+    };
+}
+
+fn scanout_live_state_mut() *ScanoutLiveState {
+    let st: *ScanoutLiveState = (hw_globals() + HW_GSLOT_SCANOUT_LIVE()) as *ScanoutLiveState;
+    if (st.*.magic != (SCANOUT_LIVE_MAGIC() as i32)) {
+        st.* = scanout_live_state_new();
+    }
+    return st;
+}
+
+fn scanout_live_spin_wait() void {
+    hw_sleep_ms(2);
+}
+
+fn scanout_live_attach_chamber(w: i32, h: i32) i32 {
+    if (display_chamber_state_from_cache()) |ch| {
+        if (ch.*.ready == 1 && ch.*.fb_ptr != 0) {
+            if (ch.*.width == w && ch.*.height == h) {
+                return 0;
+            }
+        }
+    }
+    return display_chamber_init(w, h);
+}
+
+// Stage the immutable PPM header once; pixels are memcpy'd after it per frame.
+fn scanout_live_setup_out(live: *ScanoutLiveState) i32 {
+    if (live.*.out_ptr != 0) { return 0; }
+    let hdr: []u8 = _zag_str_concat("P6\n", _zag_i64_to_str(live.*.width as i64));
+    hdr = _zag_str_concat(hdr, " ");
+    hdr = _zag_str_concat(hdr, _zag_i64_to_str(live.*.height as i64));
+    hdr = _zag_str_concat(hdr, "\n255\n");
+    let buf: *i8 = _zag_malloc(hdr.len + live.*.fb_bytes);
+    if (buf == null) { return 0 - 1; }
+    let i: i32 = 0;
+    while (i < hdr.len) {
+        buf[i] = hdr[i] as i8;
+        i = i + 1;
+    }
+    live.*.out_ptr = buf as i64;
+    live.*.out_hdr = hdr.len;
+    return 0;
+}
+
+fn scanout_live_init(w: i32, h: i32) i32 {
+    if (w < 1 || h < 1) { return 0 - 1; }
+    if (hw_rt_init() != 0) { return 0 - 2; }
+    if (scanout_live_attach_chamber(w, h) != 0) { return 0 - 3; }
+
+    let ch: *DisplayChamberState = display_chamber_state_mut();
+    if (ch.*.fb_ptr == 0) { return 0 - 4; }
+
+    let live: *ScanoutLiveState = scanout_live_state_mut();
+    if (live.*.out_ptr != 0 && (live.*.width != ch.*.width || live.*.height != ch.*.height)) {
+        _zag_free(live.*.out_ptr as *i8);
+        live.*.out_ptr = 0;
+        live.*.out_hdr = 0;
+    }
+    live.*.width = ch.*.width;
+    live.*.height = ch.*.height;
+    live.*.fb_ptr = ch.*.fb_ptr;
+    live.*.fb_bytes = ch.*.fb_bytes;
+    live.*.last_seq = scanout_frame_seq();
+    live.*.ready = 1;
+    if (scanout_live_setup_out(live) != 0) { return 0 - 5; }
+    return 0;
+}
+
+fn scanout_live_chamber_fb_ptr() *i8 {
+    let live: *ScanoutLiveState = scanout_live_state_mut();
+    if (live.*.ready == 0) { return null; }
+    if (live.*.fb_ptr == 0) { return null; }
+    return live.*.fb_ptr as *i8;
+}
+
+fn scanout_live_softfb_from_chamber() SoftFb {
+    let live: *ScanoutLiveState = scanout_live_state_mut();
+    let fb: SoftFb = softgpu_new(live.*.width, live.*.height);
+    let src: *i8 = scanout_live_chamber_fb_ptr();
+    if (src == null) { return fb; }
+    softgpu_copy_bytes(fb.pix.data as *i8, src, live.*.fb_bytes);
+    return fb;
+}
+
+fn scanout_live_present_once(path: []u8) i32 {
+    let live: *ScanoutLiveState = scanout_live_state_mut();
+    if (live.*.ready == 0) { return 0 - 1; }
+    if (live.*.out_ptr == 0 || live.*.fb_ptr == 0) { return 0 - 2; }
+    if (path.len < 1) { return 0 - 3; }
+    softgpu_copy_bytes(
+        (live.*.out_ptr + live.*.out_hdr as i64) as *i8,
+        live.*.fb_ptr as *i8,
+        live.*.fb_bytes,
+    );
+    let total: i32 = live.*.out_hdr + live.*.fb_bytes;
+    // stage + rename so viewers never see a torn frame
+    let tmp: []u8 = _zag_str_concat(path, ".tmp");
+    let out: *u8 = live.*.out_ptr as *u8;
+    let rc: i32 = _zag_write_file(tmp, out[0..total]);
+    if (rc == 0) {
+        rc = hw_rename(tmp, path);
+    }
+    live.*.last_seq = scanout_frame_seq();
+    return rc;
+}
+
+fn scanout_live_present_loop(max_frames: i32) i32 {
+    let live: *ScanoutLiveState = scanout_live_state_mut();
+    if (live.*.ready == 0) { return 0 - 1; }
+
+    let out_path: []u8 = "desktop/live_frame.ppm";
+    let presented: i32 = 0;
+    let last_seq: i32 = live.*.last_seq;
+
+    while (max_frames == 0 || presented < max_frames) {
+        if (scanout_present_flag() == 1) {
+            let seq: i32 = scanout_frame_seq();
+            if (seq != last_seq) {
+                let rc: i32 = scanout_live_present_once(out_path);
+                if (rc != 0) { return rc; }
+                last_seq = seq;
+                live.*.last_seq = seq;
+                presented = presented + 1;
+            }
+        }
+        scanout_live_spin_wait();
+    }
+    return 0;
+}

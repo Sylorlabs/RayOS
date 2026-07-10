@@ -1,0 +1,1682 @@
+// desktop/compositor.flash — RayOS desktop compositor (wallpaper, windows, taskbar).
+//
+//   let comp: Compositor = comp_new(1280, 720);
+//   comp_render_full(&comp);
+//   comp_render_damage(&comp, 100, 80, 400, 300);
+//
+// Guest window pixels are blitted from an RGB24 pool via softgpu_blit_rect.
+
+// vgpu + softgpu + ui arrive via wm → theme → ui.flash (single splice).
+@import("wm.flash")
+@import("desktop.flash")
+@import("shell.flash")
+@import("launcher.flash")
+@import("../core/scheduler.flash")
+@import("../storage/trifs.flash")
+@import("../browser/html.flash")
+@import("../driver/device_manager.flash")
+@import("../driver/rtc.flash")
+@import("../net/http.flash")
+
+struct Compositor {
+    fb: SoftFb,
+    wm: WmState,
+    desktop: DesktopState,
+    shell: ShellState,
+    launcher: LauncherState,
+    desktop_w: i32,
+    desktop_h: i32,
+    wall_r0: i32,
+    wall_g0: i32,
+    wall_b0: i32,
+    wall_r1: i32,
+    wall_g1: i32,
+    wall_b1: i32,
+    guest_pool: ArrayList[u8],
+    bg: ArrayList[u8],   // cached wallpaper+icons layer (repainted only when invalidated)
+    bg_valid: i32,
+    devices_report: []u8,   // live bus inventory (device_manager_scan)
+    term_buf: ArrayList[u8],    // terminal scrollback (newline-separated)
+    term_input: ArrayList[u8],  // current command line
+    term_cwd: t27,              // shell working directory (TriFS inode)
+    term_hist: ArrayList[u8],   // command history (newline-separated)
+    term_hist_pos: i32,         // arrow-recall cursor (-1 = live line)
+    scheduler: RayScheduler,
+    filesystem: TriFs,
+    browser_document: HtmlDocument,
+    browser_url: []u8,
+    browser_status: []u8,
+    browser_addr: ArrayList[u8],
+    browser_editing: i32,
+    compositor_task: t27,
+    filesystem_task: t27,
+    dirty: i32,
+    dmg_x0: i32,
+    dmg_y0: i32,
+    dmg_x1: i32,
+    dmg_y1: i32,
+}
+
+fn comp_clamp_i(v: i32, lo: i32, hi: i32) i32 {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+fn comp_rects_overlap(
+    ax0: i32,
+    ay0: i32,
+    ax1: i32,
+    ay1: i32,
+    bx0: i32,
+    by0: i32,
+    bx1: i32,
+    by1: i32,
+) i32 {
+    if (ax1 < bx0 || bx1 < ax0 || ay1 < by0 || by1 < ay0) { return 0; }
+    return 1;
+}
+
+// Blit RGB24 guest buffer into a destination rect (nearest-neighbor scale).
+fn softgpu_blit_rect(
+    dst: *SoftFb,
+    dx: i32,
+    dy: i32,
+    dw: i32,
+    dh: i32,
+    src: ArrayList[u8],
+    src_w: i32,
+    src_h: i32,
+    src_off: i32,
+) void {
+    if (dw < 1 || dh < 1 || src_w < 1 || src_h < 1) { return; }
+    let y: i32 = 0;
+    while (y < dh) {
+        let sy: i32 = (y * src_h) / dh;
+        let x: i32 = 0;
+        while (x < dw) {
+            let sx: i32 = (x * src_w) / dw;
+            let si: i32 = src_off + (sy * src_w + sx) * 3;
+            if (si >= 0 && si + 2 < len[u8](src)) {
+                let px: i32 = dx + x;
+                let py: i32 = dy + y;
+                softgpu_pixel(
+                    dst,
+                    px,
+                    py,
+                    get[u8](src, si) as i32,
+                    get[u8](src, si + 1) as i32,
+                    get[u8](src, si + 2) as i32,
+                );
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    softgpu_damage_mark_rect(dst, dx, dy, dx + dw - 1, dy + dh - 1);
+}
+
+fn comp_new(w: i32, h: i32) Compositor {
+    let th: RayOsTheme = rayos_theme();
+    let fb: SoftFb = softgpu_new(w, h);
+    softgpu_damage_on(&fb);
+    let scheduler: RayScheduler = scheduler_new();
+    let compositor_task: t27 = scheduler_spawn(&scheduler, 0, "compositor", 6);
+    let filesystem_task: t27 = scheduler_spawn(&scheduler, 0, "trifs", 3);
+    let _input_task: t27 = scheduler_spawn(&scheduler, 0, "input", 5);
+    let _network_task: t27 = scheduler_spawn(&scheduler, 0, "network", 2);
+    let _index_task: t27 = scheduler_spawn(&scheduler, filesystem_task, "indexer", 0 - 4);
+    let filesystem: TriFs = trifs_new();
+    let _tx: i32 = trifs_begin(&filesystem, filesystem_task);
+    let home: t27 = trifs_create(&filesystem, filesystem_task, trifs_root_inode(), "home", trifs_directory());
+    let docs: t27 = trifs_create(&filesystem, filesystem_task, home, "Documents", trifs_directory());
+    let _welcome: t27 = trifs_create(&filesystem, filesystem_task, docs, "Welcome.tri", trifs_file());
+    let _apps: t27 = trifs_create(&filesystem, filesystem_task, trifs_root_inode(), "Applications", trifs_directory());
+    let _commit: i32 = trifs_commit(&filesystem, filesystem_task);
+    let browser_document: HtmlDocument = html_parse(
+        "<!doctype html><html><body><h1>Welcome to RayOS</h1><p>Ray Browser parses and renders this document in Flash.</p><h2>Balanced ternary by design</h2><p>No external browser engine is embedded. Web content stays inside a bounded inert DOM.</p><hr><p>Networking and CSS are the next conformance layers.</p></body></html>",
+    );
+    return Compositor{
+        .fb = fb,
+        .wm = wm_new(),
+        .desktop = desktop_new(w, h),
+        .shell = shell_new(w, h),
+        .launcher = launcher_new(w, h),
+        .desktop_w = w,
+        .desktop_h = h,
+        .wall_r0 = th.wall_r0,
+        .wall_g0 = th.wall_g0,
+        .wall_b0 = th.wall_b0,
+        .wall_r1 = th.wall_r1,
+        .wall_g1 = th.wall_g1,
+        .wall_b1 = th.wall_b1,
+        .guest_pool = make[u8](w * h * 3),
+        .bg = make[u8](w * h * 3),
+        .bg_valid = 0,
+        .devices_report = "",
+        .term_buf = make[u8](512),
+        .term_input = make[u8](64),
+        .term_cwd = trifs_root_inode(),
+        .term_hist = make[u8](256),
+        .term_hist_pos = -1,
+        .scheduler = scheduler,
+        .filesystem = filesystem,
+        .browser_document = browser_document,
+        .browser_url = "rayos://welcome",
+        .browser_status = "internal page",
+        .browser_addr = make[u8](64),
+        .browser_editing = 0,
+        .compositor_task = compositor_task,
+        .filesystem_task = filesystem_task,
+        .dirty = 0,
+        .dmg_x0 = 0,
+        .dmg_y0 = 0,
+        .dmg_x1 = -1,
+        .dmg_y1 = -1,
+    };
+}
+
+fn comp_free(c: *Compositor) void {
+    let wi: i32 = 0;
+    while (wi < len[RayWindow](c.*.wm.windows)) {
+        let cw: RayWindow = get[RayWindow](c.*.wm.windows, wi);
+        wm_free_cache(&cw);
+        set[RayWindow](&c.*.wm.windows, wi, cw);
+        wi = wi + 1;
+    }
+    free[u8](&c.*.fb.pix);
+    free[u8](&c.*.fb.mask);
+    free[u8](&c.*.fb.acc);
+    free[RayWindow](&c.*.wm.windows);
+    free[DesktopIcon](&c.*.desktop.icons);
+    free[i32](&c.*.shell.win_btn_x);
+    free[i32](&c.*.shell.win_btn_w);
+    free[i32](&c.*.shell.win_btn_id);
+    free[u8](&c.*.guest_pool);
+    free[u8](&c.*.bg);
+    free[u8](&c.*.term_buf);
+    free[u8](&c.*.term_input);
+    free[u8](&c.*.term_hist);
+    free[u8](&c.*.browser_addr);
+    scheduler_free(&c.*.scheduler);
+    trifs_free(&c.*.filesystem);
+    html_document_free(&c.*.browser_document);
+}
+
+fn comp_work_h(c: *Compositor) i32 {
+    let th: RayOsTheme = c.*.wm.theme;
+    let wh: i32 = c.*.desktop_h - th.taskbar_h;
+    if (wh < 1) { wh = 1; }
+    return wh;
+}
+
+fn comp_paint_wallpaper_region(c: *Compositor, x0: i32, y0: i32, x1: i32, y1: i32) void {
+    let fb: *SoftFb = &c.*.fb;
+    let work_h: i32 = comp_work_h(c);
+    let rx0: i32 = comp_clamp_i(x0, 0, c.*.desktop_w - 1);
+    let ry0: i32 = comp_clamp_i(y0, 0, c.*.desktop_h - 1);
+    let rx1: i32 = comp_clamp_i(x1, 0, c.*.desktop_w - 1);
+    let ry1: i32 = comp_clamp_i(y1, 0, c.*.desktop_h - 1);
+    if (rx1 < rx0 || ry1 < ry0) { return; }
+
+    vg_set_clip(fb, rx0, ry0, rx1 - rx0 + 1, ry1 - ry0 + 1);
+
+    let bg: VPath = vg_path_new();
+    vg_move_to(&bg, rx0 as f32, ry0 as f32);
+    vg_line_to(&bg, (rx1 + 1) as f32, ry0 as f32);
+    vg_line_to(&bg, (rx1 + 1) as f32, (ry1 + 1) as f32);
+    vg_line_to(&bg, rx0 as f32, (ry1 + 1) as f32);
+    vg_close(&bg);
+    vg_fill_linear(
+        fb,
+        &bg,
+        0.0,
+        0.0,
+        0.0,
+        work_h as f32,
+        c.*.wall_r0,
+        c.*.wall_g0,
+        c.*.wall_b0,
+        255,
+        c.*.wall_r1,
+        c.*.wall_g1,
+        c.*.wall_b1,
+        255,
+    );
+
+    vg_clear_clip(fb);
+}
+
+fn comp_paint_wallpaper(c: *Compositor) void {
+    desktop_paint(&c.*.desktop, &c.*.fb, &c.*.wm);
+}
+
+fn comp_paint_shell(c: *Compositor) void {
+    shell_paint(&c.*.shell, &c.*.fb, &c.*.wm);
+}
+
+fn comp_paint_launcher(c: *Compositor) void {
+    launcher_paint(&c.*.launcher, &c.*.fb, &c.*.wm);
+}
+
+fn comp_set_clock(c: *Compositor, secs: i64) void {
+    shell_set_clock(&c.*.shell, secs);
+}
+
+fn comp_set_network(c: *Compositor, up: i32) void {
+    shell_set_network(&c.*.shell, up);
+}
+
+fn comp_set_guest_vms(c: *Compositor, count: i32) void {
+    shell_set_guest_vms(&c.*.shell, count);
+}
+
+fn comp_launcher_open(c: *Compositor) void {
+    launcher_open(&c.*.launcher);
+}
+
+fn comp_launcher_close(c: *Compositor) void {
+    launcher_close(&c.*.launcher);
+}
+
+fn comp_launcher_tick(c: *Compositor) void {
+    launcher_tick(&c.*.launcher);
+}
+
+fn comp_guest_alloc(c: *Compositor, bytes: i32) i32 {
+    let off: i32 = len[u8](c.*.guest_pool);
+    let i: i32 = 0;
+    while (i < bytes) {
+        push[u8](&c.*.guest_pool, 0);
+        i = i + 1;
+    }
+    return off;
+}
+
+fn comp_task_state_text(state: t9) []u8 {
+    if (state == task_ready()) { return "READY"; }
+    if (state == task_running()) { return "RUNNING"; }
+    if (state == task_sleeping()) { return "SLEEPING"; }
+    if (state == task_blocked()) { return "BLOCKED"; }
+    if (state == task_stopped()) { return "STOPPED"; }
+    return "EXITED";
+}
+
+fn comp_task_metric_label(index: i32) []u8 {
+    if (index == 0) { return "RUNNABLE"; }
+    if (index == 1) { return "DISPATCHES"; }
+    return "EPOCH";
+}
+
+fn comp_task_metric_value(c: *Compositor, index: i32) i32 {
+    if (index == 0) { return scheduler_runnable_count(&c.*.scheduler) as i32; }
+    if (index == 1) { return c.*.scheduler.dispatches as i32; }
+    return c.*.scheduler.clock as i32;
+}
+
+fn comp_paint_content_header(
+    c: *Compositor,
+    fb: *SoftFb,
+    x: i32,
+    y: i32,
+    w: i32,
+    title: []u8,
+    subtitle: []u8,
+) void {
+    let th: RayOsTheme = c.*.wm.theme;
+    softgpu_blend_round_rect_vgrad(
+        fb, x, y, w, 58, 10,
+        35, 38, 62, 26, 29, 50, 255,
+    );
+    vg_text_vec(fb, (x + 18) as f32, (y + 10) as f32, title, 17.0, 0.75,
+        th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+    vg_text_vec(fb, (x + 18) as f32, (y + 34) as f32, subtitle, 10.0, 0.55,
+        th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+}
+
+fn comp_paint_tasks(c: *Compositor, fb: *SoftFb, x: i32, y: i32, w: i32, h: i32) void {
+    let th: RayOsTheme = c.*.wm.theme;
+    comp_paint_content_header(c, fb, x, y, w, "Task Manager", "TERNARY DEADLINE SCHEDULER / LIVE STATE");
+    let metric_y: i32 = y + 70;
+    let card_w: i32 = (w - 30) / 3;
+    let mi: i32 = 0;
+    while (mi < 3) {
+        let mx: i32 = x + mi * (card_w + 8);
+        softgpu_blend_round_rect(fb, mx, metric_y, card_w, 54, 10, 255, 255, 255, 16);
+        vg_text_vec(fb, (mx + 12) as f32, (metric_y + 9) as f32,
+            comp_task_metric_label(mi), 9.0, 0.6, th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+        rayos_paint_u32(fb, (mx + 12) as f32, (metric_y + 27) as f32,
+            comp_task_metric_value(c, mi), 17.0, 0.75, th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+        mi = mi + 1;
+    }
+
+    let table_y: i32 = metric_y + 66;
+    vg_text_vec(fb, (x + 12) as f32, table_y as f32, "TASK", 9.0, 0.65,
+        th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+    vg_text_vec(fb, (x + w - 245) as f32, table_y as f32, "STATE", 9.0, 0.65,
+        th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+    vg_text_vec(fb, (x + w - 155) as f32, table_y as f32, "PRIORITY", 9.0, 0.65,
+        th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+    vg_text_vec(fb, (x + w - 65) as f32, table_y as f32, "TIME", 9.0, 0.65,
+        th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+    let row_y: i32 = table_y + 20;
+    let i: i32 = 0;
+    while (i < len[RayTask](c.*.scheduler.tasks) && row_y + 34 < y + h) {
+        let task: RayTask = get[RayTask](c.*.scheduler.tasks, i);
+        if (i % 2 == 0) {
+            softgpu_blend_round_rect(fb, x + 4, row_y, w - 8, 32, 8, 255, 255, 255, 11);
+        }
+        let running: i32 = 0;
+        if (task.state == task_running()) { running = 1; }
+        rayos_paint_status_dot(fb, (x + 16) as f32, (row_y + 16) as f32, 4.0, running, th);
+        rayos_paint_text_trunc(fb, (x + 28) as f32, (row_y + 9) as f32,
+            task.name, w - 300, 11.0, 0.58, th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+        vg_text_vec(fb, (x + w - 245) as f32, (row_y + 9) as f32,
+            comp_task_state_text(task.state), 9.0, 0.6, th.base.acc_r, th.base.acc_g, th.base.acc_b, 255);
+        rayos_paint_u32(fb, (x + w - 115) as f32, (row_y + 8) as f32,
+            (task.priority + 8) as i32, 11.0, 0.6, th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+        rayos_paint_u32(fb, (x + w - 62) as f32, (row_y + 8) as f32,
+            task.runtime as i32, 11.0, 0.6, th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+        row_y = row_y + 36;
+        i = i + 1;
+    }
+}
+
+fn comp_paint_files(c: *Compositor, fb: *SoftFb, x: i32, y: i32, w: i32, h: i32) void {
+    let th: RayOsTheme = c.*.wm.theme;
+    comp_paint_content_header(c, fb, x, y, w, "Files", "TRIFS / NATIVE T9 PAYLOADS / TRANSACTIONAL NAMESPACE");
+    let side_w: i32 = 150;
+    softgpu_blend_round_rect(fb, x, y + 66, side_w, h - 66, 10, 255, 255, 255, 12);
+    vg_text_vec(fb, (x + 16) as f32, (y + 82) as f32, "PLACES", 9.0, 0.65,
+        th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+    vg_text_vec(fb, (x + 18) as f32, (y + 112) as f32, "Home", 11.0, 0.6,
+        th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+    vg_text_vec(fb, (x + 18) as f32, (y + 144) as f32, "Documents", 11.0, 0.6,
+        th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+    vg_text_vec(fb, (x + 18) as f32, (y + 176) as f32, "Applications", 11.0, 0.6,
+        th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+    let list_x: i32 = x + side_w + 16;
+    vg_text_vec(fb, list_x as f32, (y + 78) as f32, "NAME", 9.0, 0.65,
+        th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+    vg_text_vec(fb, (x + w - 90) as f32, (y + 78) as f32, "TRYTES", 9.0, 0.65,
+        th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+    let row_y: i32 = y + 98;
+    let i: i32 = 0;
+    while (i < len[TriNode](c.*.filesystem.nodes) && row_y + 38 < y + h) {
+        let node: TriNode = get[TriNode](c.*.filesystem.nodes, i);
+        if (node.state == trifs_alive() && node.inode != trifs_root_inode()) {
+            softgpu_blend_round_rect(fb, list_x, row_y, w - side_w - 20, 36, 8, 255, 255, 255, 10);
+            let ir: i32 = th.base.acc2_r;
+            let ig: i32 = th.base.acc2_g;
+            let ib: i32 = th.base.acc2_b;
+            if (node.kind == trifs_directory()) { ir = 255; ig = 181; ib = 64; }
+            softgpu_blend_round_rect(fb, list_x + 10, row_y + 9, 20, 18, 5, ir, ig, ib, 255);
+            rayos_paint_text_trunc(fb, (list_x + 42) as f32, (row_y + 10) as f32,
+                node.name, w - side_w - 150, 11.0, 0.58,
+                th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+            rayos_paint_u32(fb, (x + w - 78) as f32, (row_y + 10) as f32,
+                node.size as i32, 10.0, 0.55, th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+            row_y = row_y + 42;
+        }
+        i = i + 1;
+    }
+}
+
+fn comp_browser_parent_tag(c: *Compositor, node: HtmlNode) []u8 {
+    if (node.parent < 0 || node.parent as i32 >= len[HtmlNode](c.*.browser_document.nodes)) { return ""; }
+    return get[HtmlNode](c.*.browser_document.nodes, node.parent as i32).tag;
+}
+
+fn comp_browser_paint_wrapped(
+    c: *Compositor,
+    fb: *SoftFb,
+    text: []u8,
+    x: i32,
+    y: i32,
+    width: i32,
+    size: f32,
+    weight: f32,
+    r: i32,
+    g: i32,
+    b: i32,
+) i32 {
+    let max_chars: i32 = (width as f32 / rayos_glyph_advance(size)) as i32;
+    if (max_chars < 1) { return y; }
+    let at: i32 = 0;
+    let line_y: i32 = y;
+    while (at < text.len) {
+        while (at < text.len && html_is_space(text[at]) == 1) { at = at + 1; }
+        if (at >= text.len) { return line_y; }
+        let end: i32 = at + max_chars;
+        if (end > text.len) { end = text.len; }
+        if (end < text.len) {
+            let split: i32 = end;
+            while (split > at && html_is_space(text[split]) == 0) { split = split - 1; }
+            if (split > at) { end = split; }
+        }
+        vg_text_vec(fb, x as f32, line_y as f32, text[at..end], size, weight, r, g, b, 255);
+        line_y = line_y + (size as i32) + 7;
+        at = end;
+    }
+    return line_y;
+}
+
+fn comp_paint_browser(c: *Compositor, fb: *SoftFb, x: i32, y: i32, w: i32, h: i32) void {
+    let th: RayOsTheme = c.*.wm.theme;
+    softgpu_blend_round_rect(fb, x, y, w, 54, 10, 31, 34, 55, 255);
+    let back: VPath = vg_path_new();
+    vg_circle(&back, (x + 24) as f32, (y + 27) as f32, 13.0);
+    vg_fill(fb, &back, 255, 255, 255, 20);
+    vg_text_vec(fb, (x + 18) as f32, (y + 18) as f32, "<", 11.0, 0.8,
+        th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+    softgpu_blend_round_rect(fb, x + 48, y + 10, w - 62, 34, 12, 255, 255, 255, 18);
+    rayos_paint_status_dot(fb, (x + 66) as f32, (y + 27) as f32, 4.0, 1, th);
+    if (c.*.browser_editing == 1) {
+        let addr: []u8 = c.*.browser_addr.data[0..c.*.browser_addr.len];
+        rayos_paint_text_trunc(fb, (x + 80) as f32, (y + 18) as f32, addr, w - 120, 11.0, 0.58,
+            th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+        let cxp: i32 = (x + 80) + ((addr.len as f32) * rayos_glyph_advance(11.0)) as i32;
+        softgpu_blend_rect(fb, cxp + 2, y + 16, 2, 18, th.base.ink_r, th.base.ink_g, th.base.ink_b, 220);
+    } else {
+        rayos_paint_text_trunc(fb, (x + 80) as f32, (y + 18) as f32, c.*.browser_url, w - 220, 11.0, 0.58,
+            th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+        rayos_paint_text_trunc(fb, (x + w - 130) as f32, (y + 18) as f32, c.*.browser_status, 118, 9.0, 0.5,
+            th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+    }
+
+    softgpu_blend_round_rect_vgrad(fb, x, y + 62, w, h - 62, 10,
+        24, 27, 45, 18, 21, 37, 255);
+    let flow_y: i32 = y + 88;
+    let i: i32 = 1;
+    while (i < len[HtmlNode](c.*.browser_document.nodes) && flow_y < y + h - 28) {
+        let node: HtmlNode = get[HtmlNode](c.*.browser_document.nodes, i);
+        if (node.kind == html_node_element() && html_equal_fold(node.tag, "hr") == 1) {
+            let line: VPath = vg_path_new();
+            vg_move_to(&line, (x + 26) as f32, flow_y as f32);
+            vg_line_to(&line, (x + w - 26) as f32, flow_y as f32);
+            vg_stroke(fb, &line, 1.0, th.base.mut_r, th.base.mut_g, th.base.mut_b, 90);
+            flow_y = flow_y + 20;
+        }
+        if (node.kind == html_node_text()) {
+            let tag: []u8 = comp_browser_parent_tag(c, node);
+            if (html_equal_fold(tag, "script") == 0 && html_equal_fold(tag, "style") == 0) {
+                let size: f32 = 13.0;
+                let weight: f32 = 0.58;
+                let rr: i32 = th.base.mut_r;
+                let rg: i32 = th.base.mut_g;
+                let rb: i32 = th.base.mut_b;
+                if (html_equal_fold(tag, "h1") == 1) {
+                    size = 25.0; weight = 1.0;
+                    rr = th.base.ink_r; rg = th.base.ink_g; rb = th.base.ink_b;
+                } else if (html_equal_fold(tag, "h2") == 1) {
+                    size = 18.0; weight = 0.8;
+                    rr = th.base.acc_r; rg = th.base.acc_g; rb = th.base.acc_b;
+                }
+                flow_y = comp_browser_paint_wrapped(
+                    c, fb, node.text, x + 28, flow_y, w - 56, size, weight, rr, rg, rb,
+                );
+                flow_y = flow_y + 8;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+
+// ── RayTerminal: the RayOS shell ─────────────────────────────────────────────
+//
+// macOS-Terminal-style core commands (pwd/cd/ls/cat/mkdir/touch/rm/mv/date/
+// uname/ps/history/...) over TriFS and the scheduler, plus RayOS-native
+// balanced-ternary and photonic commands (trit/untrit/tadd/tmul/photon/
+// chambers/devices). One session, arrow-key history recall.
+
+fn comp_term_append(c: *Compositor, s: []u8) void {
+    let i: i32 = 0;
+    while (i < s.len) {
+        push[u8](&c.*.term_buf, s[i]);
+        i = i + 1;
+    }
+}
+
+fn comp_term_println(c: *Compositor, s: []u8) void {
+    comp_term_append(c, s);
+    push[u8](&c.*.term_buf, '\n' as u8);
+}
+
+fn comp_term_input_text(c: *Compositor) []u8 {
+    return c.*.term_input.data[0..c.*.term_input.len];
+}
+
+fn comp_term_arg(line: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < line.len && line[i] != (' ' as u8)) { i = i + 1; }
+    while (i < line.len && line[i] == (' ' as u8)) { i = i + 1; }
+    return line[i..line.len];
+}
+
+fn comp_term_word(line: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < line.len && line[i] != (' ' as u8)) { i = i + 1; }
+    return line[0..i];
+}
+
+// Mark retained renders of every window with this content kind stale.
+fn comp_touch_content(c: *Compositor, content_kind: i32) void {
+    let i: i32 = 0;
+    while (i < len[RayWindow](c.*.wm.windows)) {
+        let win: RayWindow = get[RayWindow](c.*.wm.windows, i);
+        if (win.content_kind == content_kind) {
+            wm_touch(&c.*.wm, win.id);
+        }
+        i = i + 1;
+    }
+}
+
+// ── path handling ────────────────────────────────────────────────────────────
+
+fn comp_term_pwd(c: *Compositor) []u8 {
+    let cur: t27 = c.*.term_cwd;
+    if (cur == trifs_root_inode()) { return "/"; }
+    let path: []u8 = "";
+    let depth: i32 = 0;
+    while (cur != trifs_root_inode() && depth < 32) {
+        let node: TriNode = trifs_node(&c.*.filesystem, cur);
+        if (node.inode == trifs_no_inode()) { return "/"; }
+        path = _zag_str_concat("/", _zag_str_concat(node.name, path));
+        cur = node.parent;
+        depth = depth + 1;
+    }
+    return path;
+}
+
+// Resolve an absolute or cwd-relative path ("/", "..", "a/b/c"). Returns the
+// inode or trifs_no_inode().
+fn comp_term_resolve(c: *Compositor, path: []u8) t27 {
+    let cur: t27 = c.*.term_cwd;
+    let at: i32 = 0;
+    if (path.len > 0 && path[0] == ('/' as u8)) {
+        cur = trifs_root_inode();
+        at = 1;
+    }
+    while (at <= path.len) {
+        let seg_start: i32 = at;
+        while (at < path.len && path[at] != ('/' as u8)) { at = at + 1; }
+        let seg: []u8 = path[seg_start..at];
+        at = at + 1;
+        if (seg.len > 0) {
+            if (_zag_strcmp(seg, ".") == 1) {
+                // stay
+            } else if (_zag_strcmp(seg, "..") == 1) {
+                if (cur != trifs_root_inode()) {
+                    cur = trifs_node(&c.*.filesystem, cur).parent;
+                }
+            } else {
+                let next: t27 = trifs_lookup(&c.*.filesystem, cur, seg);
+                if (next < 0) { return trifs_no_inode(); }
+                cur = next;
+            }
+        }
+    }
+    return cur;
+}
+
+// ── filesystem commands ──────────────────────────────────────────────────────
+
+fn comp_term_ls(c: *Compositor, arg: []u8) void {
+    let parent: t27 = c.*.term_cwd;
+    if (arg.len > 0) {
+        parent = comp_term_resolve(c, arg);
+        if (parent == trifs_no_inode()) {
+            comp_term_println(c, "ls: no such path");
+            return;
+        }
+        let pn: TriNode = trifs_node(&c.*.filesystem, parent);
+        if (pn.kind == trifs_file()) {
+            comp_term_println(c, pn.name);
+            return;
+        }
+    }
+    let count: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[TriNode](c.*.filesystem.nodes)) {
+        let node: TriNode = get[TriNode](c.*.filesystem.nodes, i);
+        if (node.state == trifs_alive() && node.parent == parent && node.inode != parent) {
+            let line: []u8 = "f  ";
+            if (node.kind == trifs_directory()) { line = "d  "; }
+            line = _zag_str_concat(line, _zag_i64_to_str(node.size as i64));
+            line = _zag_str_concat(line, "t  ");
+            line = _zag_str_concat(line, node.name);
+            if (node.kind == trifs_directory()) {
+                line = _zag_str_concat(line, "/");
+            }
+            comp_term_println(c, line);
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    if (count == 0) {
+        comp_term_println(c, "(empty)");
+    }
+}
+
+fn comp_term_cd(c: *Compositor, arg: []u8) void {
+    if (arg.len < 1) {
+        c.*.term_cwd = trifs_root_inode();
+        return;
+    }
+    let target: t27 = comp_term_resolve(c, arg);
+    if (target == trifs_no_inode()) {
+        comp_term_println(c, "cd: no such directory");
+        return;
+    }
+    let node: TriNode = trifs_node(&c.*.filesystem, target);
+    if (node.kind != trifs_directory() && target != trifs_root_inode()) {
+        comp_term_println(c, "cd: not a directory");
+        return;
+    }
+    c.*.term_cwd = target;
+}
+
+fn comp_term_cat(c: *Compositor, arg: []u8) void {
+    if (arg.len < 1) {
+        comp_term_println(c, "usage: cat <file>");
+        return;
+    }
+    let inode: t27 = comp_term_resolve(c, arg);
+    if (inode == trifs_no_inode()) {
+        comp_term_println(c, "cat: no such file");
+        return;
+    }
+    let node: TriNode = trifs_node(&c.*.filesystem, inode);
+    if (node.kind != trifs_file()) {
+        comp_term_println(c, "cat: is a directory");
+        return;
+    }
+    if (node.size < 1) {
+        comp_term_println(c, "(empty file)");
+        return;
+    }
+    let i: t27 = 0;
+    while (i < node.size) {
+        let unit: t9 = 0;
+        if (trifs_read_unit(&c.*.filesystem, inode, i, &unit) == trifs_ok()) {
+            let v: i32 = unit as i32;
+            if (v == 10 || (v >= 32 && v <= 126)) {
+                push[u8](&c.*.term_buf, v as u8);
+            } else {
+                push[u8](&c.*.term_buf, '?' as u8);
+            }
+        }
+        i = i + 1;
+    }
+    push[u8](&c.*.term_buf, '\n' as u8);
+}
+
+fn comp_term_make(c: *Compositor, name: []u8, kind: t9) void {
+    if (name.len < 1) {
+        comp_term_println(c, "usage: mkdir|touch <name>");
+        return;
+    }
+    let _tx: i32 = trifs_begin(&c.*.filesystem, c.*.filesystem_task);
+    let made: t27 = trifs_create(&c.*.filesystem, c.*.filesystem_task, c.*.term_cwd, name, kind);
+    let _cm: i32 = trifs_commit(&c.*.filesystem, c.*.filesystem_task);
+    if (made < 0) {
+        comp_term_println(c, "error: exists or invalid name");
+        return;
+    }
+    comp_touch_content(c, wm_content_files());
+}
+
+fn comp_term_write(c: *Compositor, arg: []u8) void {
+    let name: []u8 = comp_term_word(arg);
+    let text: []u8 = comp_term_arg(arg);
+    if (name.len < 1) {
+        comp_term_println(c, "usage: write <file> <text>");
+        return;
+    }
+    let _tx: i32 = trifs_begin(&c.*.filesystem, c.*.filesystem_task);
+    let inode: t27 = trifs_lookup(&c.*.filesystem, c.*.term_cwd, name);
+    if (inode < 0) {
+        inode = trifs_create(&c.*.filesystem, c.*.filesystem_task, c.*.term_cwd, name, trifs_file());
+    }
+    if (inode < 0) {
+        let _cm0: i32 = trifs_commit(&c.*.filesystem, c.*.filesystem_task);
+        comp_term_println(c, "write: cannot create file");
+        return;
+    }
+    let payload: ArrayList[t9] = make[t9](text.len + 1);
+    let i: i32 = 0;
+    while (i < text.len) {
+        push[t9](&payload, text[i] as t9);
+        i = i + 1;
+    }
+    let rc: i32 = trifs_write(&c.*.filesystem, c.*.filesystem_task, inode, 0, &payload);
+    let _cm: i32 = trifs_commit(&c.*.filesystem, c.*.filesystem_task);
+    free[t9](&payload);
+    if (rc < 0) {
+        comp_term_println(c, "write: failed");
+        return;
+    }
+    comp_term_println(c, _zag_str_concat(_zag_i64_to_str(rc as i64), " trytes written"));
+    comp_touch_content(c, wm_content_files());
+}
+
+fn comp_term_rm(c: *Compositor, arg: []u8) void {
+    if (arg.len < 1) {
+        comp_term_println(c, "usage: rm <name>");
+        return;
+    }
+    let inode: t27 = comp_term_resolve(c, arg);
+    if (inode == trifs_no_inode()) {
+        comp_term_println(c, "rm: no such file or directory");
+        return;
+    }
+    let _tx: i32 = trifs_begin(&c.*.filesystem, c.*.filesystem_task);
+    let rc: i32 = trifs_unlink(&c.*.filesystem, c.*.filesystem_task, inode);
+    let _cm: i32 = trifs_commit(&c.*.filesystem, c.*.filesystem_task);
+    if (rc == trifs_err_not_empty()) {
+        comp_term_println(c, "rm: directory not empty");
+        return;
+    }
+    if (rc != trifs_ok()) {
+        comp_term_println(c, "rm: failed");
+        return;
+    }
+    comp_touch_content(c, wm_content_files());
+}
+
+fn comp_term_mv(c: *Compositor, arg: []u8) void {
+    let old: []u8 = comp_term_word(arg);
+    let newname: []u8 = comp_term_arg(arg);
+    if (old.len < 1 || newname.len < 1) {
+        comp_term_println(c, "usage: mv <old> <new>");
+        return;
+    }
+    let inode: t27 = comp_term_resolve(c, old);
+    if (inode == trifs_no_inode()) {
+        comp_term_println(c, "mv: no such file or directory");
+        return;
+    }
+    let _tx: i32 = trifs_begin(&c.*.filesystem, c.*.filesystem_task);
+    let rc: i32 = trifs_rename(&c.*.filesystem, c.*.filesystem_task, inode, c.*.term_cwd, newname);
+    let _cm: i32 = trifs_commit(&c.*.filesystem, c.*.filesystem_task);
+    if (rc != trifs_ok()) {
+        comp_term_println(c, "mv: failed");
+        return;
+    }
+    comp_touch_content(c, wm_content_files());
+}
+
+// ── system commands ──────────────────────────────────────────────────────────
+
+fn comp_term_pad2(v: i64) []u8 {
+    if (v < 10) {
+        return _zag_str_concat("0", _zag_i64_to_str(v));
+    }
+    return _zag_i64_to_str(v);
+}
+
+// Gregorian date from epoch days (Hinnant civil_from_days).
+fn comp_term_date(c: *Compositor) void {
+    let epoch: i64 = rtc_now_epoch() + rtc_utc_offset_secs(rtc_now_epoch());
+    let days: i64 = epoch / 86400;
+    let secs: i64 = epoch % 86400;
+    let z: i64 = days + 719468;
+    let era: i64 = z / 146097;
+    if (z < 0) { era = (z - 146096) / 146097; }
+    let doe: i64 = z - era * 146097;
+    let yoe: i64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y: i64 = yoe + era * 400;
+    let doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp: i64 = (5 * doy + 2) / 153;
+    let d: i64 = doy - (153 * mp + 2) / 5 + 1;
+    let m: i64 = mp + 3;
+    if (mp >= 10) { m = mp - 9; }
+    if (m <= 2) { y = y + 1; }
+    let line: []u8 = _zag_i64_to_str(y);
+    line = _zag_str_concat(line, "-");
+    line = _zag_str_concat(line, comp_term_pad2(m));
+    line = _zag_str_concat(line, "-");
+    line = _zag_str_concat(line, comp_term_pad2(d));
+    line = _zag_str_concat(line, " ");
+    line = _zag_str_concat(line, comp_term_pad2(secs / 3600));
+    line = _zag_str_concat(line, ":");
+    line = _zag_str_concat(line, comp_term_pad2((secs / 60) % 60));
+    line = _zag_str_concat(line, ":");
+    line = _zag_str_concat(line, comp_term_pad2(secs % 60));
+    comp_term_println(c, line);
+}
+
+fn comp_term_ps(c: *Compositor) void {
+    comp_term_println(c, "TASK        STATE     PRIO  RUNTIME");
+    let i: i32 = 0;
+    while (i < len[RayTask](c.*.scheduler.tasks)) {
+        let task: RayTask = get[RayTask](c.*.scheduler.tasks, i);
+        let line: []u8 = task.name;
+        let padn: i32 = 12 - task.name.len;
+        while (padn > 0) { line = _zag_str_concat(line, " "); padn = padn - 1; }
+        line = _zag_str_concat(line, comp_task_state_text(task.state));
+        line = _zag_str_concat(line, "   ");
+        line = _zag_str_concat(line, _zag_i64_to_str((task.priority + 8) as i64));
+        line = _zag_str_concat(line, "   ");
+        line = _zag_str_concat(line, _zag_i64_to_str(task.runtime as i64));
+        comp_term_println(c, line);
+        i = i + 1;
+    }
+}
+
+fn comp_term_top(c: *Compositor) void {
+    let hdr: []u8 = "runnable ";
+    hdr = _zag_str_concat(hdr, _zag_i64_to_str(scheduler_runnable_count(&c.*.scheduler) as i64));
+    hdr = _zag_str_concat(hdr, "  dispatches ");
+    hdr = _zag_str_concat(hdr, _zag_i64_to_str(c.*.scheduler.dispatches as i64));
+    hdr = _zag_str_concat(hdr, "  epoch ");
+    hdr = _zag_str_concat(hdr, _zag_i64_to_str(c.*.scheduler.clock as i64));
+    comp_term_println(c, hdr);
+    comp_term_ps(c);
+}
+
+fn comp_term_devices(c: *Compositor) void {
+    c.*.devices_report = device_manager_scan();
+    let n: i32 = sysbus_line_count(c.*.devices_report);
+    let i: i32 = 0;
+    while (i < n) {
+        let full: []u8 = sysbus_line_at(c.*.devices_report, i);
+        if (full.len > 0) {
+            let line: []u8 = comp_devices_field(full, 0);
+            line = _zag_str_concat(line, "  ");
+            line = _zag_str_concat(line, comp_devices_field(full, 1));
+            line = _zag_str_concat(line, "  [");
+            line = _zag_str_concat(line, comp_devices_field(full, 3));
+            line = _zag_str_concat(line, "]");
+            comp_term_println(c, line);
+        }
+        i = i + 1;
+    }
+}
+
+fn comp_term_history(c: *Compositor) void {
+    let hist: []u8 = c.*.term_hist.data[0..c.*.term_hist.len];
+    let n: i32 = sysbus_line_count(hist);
+    let i: i32 = 0;
+    while (i < n) {
+        let line: []u8 = sysbus_line_at(hist, i);
+        if (line.len > 0) {
+            comp_term_append(c, "  ");
+            comp_term_append(c, _zag_i64_to_str((i + 1) as i64));
+            comp_term_append(c, "  ");
+            comp_term_println(c, line);
+        }
+        i = i + 1;
+    }
+}
+
+// ── balanced-ternary / photonic commands ─────────────────────────────────────
+
+// Balanced-ternary digits of v, most significant first ('1', '0', 'T').
+fn comp_term_trits_of(v: i64) []u8 {
+    if (v == 0) { return "0"; }
+    let out: []u8 = "";
+    let n: i64 = v;
+    while (n != 0) {
+        let r: i64 = ((n % 3) + 3) % 3;
+        if (r == 2) {
+            out = _zag_str_concat("T", out);
+            n = (n + 1) / 3;
+        } else if (r == 1) {
+            out = _zag_str_concat("1", out);
+            n = (n - 1) / 3;
+        } else {
+            out = _zag_str_concat("0", out);
+            n = n / 3;
+        }
+    }
+    return out;
+}
+
+fn comp_term_trit_width_name(digits: i32) []u8 {
+    if (digits <= 9) { return "t9"; }
+    if (digits <= 27) { return "t27"; }
+    return "wide";
+}
+
+fn comp_term_trit(c: *Compositor, arg: []u8) void {
+    if (arg.len < 1) {
+        comp_term_println(c, "usage: trit <decimal>   (1/0/T digits, LSB last)");
+        return;
+    }
+    let v: i64 = _zag_str_to_i64(arg);
+    let tr: []u8 = comp_term_trits_of(v);
+    let line: []u8 = _zag_i64_to_str(v);
+    line = _zag_str_concat(line, " = ");
+    line = _zag_str_concat(line, tr);
+    line = _zag_str_concat(line, "  (");
+    line = _zag_str_concat(line, _zag_i64_to_str(tr.len as i64));
+    line = _zag_str_concat(line, " trits, ");
+    line = _zag_str_concat(line, comp_term_trit_width_name(tr.len));
+    line = _zag_str_concat(line, ")");
+    comp_term_println(c, line);
+}
+
+fn comp_term_untrit(c: *Compositor, arg: []u8) void {
+    if (arg.len < 1) {
+        comp_term_println(c, "usage: untrit <trits>   e.g. untrit 1TT0");
+        return;
+    }
+    let v: i64 = 0;
+    let i: i32 = 0;
+    while (i < arg.len) {
+        let ch: u8 = arg[i];
+        if (ch == ('1' as u8) || ch == ('+' as u8)) {
+            v = v * 3 + 1;
+        } else if (ch == ('T' as u8) || ch == ('t' as u8) || ch == ('-' as u8)) {
+            v = v * 3 - 1;
+        } else if (ch == ('0' as u8)) {
+            v = v * 3;
+        } else {
+            comp_term_println(c, "untrit: digits are 1, 0, T");
+            return;
+        }
+        i = i + 1;
+    }
+    let line: []u8 = arg;
+    line = _zag_str_concat(line, " = ");
+    line = _zag_str_concat(line, _zag_i64_to_str(v));
+    comp_term_println(c, line);
+}
+
+fn comp_term_trit_math(c: *Compositor, arg: []u8, mul: i32) void {
+    let a_str: []u8 = comp_term_word(arg);
+    let b_str: []u8 = comp_term_arg(arg);
+    if (a_str.len < 1 || b_str.len < 1) {
+        comp_term_println(c, "usage: tadd|tmul <a> <b>");
+        return;
+    }
+    let a: i64 = _zag_str_to_i64(a_str);
+    let b: i64 = _zag_str_to_i64(b_str);
+    let r: i64 = a + b;
+    let op: []u8 = " + ";
+    if (mul == 1) { r = a * b; op = " * "; }
+    let line: []u8 = comp_term_trits_of(a);
+    line = _zag_str_concat(line, op);
+    line = _zag_str_concat(line, comp_term_trits_of(b));
+    line = _zag_str_concat(line, " = ");
+    line = _zag_str_concat(line, comp_term_trits_of(r));
+    line = _zag_str_concat(line, "  (");
+    line = _zag_str_concat(line, _zag_i64_to_str(r));
+    line = _zag_str_concat(line, ")");
+    comp_term_println(c, line);
+}
+
+fn comp_term_photon(c: *Compositor) void {
+    comp_term_println(c, "photonic fabric");
+    let line: []u8 = "  soh lattice   ";
+    line = _zag_str_concat(line, _zag_i64_to_str(RAYOS_SOH_MMIO_TILES_X() as i64));
+    line = _zag_str_concat(line, " x ");
+    line = _zag_str_concat(line, _zag_i64_to_str(RAYOS_SOH_MMIO_TILES_Y() as i64));
+    line = _zag_str_concat(line, " tiles @ ");
+    line = _zag_str_concat(line, comp_term_hex32(RAYOS_SOH_MMIO_BASE()));
+    comp_term_println(c, line);
+    let cap: i64 = (RAYOS_SOH_MMIO_TILES_X() as i64) * (RAYOS_SOH_MMIO_TILES_Y() as i64) * 64;
+    comp_term_println(c, _zag_str_concat("  soh capacity  ",
+        _zag_str_concat(_zag_i64_to_str(cap), " trits")));
+    comp_term_println(c, "  polarization  H = -1   split = 0   V = +1");
+    let sc: []u8 = "  scanout       ";
+    sc = _zag_str_concat(sc, _zag_i64_to_str(mmio_read32(RAYOS_SCANOUT_MMIO_BASE()) as i64));
+    sc = _zag_str_concat(sc, " x ");
+    sc = _zag_str_concat(sc, _zag_i64_to_str(mmio_read32(RAYOS_SCANOUT_MMIO_BASE() + 4) as i64));
+    sc = _zag_str_concat(sc, " chamber frame ");
+    sc = _zag_str_concat(sc, _zag_i64_to_str(scanout_frame_seq() as i64));
+    comp_term_println(c, sc);
+}
+
+fn comp_term_hex_digit(v: i64) []u8 {
+    if (v == 10) { return "A"; }
+    if (v == 11) { return "B"; }
+    if (v == 12) { return "C"; }
+    if (v == 13) { return "D"; }
+    if (v == 14) { return "E"; }
+    if (v == 15) { return "F"; }
+    return _zag_i64_to_str(v);
+}
+
+fn comp_term_hex32(v: i64) []u8 {
+    let out: []u8 = "";
+    let i: i32 = 0;
+    let n: i64 = v;
+    while (i < 8) {
+        out = _zag_str_concat(comp_term_hex_digit(((n % 16) + 16) % 16), out);
+        n = n / 16;
+        i = i + 1;
+    }
+    return _zag_str_concat("0x", out);
+}
+
+fn comp_term_chamber_line(c: *Compositor, name: []u8, base: i64, live: i32) void {
+    let line: []u8 = "  ";
+    line = _zag_str_concat(line, name);
+    let padn: i32 = 10 - name.len;
+    while (padn > 0) { line = _zag_str_concat(line, " "); padn = padn - 1; }
+    line = _zag_str_concat(line, comp_term_hex32(base));
+    if (live == 1) {
+        line = _zag_str_concat(line, "  online");
+    } else {
+        line = _zag_str_concat(line, "  idle");
+    }
+    comp_term_println(c, line);
+}
+
+fn comp_term_chambers(c: *Compositor) void {
+    comp_term_println(c, "MMIO chambers (64 KiB window @ 0xE0000000)");
+    let disp: i32 = 0;
+    if (mmio_read32(RAYOS_SCANOUT_MMIO_BASE()) == 1280) { disp = 1; }
+    comp_term_chamber_line(c, "scanout", RAYOS_SCANOUT_MMIO_BASE(), disp);
+    let inp: i32 = 0;
+    if (mmio_read32(RAYOS_INPUT_MMIO_BASE() + 8) == 64) { inp = 1; }
+    comp_term_chamber_line(c, "input", RAYOS_INPUT_MMIO_BASE(), inp);
+    let dev: i32 = 0;
+    if (mmio_read32(RAYOS_DEVICE_MMIO_BASE()) == DEVICE_CHAMBER_MAGIC()) { dev = 1; }
+    comp_term_chamber_line(c, "devices", RAYOS_DEVICE_MMIO_BASE(), dev);
+    let rtcv: i32 = 0;
+    if (mmio_read32(RAYOS_RTC_MMIO_BASE()) == RTC_CHAMBER_MAGIC()) { rtcv = 1; }
+    comp_term_chamber_line(c, "rtc", RAYOS_RTC_MMIO_BASE(), rtcv);
+    comp_term_chamber_line(c, "soh", RAYOS_SOH_MMIO_BASE(), 1);
+    let backend: []u8 = "  backend   host bootstrap (sim window)";
+    if (hw_rt_backend_host() == 0) {
+        backend = "  backend   native /dev/mem trap";
+    }
+    comp_term_println(c, backend);
+}
+
+// ── dispatcher ───────────────────────────────────────────────────────────────
+
+fn comp_term_net(c: *Compositor) void {
+    let up: i32 = net_chamber_link_up();
+    if (up == 1) {
+        comp_term_println(c, "link      up");
+    } else {
+        comp_term_println(c, "link      idle (no active socket)");
+    }
+    comp_term_println(c, _zag_str_concat("nameserver ", net_ip_str(net_nameserver())));
+    comp_term_println(c, _zag_str_concat("tx bytes  ", _zag_i64_to_str(net_chamber_tx_bytes())));
+    comp_term_println(c, _zag_str_concat("rx bytes  ", _zag_i64_to_str(net_chamber_rx_bytes())));
+    let backend: []u8 = "backend   host socket data plane";
+    if (hw_rt_backend_host() == 0) { backend = "backend   native NIC offload"; }
+    comp_term_println(c, backend);
+}
+
+fn comp_term_dns(c: *Compositor, arg: []u8) void {
+    if (arg.len < 1) { comp_term_println(c, "usage: dns <host>"); return; }
+    let ip: i64 = net_dns_resolve(arg);
+    if (ip < 0) {
+        comp_term_println(c, "dns: resolution failed");
+        return;
+    }
+    comp_term_println(c, _zag_str_concat(arg, _zag_str_concat("  ", net_ip_str(ip))));
+}
+
+fn comp_term_curl(c: *Compositor, arg: []u8) void {
+    if (arg.len < 1) { comp_term_println(c, "usage: curl <url>"); return; }
+    let url: []u8 = arg;
+    if (sysbus_contains(url, "://") == 0) { url = _zag_str_concat("http://", url); }
+    let r: HttpResponse = http_get(url);
+    if (r.ok == 0) {
+        comp_term_println(c, _zag_str_concat("curl: ", r.error));
+        return;
+    }
+    comp_term_println(c, _zag_str_concat("HTTP ", _zag_i64_to_str(r.status as i64)));
+    comp_term_println(c, _zag_str_concat("  ", _zag_str_concat(
+        _zag_i64_to_str(r.body.len as i64), " bytes body")));
+    // print the first up-to-8 lines of the body
+    let shown: i32 = 0;
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i <= r.body.len && shown < 8) {
+        if (i == r.body.len || r.body[i] == ('\n' as u8)) {
+            let line: []u8 = r.body[start..i];
+            if (line.len > 120) { line = line[0..120]; }
+            if (line.len > 0) {
+                comp_term_println(c, line);
+                shown = shown + 1;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn comp_term_open(c: *Compositor, arg: []u8) void {
+    if (arg.len < 1) { comp_term_println(c, "usage: open <url>"); return; }
+    let code: i32 = comp_browser_load(c, arg);
+    if (code < 0) {
+        comp_term_println(c, _zag_str_concat("open: ", c.*.browser_status));
+        return;
+    }
+    comp_term_println(c, _zag_str_concat("loaded ", c.*.browser_url));
+    comp_term_println(c, _zag_str_concat("  ", c.*.browser_status));
+}
+
+fn comp_term_exec(c: *Compositor, line: []u8) void {
+    comp_term_append(c, comp_term_prompt(c));
+    comp_term_println(c, line);
+    let cmd: []u8 = comp_term_word(line);
+    let arg: []u8 = comp_term_arg(line);
+    if (cmd.len < 1) { return; }
+    if (_zag_strcmp(cmd, "help") == 1) {
+        comp_term_println(c, "files:   pwd cd ls cat mkdir touch write rm mv");
+        comp_term_println(c, "system:  date uname whoami hostname ps top uptime history clear echo");
+        comp_term_println(c, "network: net dns curl fetch open <url>");
+        comp_term_println(c, "ternary: trit untrit tadd tmul photon chambers devices about");
+        return;
+    }
+    if (_zag_strcmp(cmd, "about") == 1) {
+        comp_term_println(c, "RayOS / RayTerminal");
+        comp_term_println(c, "balanced-ternary OS on a photonic fabric, written in Flash.");
+        comp_term_println(c, "t9/t27 deadline scheduler, TriFS trit payloads, chamber MMIO.");
+        return;
+    }
+    if (_zag_strcmp(cmd, "pwd") == 1) { comp_term_println(c, comp_term_pwd(c)); return; }
+    if (_zag_strcmp(cmd, "cd") == 1) { comp_term_cd(c, arg); return; }
+    if (_zag_strcmp(cmd, "ls") == 1) { comp_term_ls(c, arg); return; }
+    if (_zag_strcmp(cmd, "cat") == 1) { comp_term_cat(c, arg); return; }
+    if (_zag_strcmp(cmd, "mkdir") == 1) { comp_term_make(c, arg, trifs_directory()); return; }
+    if (_zag_strcmp(cmd, "touch") == 1) { comp_term_make(c, arg, trifs_file()); return; }
+    if (_zag_strcmp(cmd, "write") == 1) { comp_term_write(c, arg); return; }
+    if (_zag_strcmp(cmd, "rm") == 1) { comp_term_rm(c, arg); return; }
+    if (_zag_strcmp(cmd, "mv") == 1) { comp_term_mv(c, arg); return; }
+    if (_zag_strcmp(cmd, "date") == 1) { comp_term_date(c); return; }
+    if (_zag_strcmp(cmd, "time") == 1) { comp_term_date(c); return; }
+    if (_zag_strcmp(cmd, "uname") == 1) {
+        comp_term_println(c, "RayOS ternary-1 t27 photonic (Flash native)");
+        return;
+    }
+    if (_zag_strcmp(cmd, "whoami") == 1) { comp_term_println(c, "ray"); return; }
+    if (_zag_strcmp(cmd, "hostname") == 1) { comp_term_println(c, "rayos"); return; }
+    if (_zag_strcmp(cmd, "ps") == 1) { comp_term_ps(c); return; }
+    if (_zag_strcmp(cmd, "tasks") == 1) { comp_term_ps(c); return; }
+    if (_zag_strcmp(cmd, "top") == 1) { comp_term_top(c); return; }
+    if (_zag_strcmp(cmd, "uptime") == 1) {
+        comp_term_println(c, _zag_str_concat(
+            _zag_i64_to_str(c.*.scheduler.clock as i64), " scheduler epochs"));
+        return;
+    }
+    if (_zag_strcmp(cmd, "history") == 1) { comp_term_history(c); return; }
+    if (_zag_strcmp(cmd, "devices") == 1) { comp_term_devices(c); return; }
+    if (_zag_strcmp(cmd, "net") == 1) { comp_term_net(c); return; }
+    if (_zag_strcmp(cmd, "dns") == 1) { comp_term_dns(c, arg); return; }
+    if (_zag_strcmp(cmd, "curl") == 1) { comp_term_curl(c, arg); return; }
+    if (_zag_strcmp(cmd, "fetch") == 1) { comp_term_curl(c, arg); return; }
+    if (_zag_strcmp(cmd, "open") == 1) { comp_term_open(c, arg); return; }
+    if (_zag_strcmp(cmd, "echo") == 1) { comp_term_println(c, arg); return; }
+    if (_zag_strcmp(cmd, "clear") == 1) { c.*.term_buf.len = 0; return; }
+    if (_zag_strcmp(cmd, "trit") == 1) { comp_term_trit(c, arg); return; }
+    if (_zag_strcmp(cmd, "untrit") == 1) { comp_term_untrit(c, arg); return; }
+    if (_zag_strcmp(cmd, "tadd") == 1) { comp_term_trit_math(c, arg, 0); return; }
+    if (_zag_strcmp(cmd, "tmul") == 1) { comp_term_trit_math(c, arg, 1); return; }
+    if (_zag_strcmp(cmd, "photon") == 1) { comp_term_photon(c); return; }
+    if (_zag_strcmp(cmd, "chambers") == 1) { comp_term_chambers(c); return; }
+    comp_term_println(c, _zag_str_concat(cmd, ": command not found (try help)"));
+}
+
+fn comp_term_prompt(c: *Compositor) []u8 {
+    let p: []u8 = "ray:";
+    p = _zag_str_concat(p, comp_term_pwd(c));
+    return _zag_str_concat(p, "$ ");
+}
+
+fn comp_term_hist_count(c: *Compositor) i32 {
+    return sysbus_line_count(c.*.term_hist.data[0..c.*.term_hist.len]);
+}
+
+fn comp_term_set_input(c: *Compositor, s: []u8) void {
+    c.*.term_input.len = 0;
+    let i: i32 = 0;
+    while (i < s.len) {
+        push[u8](&c.*.term_input, s[i]);
+        i = i + 1;
+    }
+}
+
+// Key input for the terminal. Returns 1 when handled.
+fn comp_term_key(c: *Compositor, code: i32) i32 {
+    if (code >= 32 && code <= 126) {
+        push[u8](&c.*.term_input, code as u8);
+        c.*.term_hist_pos = -1;
+        return 1;
+    }
+    if (code == 8) {
+        if (c.*.term_input.len > 0) {
+            c.*.term_input.len = c.*.term_input.len - 1;
+        }
+        return 1;
+    }
+    if (code == 130) {
+        // Up: recall older command
+        let n: i32 = comp_term_hist_count(c);
+        if (n < 1) { return 1; }
+        if (c.*.term_hist_pos < 0) {
+            c.*.term_hist_pos = n - 1;
+        } else if (c.*.term_hist_pos > 0) {
+            c.*.term_hist_pos = c.*.term_hist_pos - 1;
+        }
+        comp_term_set_input(c, sysbus_line_at(
+            c.*.term_hist.data[0..c.*.term_hist.len], c.*.term_hist_pos));
+        return 1;
+    }
+    if (code == 131) {
+        // Down: toward the live line
+        let n2: i32 = comp_term_hist_count(c);
+        if (c.*.term_hist_pos < 0) { return 1; }
+        c.*.term_hist_pos = c.*.term_hist_pos + 1;
+        if (c.*.term_hist_pos >= n2) {
+            c.*.term_hist_pos = -1;
+            c.*.term_input.len = 0;
+            return 1;
+        }
+        comp_term_set_input(c, sysbus_line_at(
+            c.*.term_hist.data[0..c.*.term_hist.len], c.*.term_hist_pos));
+        return 1;
+    }
+    if (code == 10) {
+        let line: []u8 = _zag_strdup(comp_term_input_text(c));
+        c.*.term_input.len = 0;
+        c.*.term_hist_pos = -1;
+        if (line.len > 0) {
+            let i: i32 = 0;
+            while (i < line.len) {
+                push[u8](&c.*.term_hist, line[i]);
+                i = i + 1;
+            }
+            push[u8](&c.*.term_hist, '\n' as u8);
+        }
+        comp_term_exec(c, line);
+        return 1;
+    }
+    return 0;
+}
+
+fn comp_paint_terminal(c: *Compositor, fb: *SoftFb, x: i32, y: i32, w: i32, h: i32) void {
+    let th: RayOsTheme = c.*.wm.theme;
+    softgpu_blend_round_rect(fb, x, y, w, h, 8, 14, 18, 22, 255);
+
+    let line_h: i32 = 16;
+    let rows: i32 = (h - 20) / line_h;
+    if (rows < 2) { return; }
+    let body_rows: i32 = rows - 1;
+
+    // collect the tail of the scrollback: find start offsets of the last
+    // body_rows lines
+    let buf: []u8 = c.*.term_buf.data[0..c.*.term_buf.len];
+    let total_lines: i32 = 0;
+    let i: i32 = 0;
+    while (i < buf.len) {
+        if (buf[i] == ('\n' as u8)) { total_lines = total_lines + 1; }
+        i = i + 1;
+    }
+    let skip: i32 = total_lines - body_rows;
+    if (skip < 0) { skip = 0; }
+
+    let row: i32 = 0;
+    let seen: i32 = 0;
+    let start: i32 = 0;
+    i = 0;
+    while (i < buf.len && row < body_rows) {
+        if (buf[i] == ('\n' as u8)) {
+            if (seen >= skip) {
+                rayos_paint_text_trunc(fb, (x + 10) as f32, (y + 10 + row * line_h) as f32,
+                    buf[start..i], w - 20, 10.0, 0.55, 168, 230, 190, 255);
+                row = row + 1;
+            }
+            seen = seen + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+
+    // prompt line with block cursor
+    let py: i32 = y + 10 + row * line_h;
+    let prompt: []u8 = comp_term_prompt(c);
+    vg_text_vec(fb, (x + 10) as f32, py as f32, prompt, 10.0, 0.7, 92, 255, 160, 255);
+    let px2: i32 = x + 10 + ((prompt.len as f32) * rayos_glyph_advance(10.0)) as i32 + 4;
+    let input: []u8 = comp_term_input_text(c);
+    rayos_paint_text_trunc(fb, px2 as f32, py as f32, input, w - (px2 - x) - 20, 10.0, 0.55, 235, 240, 238, 255);
+    let cx2: i32 = px2 + ((input.len as f32) * rayos_glyph_advance(10.0)) as i32;
+    softgpu_blend_rect(fb, cx2 + 2, py - 1, 7, 13, 120, 255, 170, 220);
+}
+
+fn comp_devices_bus_color(bus: []u8, th: RayOsTheme) i32 {
+    // packed r*65536+g*256+b for the bus chip
+    if (sysbus_contains(bus, "HDMI") == 1) { return 235 * 65536 + 120 * 256 + 90; }
+    if (sysbus_contains(bus, "DISPLAYPORT") == 1) { return 90 * 65536 + 170 * 256 + 235; }
+    if (sysbus_contains(bus, "WIFI") == 1) { return 120 * 65536 + 220 * 256 + 160; }
+    if (sysbus_contains(bus, "ETHERNET") == 1) { return 200 * 65536 + 180 * 256 + 90; }
+    if (sysbus_contains(bus, "THUNDERBOLT") == 1) { return 210 * 65536 + 130 * 256 + 240; }
+    if (sysbus_contains(bus, "USB-C") == 1) { return 130 * 65536 + 220 * 256 + 230; }
+    if (sysbus_contains(bus, "AUDIO") == 1) { return 240 * 65536 + 200 * 256 + 120; }
+    if (sysbus_contains(bus, "MIDI") == 1) { return 235 * 65536 + 140 * 256 + 200; }
+    return th.base.acc2_r * 65536 + th.base.acc2_g * 256 + th.base.acc2_b;
+}
+
+fn comp_devices_field(line: []u8, idx: i32) []u8 {
+    let field: i32 = 0;
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i <= line.len) {
+        if (i == line.len || line[i] == ('|' as u8)) {
+            if (field == idx) { return line[start..i]; }
+            field = field + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn comp_paint_devices(c: *Compositor, fb: *SoftFb, x: i32, y: i32, w: i32, h: i32) void {
+    let th: RayOsTheme = c.*.wm.theme;
+    comp_paint_content_header(c, fb, x, y, w, "Devices", "LIVE BUS TOPOLOGY / HOTPLUG STATE");
+    let report: []u8 = c.*.devices_report;
+    let n: i32 = sysbus_line_count(report);
+    let row_y: i32 = y + 70;
+    let i: i32 = 0;
+    while (i < n && row_y + 30 < y + h) {
+        let line: []u8 = comp_devices_field(sysbus_line_at(report, i), 0);
+        let full: []u8 = sysbus_line_at(report, i);
+        if (full.len > 0) {
+            let bus: []u8 = comp_devices_field(full, 0);
+            let name: []u8 = comp_devices_field(full, 1);
+            let detail: []u8 = comp_devices_field(full, 2);
+            let state: []u8 = comp_devices_field(full, 3);
+            softgpu_blend_round_rect(fb, x, row_y, w, 26, 7, 255, 255, 255, 10);
+            // status dot: green when live
+            let on: i32 = 0;
+            if (sysbus_contains(state, "up") == 1) { on = 1; }
+            if (sysbus_contains(state, "connected") == 1 && sysbus_contains(state, "dis") == 0) { on = 1; }
+            if (sysbus_contains(state, "attached") == 1) { on = 1; }
+            if (sysbus_contains(state, "online") == 1) { on = 1; }
+            rayos_paint_status_dot(fb, (x + 12) as f32, (row_y + 13) as f32, 4.0, on, th);
+            // bus chip
+            let packed: i32 = comp_devices_bus_color(bus, th);
+            let cw2: i32 = (bus.len * 8) + 12;
+            softgpu_blend_round_rect(fb, x + 24, row_y + 5, cw2, 16, 6,
+                packed / 65536, (packed / 256) % 256, packed % 256, 60);
+            vg_text_vec(fb, (x + 30) as f32, (row_y + 8) as f32, bus, 8.0, 0.6,
+                packed / 65536, (packed / 256) % 256, packed % 256, 255);
+            rayos_paint_text_trunc(fb, (x + 150) as f32, (row_y + 7) as f32,
+                name, w - 470, 10.0, 0.58, th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+            rayos_paint_text_trunc(fb, (x + w - 320) as f32, (row_y + 8) as f32,
+                detail, 230, 9.0, 0.5, th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+            rayos_paint_text_trunc(fb, (x + w - 92) as f32, (row_y + 8) as f32,
+                state, 90, 9.0, 0.55, th.base.acc_r, th.base.acc_g, th.base.acc_b, 255);
+            let _l: []u8 = line;
+            row_y = row_y + 30;
+        }
+        i = i + 1;
+    }
+}
+
+
+// Keyboard editing for the browser address bar. Returns 1 when handled.
+fn comp_browser_key(c: *Compositor, code: i32) i32 {
+    if (code == 27) {                 // Escape: cancel editing
+        c.*.browser_editing = 0;
+        return 1;
+    }
+    if (code == 10) {                 // Enter: navigate
+        let url: []u8 = _zag_strdup(c.*.browser_addr.data[0..c.*.browser_addr.len]);
+        c.*.browser_editing = 0;
+        if (url.len > 0) { let _r: i32 = comp_browser_load(c, url); }
+        return 1;
+    }
+    if (code == 8) {                  // Backspace
+        if (c.*.browser_editing == 0) { return 1; }
+        if (c.*.browser_addr.len > 0) { c.*.browser_addr.len = c.*.browser_addr.len - 1; }
+        return 1;
+    }
+    if (code >= 32 && code <= 126) {
+        if (c.*.browser_editing == 0) {
+            c.*.browser_editing = 1;
+            c.*.browser_addr.len = 0;   // first keystroke starts a fresh URL
+        }
+        push[u8](&c.*.browser_addr, code as u8);
+        return 1;
+    }
+    return 0;
+}
+
+// Paint window content into the retained cache buffer (window at origin).
+// Load a URL into Ray Browser: fetch over the network stack, reparse the
+// body through the bounded HTML tokenizer, and replace the live document.
+fn comp_browser_load(c: *Compositor, url: []u8) i32 {
+    let full: []u8 = url;
+    if (sysbus_contains(url, "://") == 0) {
+        full = _zag_str_concat("http://", url);
+    }
+    let r: HttpResponse = http_get(full);
+    if (r.ok == 0) {
+        c.*.browser_url = full;
+        c.*.browser_status = r.error;
+        comp_touch_content(c, wm_content_browser());
+        return 0 - 1;
+    }
+    html_document_free(&c.*.browser_document);
+    c.*.browser_document = html_parse(r.body);
+    c.*.browser_url = full;
+    c.*.browser_status = _zag_str_concat("HTTP ", _zag_i64_to_str(r.status as i64));
+    comp_touch_content(c, wm_content_browser());
+    return r.status;
+}
+
+fn comp_paint_window_content(c: *Compositor, fb: *SoftFb, win: RayWindow) void {
+    let th: RayOsTheme = c.*.wm.theme;
+    let cx: i32 = 1;
+    let cy: i32 = wm_client_y(th) + 1;
+    let cw: i32 = win.w - 2;
+    let ch: i32 = wm_client_h(win, th) - 2;
+    if (cw < 1 || ch < 1) { return; }
+
+    if (win.content_kind == wm_content_guest()) {
+        softgpu_blit_rect(
+            fb,
+            cx,
+            cy,
+            cw,
+            ch,
+            c.*.guest_pool,
+            cw,
+            ch,
+            win.fb_offset,
+        );
+        return;
+    }
+
+    if (win.content_kind == wm_content_tasks()) {
+        comp_paint_tasks(c, fb, cx + 8, cy + 8, cw - 16, ch - 16);
+        return;
+    }
+    if (win.content_kind == wm_content_files()) {
+        comp_paint_files(c, fb, cx + 8, cy + 8, cw - 16, ch - 16);
+        return;
+    }
+    if (win.content_kind == wm_content_browser()) {
+        comp_paint_browser(c, fb, cx + 8, cy + 8, cw - 16, ch - 16);
+        return;
+    }
+    if (win.content_kind == wm_content_terminal()) {
+        comp_paint_terminal(c, fb, cx + 8, cy + 8, cw - 16, ch - 16);
+        return;
+    }
+    if (win.content_kind == wm_content_devices()) {
+        if (c.*.devices_report.len < 1) {
+            c.*.devices_report = device_manager_scan();
+        }
+        comp_paint_devices(c, fb, cx + 8, cy + 8, cw - 16, ch - 16);
+        return;
+    }
+
+    softgpu_blend_round_rect_vgrad(
+        fb, cx, cy, cw, ch, (th.chrome_radius - 2.0) as i32,
+        24, 26, 42, 18, 20, 36, 255,
+    );
+}
+
+// Retained compositing: a window renders into its private buffer only when
+// its version changes; every frame it costs one shadow ring plus wide row
+// copies. Dragging an unchanged window is pure copy work.
+fn comp_paint_window(c: *Compositor, id: i32) void {
+    let win: RayWindow = wm_get(&c.*.wm, id);
+    if (win.id < 0 || win.minimized == 1) { return; }
+    let th: RayOsTheme = c.*.wm.theme;
+
+    // (re)create the cache buffer on first use or resize
+    if (win.cache_fb == 0 || win.cache_w != win.w || win.cache_h != win.h) {
+        wm_free_cache(&win);
+        let raw: *i8 = _zag_malloc(@sizeOf[SoftFb]());
+        let pfb: *SoftFb = raw as *SoftFb;
+        pfb.* = softgpu_new(win.w, win.h);
+        // share the screen framebuffer's glyph raster cache
+        pfb.*.glyph_cache = vg_glyph_cache_block(&c.*.fb);
+        win.cache_fb = raw as i64;
+        win.cache_w = win.w;
+        win.cache_h = win.h;
+        win.cache_ver = win.ver - 1;
+        wm_set(&c.*.wm, id, win);
+    }
+
+    let pfb: *SoftFb = win.cache_fb as *SoftFb;
+    if (win.cache_ver != win.ver) {
+        wm_paint_chrome_cache(&c.*.wm, pfb, win);
+        comp_paint_window_content(c, pfb, win);
+        // detach the shared glyph cache reference is not needed: never freed
+        win.cache_ver = win.ver;
+        wm_set(&c.*.wm, id, win);
+    }
+
+    rayos_paint_shadow(
+        &c.*.fb,
+        win.x as f32,
+        win.y as f32,
+        win.w as f32,
+        win.h as f32,
+        th.chrome_radius,
+        th,
+    );
+    softgpu_compose_round_rect(&c.*.fb, pfb, win.x, win.y, th.chrome_radius as i32);
+}
+
+fn comp_paint_windows_back_to_front(c: *Compositor) void {
+    let z_cap: i32 = c.*.wm.z_top + 1;
+    let z: i32 = 0;
+    while (z <= z_cap) {
+        let i: i32 = 0;
+        while (i < len[RayWindow](c.*.wm.windows)) {
+            let w: RayWindow = get[RayWindow](c.*.wm.windows, i);
+            if (w.minimized == 0 && w.z == z) {
+                comp_paint_window(c, w.id);
+            }
+            i = i + 1;
+        }
+        z = z + 1;
+    }
+}
+
+fn comp_paint_windows_in_rect(c: *Compositor, x0: i32, y0: i32, x1: i32, y1: i32) void {
+    let z_cap: i32 = c.*.wm.z_top + 1;
+    let z: i32 = 0;
+    while (z <= z_cap) {
+        let i: i32 = 0;
+        while (i < len[RayWindow](c.*.wm.windows)) {
+            let w: RayWindow = get[RayWindow](c.*.wm.windows, i);
+            if (w.minimized == 0 && w.z == z) {
+                let pad: i32 = 12;
+                let wx0: i32 = w.x - pad;
+                let wy0: i32 = w.y - pad;
+                let wx1: i32 = w.x + w.w + pad;
+                let wy1: i32 = w.y + w.h + pad;
+                if (comp_rects_overlap(x0, y0, x1, y1, wx0, wy0, wx1, wy1) == 1) {
+                    comp_paint_window(c, w.id);
+                }
+            }
+            i = i + 1;
+        }
+        z = z + 1;
+    }
+}
+
+fn comp_render_full(c: *Compositor) void {
+    softgpu_damage_reset(&c.*.fb);
+    let bytes: i32 = c.*.desktop_w * c.*.desktop_h * 3;
+    if (c.*.bg_valid == 0) {
+        comp_paint_wallpaper(c);
+        softgpu_copy_bytes(c.*.bg.data as *i8, c.*.fb.pix.data as *i8, bytes);
+        c.*.bg_valid = 1;
+    } else {
+        // wallpaper + desktop icons are static: restore from cache
+        softgpu_copy_bytes(c.*.fb.pix.data as *i8, c.*.bg.data as *i8, bytes);
+        softgpu_damage_mark_rect(&c.*.fb, 0, 0, c.*.desktop_w - 1, c.*.desktop_h - 1);
+    }
+    comp_paint_windows_back_to_front(c);
+    comp_paint_shell(c);
+    comp_paint_launcher(c);
+    c.*.dirty = 0;
+    c.*.dmg_x0 = 0;
+    c.*.dmg_y0 = 0;
+    c.*.dmg_x1 = -1;
+    c.*.dmg_y1 = -1;
+}
+
+fn comp_mark_damage(c: *Compositor, x0: i32, y0: i32, x1: i32, y1: i32) void {
+    if (c.*.dirty == 0) {
+        c.*.dmg_x0 = x0;
+        c.*.dmg_y0 = y0;
+        c.*.dmg_x1 = x1;
+        c.*.dmg_y1 = y1;
+        c.*.dirty = 1;
+        return;
+    }
+    if (x0 < c.*.dmg_x0) { c.*.dmg_x0 = x0; }
+    if (y0 < c.*.dmg_y0) { c.*.dmg_y0 = y0; }
+    if (x1 > c.*.dmg_x1) { c.*.dmg_x1 = x1; }
+    if (y1 > c.*.dmg_y1) { c.*.dmg_y1 = y1; }
+}
+
+fn comp_render_damage(c: *Compositor, x0: i32, y0: i32, x1: i32, y1: i32) i32 {
+    let rx0: i32 = comp_clamp_i(x0, 0, c.*.desktop_w - 1);
+    let ry0: i32 = comp_clamp_i(y0, 0, c.*.desktop_h - 1);
+    let rx1: i32 = comp_clamp_i(x1, 0, c.*.desktop_w - 1);
+    let ry1: i32 = comp_clamp_i(y1, 0, c.*.desktop_h - 1);
+    if (rx1 < rx0 || ry1 < ry0) { return 0; }
+
+    comp_mark_damage(c, rx0, ry0, rx1, ry1);
+    softgpu_damage_reset(&c.*.fb);
+    vg_set_clip(&c.*.fb, rx0, ry0, rx1 - rx0 + 1, ry1 - ry0 + 1);
+    comp_paint_wallpaper_region(c, rx0, ry0, rx1, ry1);
+    comp_paint_windows_in_rect(c, rx0, ry0, rx1, ry1);
+    let th: RayOsTheme = c.*.wm.theme;
+    if (ry1 >= c.*.desktop_h - th.taskbar_h) {
+        comp_paint_shell(c);
+    }
+    if (launcher_is_open(c.*.launcher) == 1) {
+        comp_paint_launcher(c);
+    }
+    vg_clear_clip(&c.*.fb);
+
+    let pixels: i32 = (rx1 - rx0 + 1) * (ry1 - ry0 + 1);
+    return pixels;
+}
+
+fn comp_flush_damage(c: *Compositor) i32 {
+    if (c.*.dirty == 0) { return 0; }
+    let px: i32 = comp_render_damage(c, c.*.dmg_x0, c.*.dmg_y0, c.*.dmg_x1, c.*.dmg_y1);
+    c.*.dirty = 0;
+    c.*.dmg_x1 = -1;
+    return px;
+}
+
+fn comp_present(c: *Compositor, dev: SoftGpuDevice) i32 {
+    return softgpu_present(dev, &c.*.fb);
+}
+
+fn comp_checksum(c: *Compositor) i32 {
+    return softgpu_checksum(&c.*.fb);
+}

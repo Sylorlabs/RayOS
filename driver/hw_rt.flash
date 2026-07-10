@@ -1,0 +1,262 @@
+// driver/hw_rt.flash — native MMIO runtime (Phase-1 host bootstrap only).
+//
+// Maps RayOS photonic register windows through Linux mmap(2) on /dev/mem when
+// available, otherwise a shared simulation backing store at /tmp/rayos_mmio.bin.
+// Logical addresses begin at RAYOS_MMIO_BASE (0xE0000000).
+//
+// Phase-1 uses extern _zag_raw_syscall for open/mmap/ftruncate — this is a
+// host-bootstrap shim only.  Bare-metal RayOS will trap MMIO directly with no
+// Linux piggyback on the core hardware path.
+//
+//   @import("hw_rt.flash")
+//   hw_rt_init();
+//   let val: i32 = mmio_read32((RAYOS_MMIO_BASE() as i64));
+
+extern fn _zag_raw_syscall(num: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) i64
+
+fn HW_PROT_READ() i64 { return 1; }
+fn HW_PROT_WRITE() i64 { return 2; }
+fn HW_PROT_RW() i64 { return 3; }
+fn HW_MAP_SHARED() i64 { return 1; }
+fn HW_O_RDWR() i64 { return 2; }
+fn HW_O_CREAT() i64 { return 64; }
+fn HW_O_RDWR_CREAT() i64 { return 66; }
+fn HW_MODE_0644() i64 { return 420; }
+
+fn HW_RT_MAGIC() i32 { return 1381259078; }   // "HWRT" (0x48575254)
+
+// ── process-local globals page ───────────────────────────────────────────────
+//
+// Flash has no static storage, so driver state used to live behind per-pid
+// pointer files in /tmp — an open+read+parse on EVERY register access. This
+// page replaces that: a fixed-address anonymous mapping created on first use.
+// MAP_FIXED_NOREPLACE means later calls fail with EEXIST and leave the page
+// untouched, so the whole lookup is a single cheap syscall.
+//
+// On real ternary hardware this page is a reserved SRAM window; the fixed
+// virtual address is the Phase-1 host equivalent.
+
+fn HW_GLOBALS_ADDR() i64 { return 121634816000000; }   // page-aligned, unused range
+fn HW_GLOBALS_BYTES() i64 { return 16384; }
+fn HW_MAP_FIXED_ANON_PRIVATE() i64 { return 1048610; } // NOREPLACE|ANON|PRIVATE
+
+fn HW_GSLOT_HW_RT() i64 { return 0; }
+fn HW_GSLOT_DISPLAY() i64 { return 512; }
+fn HW_GSLOT_SCANOUT_LIVE() i64 { return 1024; }
+fn HW_GSLOT_GUEST_FB_SOH() i64 { return 1536; }
+fn HW_GSLOT_SLEEP_TSPEC() i64 { return 2048; }
+
+fn hw_globals() i64 {
+    let addr: i64 = HW_GLOBALS_ADDR();
+    let _p: i64 = _zag_raw_syscall(
+        9, addr, HW_GLOBALS_BYTES(), (HW_PROT_RW() as i32), HW_MAP_FIXED_ANON_PRIVATE(), 0 - 1, 0,
+    );
+    return addr;
+}
+
+// Atomic file replace: rename(2). Readers never observe a half-written file.
+fn hw_rename(from: []u8, to: []u8) i32 {
+    let rc: i64 = _zag_raw_syscall(
+        82, hw_rt_path_cstr(from), hw_rt_path_cstr(to), 0, 0, 0, 0,
+    );
+    return rc as i32;
+}
+
+// Sleep without burning the core: nanosleep(2) with a timespec kept in the
+// globals page (no per-call allocation).
+fn hw_sleep_ms(ms: i32) void {
+    if (ms < 1) { return; }
+    let ts: i64 = hw_globals() + HW_GSLOT_SLEEP_TSPEC();
+    let secs: *i64 = ts as *i64;
+    let nanos: *i64 = (ts + 8) as *i64;
+    secs.* = (ms / 1000) as i64;
+    nanos.* = ((ms % 1000) as i64) * 1000000;
+    let _rc: i64 = _zag_raw_syscall(35, ts, 0, 0, 0, 0, 0);
+}
+
+struct HwRtState {
+    magic: i32,
+    pid: i64,
+    map_base: i64,
+    map_size: i64,
+    virt_base: i64,
+    ready: i32,
+    backend: i32,   // 1 = /dev/mem, 2 = /tmp/rayos_mmio.bin
+}
+
+fn hw_rt_getpid() i64 {
+    return _zag_raw_syscall(39, 0, 0, 0, 0, 0, 0);
+}
+
+fn hw_rt_state_new() HwRtState {
+    return HwRtState{
+        .magic = (HW_RT_MAGIC() as i32),
+        .pid = hw_rt_getpid(),
+        .map_base = 0,
+        .map_size = 0,
+        .virt_base = (RAYOS_MMIO_BASE() as i64),
+        .ready = 0,
+        .backend = 0,
+    };
+}
+
+fn hw_rt_state_mut() *HwRtState {
+    let st: *HwRtState = (hw_globals() + HW_GSLOT_HW_RT()) as *HwRtState;
+    if (st.*.magic != (HW_RT_MAGIC() as i32)) {
+        st.* = hw_rt_state_new();
+    }
+    return st;
+}
+
+fn hw_rt_path_cstr(path: []u8) i64 {
+    let raw: *i8 = _zag_malloc(path.len + 1);
+    let i: i32 = 0;
+    while (i < path.len) {
+        raw[i] = path[i];
+        i = i + 1;
+    }
+    raw[path.len] = 0;
+    return raw as i64;
+}
+
+fn hw_rt_mmap_devmem(size: i64, phys_off: i64) i64 {
+    let devmem: []u8 = "/dev/mem";
+    let fd: i64 = _zag_raw_syscall(2, hw_rt_path_cstr(devmem), (HW_O_RDWR() as i32), 0, 0, 0, 0);
+    if (fd < 0) { return 0; }
+    let ptr: i64 = _zag_raw_syscall(
+        9, 0, size, (HW_PROT_RW() as i32), (HW_MAP_SHARED() as i32), fd, phys_off,
+    );
+    let _rc: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+    if (ptr < 0) { return 0; }
+    return ptr;
+}
+
+fn hw_rt_unmap(addr: i64, size: i64) void {
+    let _rc: i64 = _zag_raw_syscall(11, addr, size, 0, 0, 0, 0);
+}
+
+fn hw_rt_probe_writable(ptr: i64) i32 {
+    let p: *i32 = ptr as *i32;
+    let saved: i32 = p.*;
+    let tag: i32 = 1381259078;   // HW_RT_MAGIC — unlikely in physical RAM
+    p.* = tag;
+    let got: i32 = p.*;
+    p.* = saved;
+    if (got == tag) { return 1; }
+    return 0;
+}
+
+fn hw_rt_mmap_simfile(size: i64) i64 {
+    let path: []u8 = "/tmp/rayos_mmio.bin";
+    let fd: i64 = _zag_raw_syscall(
+        2, hw_rt_path_cstr(path), (HW_O_RDWR_CREAT() as i32), (HW_MODE_0644() as i32), 0, 0, 0,
+    );
+    if (fd < 0) { return 0; }
+    let _ft: i64 = _zag_raw_syscall(77, fd, size, 0, 0, 0, 0);
+    let ptr: i64 = _zag_raw_syscall(
+        9, 0, size, (HW_PROT_RW() as i32), (HW_MAP_SHARED() as i32), fd, 0,
+    );
+    let _rc: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+    if (ptr < 0) { return 0; }
+    return ptr;
+}
+
+fn hw_rt_init() i32 {
+    let st: *HwRtState = hw_rt_state_mut();
+    if (st.*.ready == 1) { return 0; }
+    let size: i64 = (RAYOS_MMIO_MAP_BYTES() as i64);
+    // Dev hosts: prefer the mmap-backed sim file (chamber regs are deterministic).
+    // Bare-metal / FPGA bring-up: fall back to /dev/mem at RAYOS_MMIO_BASE.
+    let ptr: i64 = hw_rt_mmap_simfile(size);
+    let backend: i32 = 2;
+    if (ptr == 0) {
+        ptr = hw_rt_mmap_devmem(size, (RAYOS_MMIO_BASE() as i64));
+        backend = 1;
+        if (ptr != 0 && hw_rt_probe_writable(ptr) == 0) {
+            hw_rt_unmap(ptr, size);
+            ptr = 0;
+        }
+    }
+    if (ptr == 0) { return 0 - 1; }
+    st.*.pid = hw_rt_getpid();
+    st.*.map_base = ptr;
+    st.*.map_size = size;
+    st.*.virt_base = (RAYOS_MMIO_BASE() as i64);
+    st.*.backend = backend;
+    st.*.ready = 1;
+    return 0;
+}
+
+fn hw_rt_ensure() i32 {
+    let st: *HwRtState = hw_rt_state_mut();
+    if (st.*.ready == 1) { return 0; }
+    return hw_rt_init();
+}
+
+fn mmio_read32(addr: i64) i32 {
+    if (hw_rt_ensure() != 0) { return 0; }
+    let st: *HwRtState = hw_rt_state_mut();
+    let off: i64 = addr - st.*.virt_base;
+    if (off < 0 || off + 4 > st.*.map_size) { return 0; }
+    let bytes: *u8 = (st.*.map_base + off) as *u8;
+    let out: i64 = 0;
+    let i: i32 = 0;
+    while (i < 4) {
+        let limb: i64 = bytes[i] as i64;
+        let j: i32 = 0;
+        while (j < i) {
+            limb = limb * 256;
+            j = j + 1;
+        }
+        out = out + limb;
+        i = i + 1;
+    }
+    if (out >= 2147483648) { out = out - 4294967296; }
+    return out as i32;
+}
+
+fn mmio_write32(addr: i64, val: i32) void {
+    if (hw_rt_ensure() != 0) { return; }
+    let st: *HwRtState = hw_rt_state_mut();
+    let off: i64 = addr - st.*.virt_base;
+    if (off < 0 || off + 4 > st.*.map_size) { return; }
+    // Byte-wise store avoids Flash trit saturation on small i32 wire values (e.g. 2).
+    let pack: i64 = val as i64;
+    if (pack < 0) { pack = pack + 4294967296; }
+    let bytes: *u8 = (st.*.map_base + off) as *u8;
+    let shift: i64 = pack;
+    let i: i32 = 0;
+    while (i < 4) {
+        let limb: i64 = shift - ((shift / 256) * 256);
+        bytes[i] = limb as u8;
+        shift = shift / 256;
+        i = i + 1;
+    }
+}
+
+// Byte pointer into the mapped MMIO window at a logical address; null when
+// the range does not fit inside the window.
+fn hw_mmio_ptr(addr: i64, need: i32) *i8 {
+    if (hw_rt_ensure() != 0) { return null; }
+    let st: *HwRtState = hw_rt_state_mut();
+    let off: i64 = addr - st.*.virt_base;
+    if (off < 0 || off + (need as i64) > st.*.map_size) { return null; }
+    return (st.*.map_base + off) as *i8;
+}
+
+// 1 on Phase-1 hosts (sim-file backend), 0 on native/bare-metal (/dev/mem
+// trap). Firmware seeders run only on hosts; native controllers publish
+// into the chambers themselves.
+fn hw_rt_backend_host() i32 {
+    if (hw_rt_ensure() != 0) { return 1; }
+    let st: *HwRtState = hw_rt_state_mut();
+    if (st.*.backend == 2) { return 1; }
+    return 0;
+}
+
+fn hw_fence() void {
+    if (hw_rt_ensure() != 0) { return; }
+    let st: *HwRtState = hw_rt_state_mut();
+    let probe: i32 = mmio_read32(st.*.virt_base);
+    let _sink: i32 = probe + 0;
+}

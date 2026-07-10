@@ -1,0 +1,78 @@
+// btm_synthetic_test.flash — BTM synthetic x86 guest execution on SOH (no QEMU)
+
+@import("../core/init.flash")
+@import("../driver/virtio_block_mmio_nop.flash")
+@import("../driver/virtio_gpu_mmio_nop.flash")
+
+fn test_fail(msg: []u8) void {
+    _zag_print("btm_synthetic_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn test_expect_i64(got: i64, want: i64, msg: []u8) void {
+    if (got != want) { test_fail(msg); }
+}
+
+fn test_expect_i32(got: i32, want: i32, msg: []u8) void {
+    if (got != want) { test_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("btm_synthetic_test: running");
+
+    let hv: *BinaryTranslationMatrix = btm_new();
+    btm_attach_guest(hv, GuestArch.X86_64);
+
+    let prog_len: i32 = 6;
+    let prog: *u8 = _zag_malloc(prog_len);
+    prog[0] = 144;
+    prog[1] = 144;
+    prog[2] = 144;
+    prog[3] = 131;
+    prog[4] = 192;
+    prog[5] = 5;
+    let prog_slice: []u8 = prog[0..prog_len];
+
+    let i: i32 = 0;
+    while (i < 3) {
+        let step: i32 = btm_step(hv, prog_slice);
+        if (step != 1) { test_fail("btm_step nop sled"); }
+        i = i + 1;
+    }
+    test_expect_i64(btm_guest_pc(hv.*) as i64, 3, "guest pc after nop sled");
+
+    let add_step: i32 = btm_step(hv, prog_slice);
+    if (add_step != 3) { test_fail("btm_step add imm8"); }
+    test_expect_i64(btm_guest_pc(hv.*) as i64, 6, "guest pc after add");
+    test_expect_i64(btm_guest_reg(hv.*, GuestRegId.R0) as i64, 5, "eax after add imm8");
+
+    _zag_free(prog);
+    btm_free(hv);
+
+    let nop_hv: *BinaryTranslationMatrix = btm_new();
+    btm_attach_guest(nop_hv, GuestArch.X86_64);
+    let one_nop: *u8 = _zag_malloc(1);
+    one_nop[0] = 144;
+    if (btm_step(nop_hv, one_nop[0..1]) != 1) { test_fail("btm_step single nop"); }
+    let nop_phase: i8 = btm_phase_acc(nop_hv.*);
+    btm_free(nop_hv);
+
+    let add_only: *BinaryTranslationMatrix = btm_new();
+    btm_attach_guest(add_only, GuestArch.X86_64);
+    let add_len: i32 = 3;
+    let add_buf: *u8 = _zag_malloc(add_len);
+    add_buf[0] = 131;
+    add_buf[1] = 192;
+    add_buf[2] = 5;
+    let add_only_slice: []u8 = add_buf[0..add_len];
+    if (btm_step(add_only, add_only_slice) != 3) { test_fail("btm_step add phase"); }
+    if (btm_phase_acc(add_only.*) == nop_phase) { test_fail("add phase differs from nop"); }
+    test_expect_i64(btm_guest_reg(add_only.*, GuestRegId.R0) as i64, 5, "add phase reg");
+    _zag_free(one_nop);
+    _zag_free(add_buf);
+    btm_free(add_only);
+
+    _zag_println("btm_synthetic_test: ok");
+    return 0;
+}

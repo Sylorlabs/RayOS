@@ -1,0 +1,101 @@
+// testing/rayplay.flash — deterministic Flash-native desktop automation.
+//
+// RayPlay schedules MMIO pointer/button events by frame, inspects retained OS
+// state directly, and captures compositor frames. It is the RayOS equivalent
+// of browser-driving tools, without a browser, shell, or foreign test runtime.
+
+struct RayPlayAction {
+    frame: t27,
+    // MMIO ABI values are explicitly foreign binary interop units.
+    x: i32,
+    y: i32,
+    button: i32,
+}
+
+struct RayPlay {
+    actions: ArrayList[RayPlayAction],
+    cursor: t27,
+    injected: t27,
+}
+
+fn rayplay_new() RayPlay {
+    return RayPlay{
+        .actions = make[RayPlayAction](27),
+        .cursor = 0,
+        .injected = 0,
+    };
+}
+
+fn rayplay_free(play: *RayPlay) void {
+    free[RayPlayAction](&play.*.actions);
+}
+
+fn rayplay_pointer(play: *RayPlay, frame: t27, x: i32, y: i32, button: i32) i32 {
+    if (frame < 0 || x < 0 || y < 0) { return 0 - 1; }
+    if (len[RayPlayAction](play.*.actions) > 0) {
+        let last: RayPlayAction = get[RayPlayAction](
+            play.*.actions,
+            len[RayPlayAction](play.*.actions) - 1,
+        );
+        if (frame < last.frame) { return 0 - 2; }
+    }
+    push[RayPlayAction](&play.*.actions, RayPlayAction{
+        .frame = frame,
+        .x = x,
+        .y = y,
+        .button = button,
+    });
+    return 0;
+}
+
+fn rayplay_click(play: *RayPlay, frame: t27, x: i32, y: i32) i32 {
+    if (rayplay_pointer(play, frame, x, y, 1) != 0) { return 0 - 1; }
+    return rayplay_pointer(play, frame + 1, x, y, 0);
+}
+
+fn rayplay_tick(
+    play: *RayPlay,
+    comp: *Compositor,
+    drag: *RayOsDesktopDrag,
+    frame: t27,
+) t27 {
+    let count: t27 = 0;
+    while (play.*.cursor < len[RayPlayAction](play.*.actions) as t27) {
+        let action: RayPlayAction = get[RayPlayAction](play.*.actions, play.*.cursor as i32);
+        if (action.frame > frame) { return count; }
+        if (action.frame == frame) {
+            // Scripted pointer actions are button transitions (press/release).
+            input_chamber_inject_ev(INPUT_KIND_BUTTON(), action.x, action.y, action.button);
+            let kind: i32 = 0;
+            let mx: i32 = 0;
+            let my: i32 = 0;
+            let btn: i32 = 0;
+            if (input_chamber_poll_ev(&kind, &mx, &my, &btn) != 1) { return 0 - 1; }
+            if (mx != action.x || my != action.y || btn != action.button) {
+                _zag_print("rayplay MMIO mismatch got=");
+                _zag_print(_zag_i64_to_str(mx as i64));
+                _zag_print(",");
+                _zag_print(_zag_i64_to_str(my as i64));
+                _zag_print(",");
+                _zag_println(_zag_i64_to_str(btn as i64));
+                return 0 - 2;
+            }
+            rayos_desktop_handle_input(comp, drag, kind, mx, my, btn);
+            play.*.injected = play.*.injected + 1;
+            count = count + 1;
+        }
+        play.*.cursor = play.*.cursor + 1;
+    }
+    return count;
+}
+
+fn rayplay_count_windows(comp: *Compositor, content_kind: i32) t27 {
+    let count: t27 = 0;
+    let i: i32 = 0;
+    while (i < len[RayWindow](comp.*.wm.windows)) {
+        let win: RayWindow = get[RayWindow](comp.*.wm.windows, i);
+        if (win.content_kind == content_kind) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}

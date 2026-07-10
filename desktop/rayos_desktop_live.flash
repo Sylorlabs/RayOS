@@ -1,0 +1,14 @@
+// rayos_desktop_live.flash — RayOS desktop with live PPM/fbdev mirror each frame.
+
+@import("rayos_desktop.flash")
+
+fn main() i32 {
+    _zag_println("RayOS Desktop Live: starting");
+    let rc: i32 = rayos_desktop_run_live(0);
+    if (rc != 0) {
+        _zag_print("RayOS Desktop Live: exit rc=");
+        _zag_println(_zag_i64_to_str(rc as i64));
+        return 1;
+    }
+    return 0;
+}

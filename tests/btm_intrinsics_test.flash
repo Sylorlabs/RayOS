@@ -1,0 +1,56 @@
+// btm_intrinsics_test.flash — CPUID + RDTSC + INT 0x15 synthetic program
+
+@import("../core/init.flash")
+@import("../driver/virtio_block_mmio_nop.flash")
+@import("../driver/virtio_gpu_mmio_nop.flash")
+
+fn test_fail(msg: []u8) void {
+    _zag_print("btm_intrinsics_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn test_expect_u64(got: u64, want: u64, msg: []u8) void {
+    if (got != want) { test_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("btm_intrinsics_test: running");
+
+    let prog_len: i32 = 6;
+    let prog: *u8 = _zag_malloc(prog_len);
+    prog[0] = 15;
+    prog[1] = 162;
+    prog[2] = 15;
+    prog[3] = 49;
+    prog[4] = 205;
+    prog[5] = 21;
+    let prog_slice: []u8 = prog[0..prog_len];
+
+    let hv: *BinaryTranslationMatrix = btm_new();
+    btm_attach_guest(hv, GuestArch.X86_64);
+    grf_set(&hv.*.guest, GuestRegId.Pc, 0);
+    grf_set(&hv.*.guest, GuestRegId.Flags, 1);
+
+    if (btm_step(hv, prog_slice) != 2) { test_fail("btm_step cpuid"); }
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.R0), 1, "cpuid eax");
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.R1), 0, "cpuid ebx");
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.R2), 0, "cpuid ecx");
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.R3), 126614527, "cpuid edx");
+    test_expect_u64(btm_guest_pc(hv.*), 2, "pc after cpuid");
+
+    if (btm_step(hv, prog_slice) != 2) { test_fail("btm_step rdtsc"); }
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.R0), 1, "rdtsc eax low");
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.R2), 0, "rdtsc edx high");
+    test_expect_u64(btm_guest_pc(hv.*), 4, "pc after rdtsc");
+
+    if (btm_step(hv, prog_slice) != 2) { test_fail("btm_step int 15"); }
+    test_expect_u64(btm_guest_reg(hv.*, GuestRegId.Flags), 0, "int 15 carry clear");
+    test_expect_u64(btm_guest_pc(hv.*), 6, "pc after int 15");
+
+    _zag_free(prog);
+    btm_free(hv);
+
+    _zag_println("btm_intrinsics_test: ok");
+    return 0;
+}

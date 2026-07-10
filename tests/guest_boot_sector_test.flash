@@ -1,0 +1,86 @@
+// guest_boot_sector_test.flash — synthetic MBR boot sector at GPA 0x7C00 via BTM
+
+@import("../core/init.flash")
+@import("../driver/virtio_block_mmio_nop.flash")
+@import("../driver/virtio_gpu_mmio_nop.flash")
+@import("../driver/hw_rt.flash")
+@import("../driver/soh_mmio.flash")
+@import("../storage/soh_block.flash")
+@import("../storage/guest_image.flash")
+
+fn test_fail(msg: []u8) void {
+    _zag_print("guest_boot_sector_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn test_expect_u64_eq(got: u64, want: u64, msg: []u8) void {
+    if (got != want) { test_fail(msg); }
+}
+
+fn guest_boot_write_bootsect_bin() void {
+    let sector: *u8 = _zag_malloc(512);
+    let i: i32 = 0;
+    while (i < 512) {
+        sector[i] = 0;
+        i = i + 1;
+    }
+    sector[0] = 235;
+    sector[1] = 254;
+    sector[510] = 85;
+    sector[511] = 170;
+    _zag_write_file("vm/bootsect.bin", sector[0..512]);
+    _zag_free(sector);
+}
+
+fn main() i32 {
+    _zag_println("guest_boot_sector_test: running");
+
+    if (hw_rt_init() != 0) { test_fail("hw_rt_init"); }
+
+    guest_boot_write_bootsect_bin();
+
+    let boot_off: i32 = GPA_BOOT_SECTOR() as i32;
+    let guest_ram: ArrayList[u8] = make[u8](0);
+
+    let rc_file: i32 = guest_image_load_boot_sector("vm/bootsect.bin", &guest_ram, boot_off);
+    if (rc_file != 0) { test_fail("guest_image_load_boot_sector file"); }
+
+    let sector: ArrayList[u8] = make[u8]((SOH_BLOCK_SIZE() as i32));
+    let i: i32 = 0;
+    while (i < (SOH_BLOCK_SIZE() as i32)) {
+        push[u8](&sector, guest_ram.data[boot_off + i]);
+        i = i + 1;
+    }
+    if (soh_block_write((SOH_BLOCK_BOOT_ID() as i32), sector.data[0..(SOH_BLOCK_SIZE() as i32)]) != 0) {
+        test_fail("soh_block_write boot");
+    }
+    free[u8](&sector);
+
+    let guest_ram2: ArrayList[u8] = make[u8](0);
+    let rc_soh: i32 = guest_image_load_boot_sector("", &guest_ram2, boot_off);
+    if (rc_soh != 0) { test_fail("guest_image_load_boot_sector soh"); }
+    if (get[u8](&guest_ram2, boot_off + 0) != 235) { test_fail("soh byte0"); }
+    if (get[u8](&guest_ram2, boot_off + 1) != 254) { test_fail("soh byte1"); }
+    if (get[u8](&guest_ram2, boot_off + 510) != 85) { test_fail("soh sig_lo"); }
+    if (get[u8](&guest_ram2, boot_off + 511) != 170) { test_fail("soh sig_hi"); }
+    free[u8](&guest_ram2);
+
+    let hv: *BinaryTranslationMatrix = btm_new();
+    guest_boot_attach(hv, guest_ram);
+
+    let pc0: u64 = guest_boot_pc(hv);
+    if (pc0 != (GPA_BOOT_SECTOR() as u64)) { test_fail("guest_boot_attach pc"); }
+
+    let stepped: i32 = guest_boot_step_n(hv, guest_ram, 3);
+    if (stepped != 3) { test_fail("guest_boot_step_n"); }
+
+    let pc1: u64 = guest_boot_pc(hv);
+    test_expect_u64_eq(pc1, (GPA_BOOT_SECTOR() as u64), "guest pc jmp loop");
+
+    free[u8](&guest_ram);
+    btm_free(hv);
+
+    _zag_println("guest_boot_sector_test: ok");
+    return 0;
+}

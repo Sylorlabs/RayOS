@@ -1,0 +1,61 @@
+// device_bus_test.flash — generalist bus drivers read live topology.
+
+@import("../driver/device_manager.flash")
+
+fn devtest_count_rows_with(report: []u8, tag: []u8) i32 {
+    let n: i32 = sysbus_line_count(report);
+    let hits: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let line: []u8 = sysbus_line_at(report, i);
+        if (sysbus_contains(line, tag) == 1) { hits = hits + 1; }
+        i = i + 1;
+    }
+    return hits;
+}
+
+fn main() i32 {
+    _zag_println("device_bus_test: running");
+
+    // sysbus primitives
+    let names: []u8 = sysbus_listdir("/sys/class/net");
+    if (names.len < 1) {
+        _zag_println("device_bus_test: FAIL listdir /sys/class/net empty");
+        return 1;
+    }
+    if (sysbus_contains(names, "lo") == 0) {
+        _zag_println("device_bus_test: FAIL loopback interface missing");
+        return 1;
+    }
+    if (sysbus_contains("card1-HDMI-A-1", "HDMI") == 0) {
+        _zag_println("device_bus_test: FAIL contains");
+        return 1;
+    }
+    if (sysbus_line_count("a\nb\nc") != 3) {
+        _zag_println("device_bus_test: FAIL line_count");
+        return 1;
+    }
+    if (_zag_strcmp(sysbus_line_at("a\nb\nc", 1), "b") == 0) {
+        _zag_println("device_bus_test: FAIL line_at");
+        return 1;
+    }
+
+    // full scan: must produce at least the loopback row, with well-formed rows
+    let report: []u8 = device_manager_scan();
+    if (report.len < 1) {
+        _zag_println("device_bus_test: FAIL empty report");
+        return 1;
+    }
+    if (devtest_count_rows_with(report, "ETHERNET|lo|loopback") != 1) {
+        _zag_println("device_bus_test: FAIL loopback row");
+        _zag_println(report);
+        return 1;
+    }
+    let rows: i32 = sysbus_line_count(report) - 1;
+    _zag_print("device_bus_test: ");
+    _zag_print(_zag_i64_to_str(rows as i64));
+    _zag_println(" live devices enumerated");
+
+    _zag_println("device_bus_test: ok");
+    return 0;
+}

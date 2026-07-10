@@ -1,0 +1,14 @@
+// rayos_desktop_main.flash — standalone RayOS desktop entry (native scanout loop).
+
+@import("rayos_desktop.flash")
+
+fn main() i32 {
+    _zag_println("RayOS Desktop: starting");
+    let rc: i32 = rayos_desktop_run(0);
+    if (rc != 0) {
+        _zag_print("RayOS Desktop: exit rc=");
+        _zag_println(_zag_i64_to_str(rc as i64));
+        return 1;
+    }
+    return 0;
+}

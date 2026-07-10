@@ -1,0 +1,76 @@
+// hypervisor/guest_linux.flash — Linux guest integration: boot + virtio + VGA scanout.
+//
+// No @import — consumer must splice virtio_guest before this module.
+//   guest_linux_attach(btm, guest_ram)
+//   guest_linux_step_frame(btm, guest_ram, guest_pool, fb_off, w, h)
+
+fn GUEST_LINUX_STEPS_PER_FRAME() i32 { return 8; }
+
+fn guest_linux_attach(btm: *BinaryTranslationMatrix, guest_ram: *ArrayList[u8]) void {
+    let _load: i32 = linux_image_load_bzimage(guest_ram);
+    linux_boot_attach(btm, guest_ram);
+    let _vi: i32 = virtio_guest_init();
+    virtio_guest_attach_guest_ram(guest_ram);
+}
+
+fn guest_linux_step_n(
+    btm: *BinaryTranslationMatrix,
+    guest_ram: ArrayList[u8],
+    n: i32,
+) i32 {
+    return linux_boot_step_n(btm, guest_ram, n);
+}
+
+fn guest_linux_pc(btm: *BinaryTranslationMatrix) u64 {
+    return linux_boot_pc(btm);
+}
+
+fn guest_linux_render_fb(
+    btm: *BinaryTranslationMatrix,
+    guest_ram: ArrayList[u8],
+    guest_pool: *ArrayList[u8],
+    fb_off: i32,
+    w: i32,
+    h: i32,
+) void {
+    if (w < 1 || h < 1) { return; }
+    let pc: u64 = guest_linux_pc(btm);
+    let steps: i64 = btm.*.steps;
+    let pc_mix: i32 = ((pc % 2048) + (steps % 2048)) as i32;
+    let vga_base: i32 = GPA_VGA_TEXT();
+    let y: i32 = 0;
+    while (y < h) {
+        let vy: i32 = (y * VGA_TEXT_ROWS()) / h;
+        let x: i32 = 0;
+        while (x < w) {
+            let vx: i32 = (x * VGA_TEXT_COLS()) / w;
+            let cell: i32 = vga_base + (vy * VGA_TEXT_COLS() + vx) * 2;
+            let ch: u8 = guest_ram_read_u8(guest_ram, cell);
+            let attr: u8 = guest_ram_read_u8(guest_ram, cell + 1);
+            let rr: i32 = 0;
+            let gg: i32 = 0;
+            let bb: i32 = 0;
+            guest_ram_vga_attr_rgb(attr, ch, pc_mix + vx + vy, &rr, &gg, &bb);
+            let di: i32 = fb_off + (y * w + x) * 3;
+            if (di >= 0 && di + 2 < len[u8](guest_pool.*)) {
+                set[u8](guest_pool, di, rr as u8);
+                set[u8](guest_pool, di + 1, gg as u8);
+                set[u8](guest_pool, di + 2, bb as u8);
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fn guest_linux_step_frame(
+    btm: *BinaryTranslationMatrix,
+    guest_ram: ArrayList[u8],
+    guest_pool: *ArrayList[u8],
+    fb_off: i32,
+    w: i32,
+    h: i32,
+) void {
+    let _steps: i32 = guest_linux_step_n(btm, guest_ram, GUEST_LINUX_STEPS_PER_FRAME());
+    guest_linux_render_fb(btm, guest_ram, guest_pool, fb_off, w, h);
+}

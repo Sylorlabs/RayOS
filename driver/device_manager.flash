@@ -1,0 +1,30 @@
+// driver/device_manager.flash — live device inventory via the enumeration
+// chamber.
+//
+// The chamber (device_chamber.flash) is the only source of truth. On native
+// RayOS hardware the bus controllers publish their records directly into it
+// and this file is a pure reader. On Phase-1 hosts, the firmware seeder
+// below fills the chamber from the host topology first — then reads it back
+// through the exact same MMIO path the native build uses.
+
+@import("device_bus.flash")
+@import("device_chamber.flash")
+
+// Phase-1 firmware seeder: host topology → enumeration chamber.
+fn device_manager_seed_from_host() i32 {
+    let report: []u8 = "";
+    report = devbus_scan_display(report);
+    report = devbus_scan_net(report);
+    report = devbus_scan_usb(report);
+    report = devbus_scan_audio(report);
+    report = devbus_scan_thunderbolt(report);
+    report = devbus_scan_typec(report);
+    return device_chamber_publish(report);
+}
+
+fn device_manager_scan() []u8 {
+    if (hw_rt_backend_host() == 1) {
+        let _n: i32 = device_manager_seed_from_host();
+    }
+    return device_chamber_report();
+}

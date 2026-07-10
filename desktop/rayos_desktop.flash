@@ -1,0 +1,554 @@
+// desktop/rayos_desktop.flash — production compositor loop (MMIO scanout + input).
+//
+// 1280×800 loop: poll native input ring, WM hit-test/drag, full composite,
+// scanout blit/present.  No QEMU, VNC, file IPC, or shell sleep.
+//
+//   rayos_desktop_run(0);        // run until externally stopped
+//   rayos_desktop_run(1);        // single-frame CI / test mode
+
+@import("compositor.flash")
+@import("../driver/display_chamber.flash")
+@import("../driver/input_chamber.flash")
+@import("../driver/guest_fb_soh.flash")
+@import("../driver/scanout_live.flash")
+@import("../driver/rtc.flash")
+@import("guest_linux_host.flash")
+
+fn RAYOS_DESKTOP_W() i32 { return 1280; }
+fn RAYOS_DESKTOP_H() i32 { return 800; }
+
+struct RayOsDesktopDrag {
+    active: i32,
+    win_id: i32,
+    off_x: i32,
+    off_y: i32,
+}
+
+fn rayos_desktop_drag_new() RayOsDesktopDrag {
+    return RayOsDesktopDrag{
+        .active = 0,
+        .win_id = -1,
+        .off_x = 0,
+        .off_y = 0,
+    };
+}
+
+fn rayos_desktop_spin_wait() void {
+    hw_sleep_ms(1);
+}
+
+fn rayos_desktop_taskbar_y(comp: *Compositor) i32 {
+    let th: RayOsTheme = comp.*.wm.theme;
+    return comp.*.desktop_h - th.taskbar_h;
+}
+
+fn rayos_desktop_in_taskbar(comp: *Compositor, my: i32) i32 {
+    if (my >= rayos_desktop_taskbar_y(comp)) { return 1; }
+    return 0;
+}
+
+fn rayos_desktop_spawn_guest_window_at(
+    comp: *Compositor,
+    title: []u8,
+    guest_id: i32,
+    x: i32,
+    y: i32,
+    gw: i32,
+    gh: i32,
+    r: i32,
+    g: i32,
+    b: i32,
+) i32 {
+    guest_fb_bind_pool(&comp.*.guest_pool);
+    let off: i32 = guest_fb_alloc(gw, gh);
+    if (guest_id != 1) {
+        guest_fb_fill(comp.*.guest_pool, off, gw, gh, r, g, b);
+    }
+    return wm_add_window(
+        &comp.*.wm,
+        title,
+        x,
+        y,
+        gw + 2,
+        gh + 34,
+        wm_content_guest(),
+        guest_id,
+        off,
+    );
+}
+
+fn rayos_desktop_spawn_guest_window(comp: *Compositor) i32 {
+    return rayos_desktop_spawn_guest_window_at(
+        comp,
+        "GUEST-LINUX",
+        1,
+        140,
+        100,
+        480,
+        320,
+        48,
+        180,
+        64,
+    );
+}
+
+fn rayos_desktop_spawn_native_window(
+    comp: *Compositor,
+    title: []u8,
+    content_kind: i32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) i32 {
+    return wm_add_window(
+        &comp.*.wm,
+        title,
+        x,
+        y,
+        w,
+        h,
+        content_kind,
+        0,
+        0,
+    );
+}
+
+fn rayos_desktop_spawn_launcher_app(comp: *Compositor, app_id: i32) void {
+    if (app_id < 0) { return; }
+    let title: []u8 = launcher_app_title(app_id);
+    let kind: i32 = launcher_app_content_kind(app_id);
+    if (kind == wm_content_guest()) {
+        let gid: i32 = launcher_app_guest_id(app_id);
+        let rr: i32 = 48;
+        let rg: i32 = 180;
+        let rb: i32 = 64;
+        if (gid == 2) {
+            rr = 32;
+            rg = 96;
+            rb = 200;
+        }
+        let _id: i32 = rayos_desktop_spawn_guest_window_at(
+            comp,
+            title,
+            gid,
+            180,
+            120,
+            520,
+            340,
+            rr,
+            rg,
+            rb,
+        );
+        comp_set_guest_vms(comp, wm_count_visible(&comp.*.wm));
+        return;
+    }
+    let win_w: i32 = 520;
+    let win_h: i32 = 360;
+    if (kind == wm_content_tasks()) { win_w = 720; win_h = 460; }
+    if (kind == wm_content_files()) { win_w = 680; win_h = 440; }
+    if (kind == wm_content_browser()) { win_w = 820; win_h = 560; }
+    let _id2: i32 = rayos_desktop_spawn_native_window(comp, title, kind, 200, 120, win_w, win_h);
+}
+
+fn rayos_desktop_spawn_desktop_icon(comp: *Compositor, icon_id: i32) void {
+    if (icon_id == desktop_icon_none()) { return; }
+    let title: []u8 = desktop_icon_label(icon_id);
+    let kind: i32 = wm_content_native();
+    if (icon_id == desktop_icon_files()) { kind = wm_content_files(); }
+    let _id: i32 = rayos_desktop_spawn_native_window(comp, title, kind, 220, 140, 620, 400);
+}
+
+fn rayos_desktop_handle_shell(
+    comp: *Compositor,
+    drag: *RayOsDesktopDrag,
+    mx: i32,
+    my: i32,
+    btn: i32,
+) i32 {
+    let sh: ShellHit = shell_hit_test(comp.*.shell, &comp.*.wm, mx, my);
+    if (btn != 0) {
+        if (sh.kind == shell_hit_start()) {
+            comp_launcher_open(comp);
+            return 1;
+        }
+        if (sh.kind == shell_hit_window() && sh.id >= 0) {
+            wm_focus(&comp.*.wm, sh.id);
+            return 1;
+        }
+        if (sh.kind == shell_hit_logo()) {
+            comp_launcher_close(comp);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn rayos_desktop_handle_launcher(comp: *Compositor, mx: i32, my: i32, btn: i32) i32 {
+    if (launcher_is_open(comp.*.launcher) == 0 && comp.*.launcher.slide <= 0.001) {
+        return 0;
+    }
+    let hit: i32 = launcher_hit_test(&comp.*.launcher, &comp.*.wm, mx, my);
+    if (btn != 0) {
+        if (hit == launcher_hit_close()) {
+            comp_launcher_close(comp);
+            return 1;
+        }
+        if (hit == launcher_hit_search()) {
+            return 1;
+        }
+        if (hit >= 0) {
+            rayos_desktop_spawn_launcher_app(comp, hit);
+            comp_launcher_close(comp);
+            return 1;
+        }
+    }
+    return 1;
+}
+
+fn rayos_desktop_handle_desktop(comp: *Compositor, mx: i32, my: i32, btn: i32) i32 {
+    if (btn == 0) { return 0; }
+    let icon_id: i32 = desktop_hit_test(comp.*.desktop, &comp.*.wm, mx, my);
+    if (icon_id != desktop_icon_none()) {
+        rayos_desktop_spawn_desktop_icon(comp, icon_id);
+        return 1;
+    }
+    return 0;
+}
+
+fn rayos_desktop_handle_window_press(
+    comp: *Compositor,
+    drag: *RayOsDesktopDrag,
+    mx: i32,
+    my: i32,
+) void {
+    let hit: i32 = wm_hit_test(&comp.*.wm, mx, my);
+    let win_id: i32 = wm_hit_test_window(&comp.*.wm, mx, my);
+    if (win_id < 0) { return; }
+
+    if (hit == wm_hit_close()) {
+        wm_close(&comp.*.wm, win_id);
+        drag.*.active = 0;
+        drag.*.win_id = -1;
+        return;
+    }
+    if (hit == wm_hit_min()) {
+        wm_minimize(&comp.*.wm, win_id);
+        drag.*.active = 0;
+        drag.*.win_id = -1;
+        return;
+    }
+    if (hit == wm_hit_max()) {
+        wm_toggle_maximize(&comp.*.wm, win_id, comp.*.desktop_w, comp_work_h(comp));
+        drag.*.active = 0;
+        drag.*.win_id = -1;
+        return;
+    }
+    if (hit == wm_hit_titlebar()) {
+        let win: RayWindow = wm_get(&comp.*.wm, win_id);
+        drag.*.active = 1;
+        drag.*.win_id = win_id;
+        drag.*.off_x = mx - win.x;
+        drag.*.off_y = my - win.y;
+        wm_focus(&comp.*.wm, win_id);
+        return;
+    }
+    wm_focus(&comp.*.wm, win_id);
+}
+
+fn rayos_desktop_handle_key(comp: *Compositor, code: i32) void {
+    // launcher first: typing filters, Enter launches, Escape closes
+    if (launcher_is_open(comp.*.launcher) == 1) {
+        let rc: i32 = launcher_key(&comp.*.launcher, code);
+        if (rc == 2) {
+            let app: LauncherApp = launcher_filtered_at(&comp.*.launcher, 0);
+            if (app.id >= 0) {
+                rayos_desktop_spawn_launcher_app(comp, app.id);
+            }
+            comp_launcher_close(comp);
+            return;
+        }
+        if (rc == 3) {
+            comp_launcher_close(comp);
+            return;
+        }
+        if (rc == 1) { return; }
+        return;
+    }
+    // then the focused window
+    let win: RayWindow = wm_get(&comp.*.wm, comp.*.wm.focused_id);
+    if (win.id < 0) { return; }
+    if (win.content_kind == wm_content_terminal()) {
+        if (comp_term_key(comp, code) == 1) {
+            wm_touch(&comp.*.wm, win.id);
+        }
+        return;
+    }
+    if (win.content_kind == wm_content_devices()) {
+        if (code == ('r' as i32)) {
+            comp.*.devices_report = device_manager_scan();
+            wm_touch(&comp.*.wm, win.id);
+        }
+        return;
+    }
+    if (win.content_kind == wm_content_browser()) {
+        if (comp_browser_key(comp, code) == 1) {
+            wm_touch(&comp.*.wm, win.id);
+        }
+        return;
+    }
+}
+
+// Kind-aware event routing: presses act, moves carry drags, releases end them.
+fn rayos_desktop_handle_input(
+    comp: *Compositor,
+    drag: *RayOsDesktopDrag,
+    kind: i32,
+    mx: i32,
+    my: i32,
+    btn: i32,
+) void {
+    if (kind == INPUT_KIND_KEY()) {
+        if (btn == 1) {
+            rayos_desktop_handle_key(comp, mx);
+        }
+        return;
+    }
+    if (kind == INPUT_KIND_MOVE()) {
+        if (drag.*.active == 1 && drag.*.win_id >= 0) {
+            wm_move(&comp.*.wm, drag.*.win_id, mx - drag.*.off_x, my - drag.*.off_y);
+        }
+        return;
+    }
+
+    if (btn == 0) {
+        drag.*.active = 0;
+        drag.*.win_id = -1;
+        return;
+    }
+
+    if (rayos_desktop_handle_launcher(comp, mx, my, btn) == 1) { return; }
+
+    if (rayos_desktop_in_taskbar(comp, my) == 1) {
+        let _sh: i32 = rayos_desktop_handle_shell(comp, drag, mx, my, btn);
+        return;
+    }
+
+    let win_id: i32 = wm_hit_test_window(&comp.*.wm, mx, my);
+    if (win_id < 0) {
+        if (rayos_desktop_handle_desktop(comp, mx, my, btn) == 1) { return; }
+        return;
+    }
+
+    rayos_desktop_handle_window_press(comp, drag, mx, my);
+}
+
+fn rayos_desktop_guest_linux_tick(comp: *Compositor) void {
+    let th: RayOsTheme = comp.*.wm.theme;
+    let i: i32 = 0;
+    while (i < len[RayWindow](comp.*.wm.windows)) {
+        let win: RayWindow = get[RayWindow](comp.*.wm.windows, i);
+        if (win.minimized == 0) {
+            if (win.content_kind == wm_content_guest()) {
+                if (win.guest_id == 1) {
+                    let gw: i32 = win.w - 2;
+                    let gh: i32 = wm_client_h(win, th) - 2;
+                    if (gw > 0 && gh > 0) {
+                        guest_linux_host_step_guest_pool(
+                            &comp.*.guest_pool,
+                            win.fb_offset,
+                            gw,
+                            gh,
+                        );
+                    }
+                }
+                wm_touch(&comp.*.wm, win.id);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn rayos_desktop_count_windows_of(comp: *Compositor, content_kind: i32) i32 {
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[RayWindow](comp.*.wm.windows)) {
+        let win: RayWindow = get[RayWindow](comp.*.wm.windows, i);
+        if (win.content_kind == content_kind) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn rayos_desktop_count_guest_vms(comp: *Compositor) i32 {
+    return rayos_desktop_count_windows_of(comp, wm_content_guest());
+}
+
+fn rayos_desktop_touch_windows_of(comp: *Compositor, content_kind: i32) void {
+    let i: i32 = 0;
+    while (i < len[RayWindow](comp.*.wm.windows)) {
+        let win: RayWindow = get[RayWindow](comp.*.wm.windows, i);
+        if (win.content_kind == content_kind) {
+            wm_touch(&comp.*.wm, win.id);
+        }
+        i = i + 1;
+    }
+}
+
+fn rayos_desktop_frame_at(
+    comp: *Compositor,
+    drag: *RayOsDesktopDrag,
+    frame: i32,
+    clock_secs: i64,
+) void {
+    comp_set_clock(comp, clock_secs);
+    comp_launcher_tick(comp);
+    let _scheduled: t27 = scheduler_tick(&comp.*.scheduler, 1);
+    rayos_desktop_touch_windows_of(comp, wm_content_tasks());
+    rayos_desktop_guest_linux_tick(comp);
+
+    let kind: i32 = 0;
+    let mx: i32 = 0;
+    let my: i32 = 0;
+    let btn: i32 = 0;
+    let got: i32 = input_chamber_poll_ev(&kind, &mx, &my, &btn);
+    if (got == 1) {
+        rayos_desktop_handle_input(comp, drag, kind, mx, my, btn);
+    }
+
+    comp_render_full(comp);
+    let _blit: i32 = scanout_blit(&comp.*.fb);
+    let _pres: i32 = scanout_present();
+}
+
+fn rayos_desktop_frame(comp: *Compositor, drag: *RayOsDesktopDrag, frame: i32) void {
+    // Deterministic clock: CI gates and RayPlay captures must be reproducible.
+    let clock_secs: i64 = (14 * 3600 + frame * 2) as i64;
+    rayos_desktop_frame_at(comp, drag, frame, clock_secs);
+}
+
+fn rayos_desktop_dump_ppm(comp: *Compositor, path: []u8) i32 {
+    if (path.len < 1) { return 0; }
+    let dev: SoftGpuDevice = SoftGpuDevice{ .kind = 0, .path = path };
+    return comp_present(comp, dev);
+}
+
+fn rayos_desktop_run_dump(max_frames: i32, ppm_path: []u8) i32 {
+    if (input_chamber_init() != 0) { return 0 - 1; }
+    if (display_chamber_init(RAYOS_DESKTOP_W(), RAYOS_DESKTOP_H()) != 0) { return 0 - 2; }
+
+    let comp: Compositor = comp_new(RAYOS_DESKTOP_W(), RAYOS_DESKTOP_H());
+    let _guest: i32 = rayos_desktop_spawn_guest_window(&comp);
+    comp_set_guest_vms(&comp, 1);
+    comp_set_network(&comp, 1);
+
+    let drag: RayOsDesktopDrag = rayos_desktop_drag_new();
+    let frame: i32 = 0;
+
+    while (max_frames == 0 || frame < max_frames) {
+        rayos_desktop_frame(&comp, &drag, frame);
+        if (ppm_path.len > 0 && frame == max_frames - 1) {
+            let _dump: i32 = rayos_desktop_dump_ppm(&comp, ppm_path);
+        }
+        rayos_desktop_spin_wait();
+        frame = frame + 1;
+    }
+    comp_free(&comp);
+    return 0;
+}
+
+fn rayos_desktop_run(max_frames: i32) i32 {
+    return rayos_desktop_run_dump(max_frames, "");
+}
+
+// Interactive loop: renders ONLY when something changed (input, launcher
+// animation, wall-clock minute display, live guest content), drains the whole
+// input ring every iteration, and sleeps between polls instead of spinning.
+fn rayos_desktop_run_live(max_frames: i32) i32 {
+    if (scanout_live_init(RAYOS_DESKTOP_W(), RAYOS_DESKTOP_H()) != 0) { return 0 - 10; }
+    if (input_chamber_init() != 0) { return 0 - 1; }
+    if (display_chamber_init(RAYOS_DESKTOP_W(), RAYOS_DESKTOP_H()) != 0) { return 0 - 2; }
+
+    // Boot to a clean RayOS desktop: guest VMs are launched on demand from
+    // the launcher, and taskbar status reflects live state each frame.
+    let comp: Compositor = comp_new(RAYOS_DESKTOP_W(), RAYOS_DESKTOP_H());
+
+    let tz_off: i64 = rtc_utc_offset_secs(rtc_now_epoch());
+    let drag: RayOsDesktopDrag = rayos_desktop_drag_new();
+    let frame: i32 = 0;
+    // tmpfs: frames go to RAM, not the SSD
+    let live_path: []u8 = "/tmp/rayos_live_frame.ppm";
+    let last_clock: i64 = 0 - 1;
+    let last_minute: i64 = 0 - 1;
+    let last_slide: f32 = 0.0 - 1.0;
+
+    while (max_frames == 0 || frame < max_frames) {
+        let dirty: i32 = 0;
+        if (frame == 0) { dirty = 1; }
+
+        // drain every pending input event this iteration
+        let kind: i32 = 0;
+        let mx: i32 = 0;
+        let my: i32 = 0;
+        let btn: i32 = 0;
+        while (input_chamber_poll_ev(&kind, &mx, &my, &btn) == 1) {
+            let dragging: i32 = drag.active;
+            rayos_desktop_handle_input(&comp, &drag, kind, mx, my, btn);
+            if (kind == INPUT_KIND_BUTTON() || kind == INPUT_KIND_KEY() || dragging == 1) {
+                dirty = 1;
+            }
+        }
+
+        comp_launcher_tick(&comp);
+        if (comp.launcher.slide != last_slide) {
+            last_slide = comp.launcher.slide;
+            dirty = 1;
+        }
+
+        let clock_secs: i64 = rtc_secs_of_day(rtc_now_epoch() + tz_off);
+        if (clock_secs != last_clock) {
+            last_clock = clock_secs;
+            // scheduler metrics advance with the wall clock (Task Manager stays live)
+            let _scheduled: t27 = scheduler_tick(&comp.scheduler, 1);
+            rayos_desktop_touch_windows_of(&comp, wm_content_tasks());
+            // Tray clock shows HH:MM, so an idle desktop repaints once a
+            // minute; with a Task Manager open its metrics repaint per second.
+            if (rayos_desktop_count_windows_of(&comp, wm_content_tasks()) > 0) {
+                dirty = 1;
+            }
+            // hotplug: rescan the buses every 2s while a Devices window is open
+            if (rayos_desktop_count_windows_of(&comp, wm_content_devices()) > 0) {
+                if (clock_secs % 2 == 0) {
+                    comp.devices_report = device_manager_scan();
+                    rayos_desktop_touch_windows_of(&comp, wm_content_devices());
+                    dirty = 1;
+                }
+            }
+            if (clock_secs / 60 != last_minute) {
+                last_minute = clock_secs / 60;
+                dirty = 1;
+            }
+        }
+
+        let vms: i32 = rayos_desktop_count_guest_vms(&comp);
+        if (vms > 0) {
+            rayos_desktop_guest_linux_tick(&comp);
+            dirty = 1;
+        }
+
+        if (dirty == 1) {
+            comp_set_clock(&comp, clock_secs);
+            comp_set_guest_vms(&comp, vms);
+            comp_set_network(&comp, 0);
+            comp_render_full(&comp);
+            let _blit: i32 = scanout_blit(&comp.fb);
+            let _pres: i32 = scanout_present();
+            let _live: i32 = scanout_live_present_once(live_path);
+        }
+
+        hw_sleep_ms(4);
+        frame = frame + 1;
+    }
+    comp_free(&comp);
+    return 0;
+}

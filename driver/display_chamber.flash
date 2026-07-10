@@ -1,0 +1,194 @@
+// driver/display_chamber.flash — photonic display scanout chamber (MMIO control plane).
+//
+// Registers at RAYOS_DISPLAY_MMIO_BASE; RGB24 pixels live in a host backing
+// store keyed off the MMIO map (Phase-1 bootstrap).  Bare-metal RayOS maps the
+// full frame at a fixed physical offset behind the same register block.
+//
+//   @import("display_chamber.flash")
+//   display_chamber_init(1280, 800);
+//   scanout_blit(&comp.fb);
+//   scanout_present();
+//   let ok: i32 = scanout_present_flag();
+
+@import("../core/constants.flash")
+@import("hw_rt.flash")
+
+fn DISPLAY_REG_WIDTH() i32 { return 0; }
+fn DISPLAY_REG_HEIGHT() i32 { return 4; }
+fn DISPLAY_REG_PRESENT_FLAG() i32 { return 8; }
+fn DISPLAY_REG_FRAME_SEQ() i32 { return 12; }
+fn DISPLAY_REG_PIXEL_BYTES() i32 { return 16; }
+fn DISPLAY_REG_CHECKSUM() i32 { return 20; }
+
+fn DISPLAY_CHAMBER_MAGIC() i32 { return 1381259348; }   // "DSCN"
+
+struct DisplayChamberState {
+    magic: i32,
+    pid: i64,
+    width: i32,
+    height: i32,
+    fb_ptr: i64,
+    fb_bytes: i32,
+    present_flag: i32,
+    frame_seq: i32,
+    ready: i32,
+}
+
+fn display_chamber_base() i64 {
+    return (RAYOS_SCANOUT_MMIO_BASE() as i64);
+}
+
+fn display_chamber_state_new() DisplayChamberState {
+    return DisplayChamberState{
+        .magic = (DISPLAY_CHAMBER_MAGIC() as i32),
+        .pid = hw_rt_getpid(),
+        .width = 0,
+        .height = 0,
+        .fb_ptr = 0,
+        .fb_bytes = 0,
+        .present_flag = 0,
+        .frame_seq = 0,
+        .ready = 0,
+    };
+}
+
+fn display_chamber_mmio_ptr(reg: i32) *i8 {
+    if (hw_rt_ensure() != 0) { return null; }
+    let rt: *HwRtState = hw_rt_state_mut();
+    let rel: i64 = display_chamber_base() - rt.*.virt_base + reg as i64;
+    if (rel < 0 || rel + 1 > rt.*.map_size) { return null; }
+    return (rt.*.map_base + rel) as *i8;
+}
+
+fn display_chamber_mmio_store8(reg: i32, val: i8) void {
+    if (display_chamber_mmio_ptr(reg)) |bp| {
+        bp.* = val;
+        hw_fence();
+    }
+}
+
+fn display_chamber_mmio_load8(reg: i32) i32 {
+    if (display_chamber_mmio_ptr(reg)) |bp| {
+        let v: i64 = bp.* as i64;
+        if (v < 0) { v = v + 256; }
+        return v as i32;
+    }
+    return 0;
+}
+
+fn display_chamber_state_mut() *DisplayChamberState {
+    let st: *DisplayChamberState = (hw_globals() + HW_GSLOT_DISPLAY()) as *DisplayChamberState;
+    if (st.*.magic != (DISPLAY_CHAMBER_MAGIC() as i32)) {
+        st.* = display_chamber_state_new();
+    }
+    return st;
+}
+
+// Initialized-state view: null until display_chamber_init has run.
+fn display_chamber_state_from_cache() ?*DisplayChamberState {
+    let st: *DisplayChamberState = display_chamber_state_mut();
+    if (st.*.ready == 0) { return null; }
+    return st;
+}
+
+fn display_chamber_fb_ptr(st: *DisplayChamberState) *i8 {
+    if (st.*.fb_ptr == 0) { return null; }
+    return st.*.fb_ptr as *i8;
+}
+
+fn display_chamber_init(w: i32, h: i32) i32 {
+    if (hw_rt_init() != 0) { return 0 - 1; }
+    if (w < 1 || h < 1) { return 0 - 2; }
+    let bytes: i32 = w * h * 3;
+
+    let st: *DisplayChamberState = display_chamber_state_mut();
+    if (st.*.fb_ptr != 0 && st.*.fb_bytes != bytes) {
+        _zag_free(st.*.fb_ptr as *i8);
+        st.*.fb_ptr = 0;
+        st.*.fb_bytes = 0;
+    }
+    if (st.*.fb_ptr == 0) {
+        let raw: *i8 = _zag_malloc(bytes);
+        if (raw == null) { return 0 - 3; }
+        st.*.fb_ptr = raw as i64;
+        st.*.fb_bytes = bytes;
+    }
+    st.*.pid = hw_rt_getpid();
+    st.*.width = w;
+    st.*.height = h;
+    st.*.present_flag = 0;
+    st.*.frame_seq = 0;
+    st.*.ready = 1;
+
+    let base: i64 = display_chamber_base();
+    mmio_write32(base + (DISPLAY_REG_WIDTH() as i64), w);
+    mmio_write32(base + (DISPLAY_REG_HEIGHT() as i64), h);
+    mmio_write32(base + (DISPLAY_REG_PIXEL_BYTES() as i64), bytes);
+    mmio_write32(base + (DISPLAY_REG_CHECKSUM() as i64), 0);
+    display_chamber_mmio_store8(DISPLAY_REG_PRESENT_FLAG(), 0 as i8);
+    display_chamber_mmio_store8(DISPLAY_REG_FRAME_SEQ(), 0 as i8);
+    return 0;
+}
+
+fn scanout_fb_checksum(src: *SoftFb) i32 {
+    let acc: i32 = 7;
+    let n: i32 = src.*.w * src.*.h * 3;
+    let i: i32 = 0;
+    while (i < n) {
+        acc = (acc * 131 + (get[u8](src.*.pix, i) as i32)) % 15485863;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn scanout_blit(src: *SoftFb) i32 {
+    let st: *DisplayChamberState = display_chamber_state_mut();
+    if (st.*.ready == 0) { return 0 - 1; }
+    if (src.*.w != st.*.width || src.*.h != st.*.height) { return 0 - 2; }
+    let dst: *i8 = display_chamber_fb_ptr(st);
+    if (dst == null) { return 0 - 3; }
+    softgpu_copy_bytes(dst, src.*.pix.data as *i8, st.*.fb_bytes);
+    hw_fence();
+    return 0;
+}
+
+// Integrity-checked blit: also publishes the frame checksum register.
+// Costly (touches every byte twice) — for tests and bring-up, not the
+// per-frame present path.
+fn scanout_blit_verified(src: *SoftFb) i32 {
+    let rc: i32 = scanout_blit(src);
+    if (rc != 0) { return rc; }
+    let cks: i32 = scanout_fb_checksum(src);
+    let base: i64 = display_chamber_base();
+    mmio_write32(base + (DISPLAY_REG_CHECKSUM() as i64), cks);
+    hw_fence();
+    return 0;
+}
+
+fn scanout_present() i32 {
+    let st: *DisplayChamberState = display_chamber_state_mut();
+    if (st.*.ready == 0) { return 0 - 1; }
+    st.*.present_flag = 1;
+    st.*.frame_seq = st.*.frame_seq + 1;
+    display_chamber_mmio_store8(DISPLAY_REG_PRESENT_FLAG(), 1 as i8);
+    display_chamber_mmio_store8(DISPLAY_REG_FRAME_SEQ(), st.*.frame_seq as i8);
+    return 0;
+}
+
+fn scanout_present_flag() i32 {
+    let st: *DisplayChamberState = display_chamber_state_mut();
+    if (st.*.ready == 1) { return st.*.present_flag; }
+    return display_chamber_mmio_load8(DISPLAY_REG_PRESENT_FLAG());
+}
+
+fn scanout_frame_seq() i32 {
+    let st: *DisplayChamberState = display_chamber_state_mut();
+    if (st.*.ready == 1) { return st.*.frame_seq; }
+    return display_chamber_mmio_load8(DISPLAY_REG_FRAME_SEQ());
+}
+
+fn scanout_clear_present_flag() void {
+    let st: *DisplayChamberState = display_chamber_state_mut();
+    st.*.present_flag = 0;
+    display_chamber_mmio_store8(DISPLAY_REG_PRESENT_FLAG(), 0 as i8);
+}

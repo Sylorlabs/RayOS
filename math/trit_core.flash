@@ -1,0 +1,36 @@
+// math/trit_core.flash — minimal balanced-trit ripple ops (no truth tables).
+
+struct TritAddResult {
+    sum: i8,
+    carry: i8,
+}
+
+struct TritMulResult {
+    product: i8,
+}
+
+fn balance_sum(raw: i32) TritAddResult {
+    let result: i8 = 0;
+    let carry: i8 = 0;
+    if (raw > 1) {
+        result = (raw - 3) as i8;
+        carry = 1;
+    } else if (raw < 0 - 1) {
+        result = (raw + 3) as i8;
+        carry = 0 - 1;
+    } else {
+        result = raw as i8;
+        carry = 0;
+    }
+    return TritAddResult{ .sum = result, .carry = carry };
+}
+
+fn add(a: i8, b: i8, carry_in: i8) TritAddResult {
+    let raw: i32 = (a as i32) + (b as i32) + (carry_in as i32);
+    return balance_sum(raw);
+}
+
+fn mul(a: i8, b: i8) TritMulResult {
+    let product: i8 = (a * b) as i8;
+    return TritMulResult{ .product = product };
+}
