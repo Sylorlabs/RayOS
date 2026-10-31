@@ -353,11 +353,13 @@ fn comp_paint_tasks(c: *Compositor, fb: *SoftFb, x: i32, y: i32, w: i32, h: i32)
     let table_y: i32 = metric_y + 66;
     vg_text_vec(fb, (x + 12) as f32, table_y as f32, "TASK", 9.0, 0.65,
         th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
-    vg_text_vec(fb, (x + w - 245) as f32, table_y as f32, "STATE", 9.0, 0.65,
+    vg_text_vec(fb, (x + w - 275) as f32, table_y as f32, "STATE", 9.0, 0.65,
         th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
-    vg_text_vec(fb, (x + w - 155) as f32, table_y as f32, "PRIORITY", 9.0, 0.65,
+    vg_text_vec(fb, (x + w - 190) as f32, table_y as f32, "DOMAIN", 9.0, 0.65,
         th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
-    vg_text_vec(fb, (x + w - 65) as f32, table_y as f32, "TIME", 9.0, 0.65,
+    vg_text_vec(fb, (x + w - 115) as f32, table_y as f32, "PRIORITY", 9.0, 0.65,
+        th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+    vg_text_vec(fb, (x + w - 55) as f32, table_y as f32, "TIME", 9.0, 0.65,
         th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
     let row_y: i32 = table_y + 20;
     let i: i32 = 0;
@@ -370,9 +372,12 @@ fn comp_paint_tasks(c: *Compositor, fb: *SoftFb, x: i32, y: i32, w: i32, h: i32)
         if (task.state == task_running()) { running = 1; }
         rayos_paint_status_dot(fb, (x + 16) as f32, (row_y + 16) as f32, 4.0, running, th);
         rayos_paint_text_trunc(fb, (x + 28) as f32, (row_y + 9) as f32,
-            task.name, w - 300, 11.0, 0.58, th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
-        vg_text_vec(fb, (x + w - 245) as f32, (row_y + 9) as f32,
+            task.name, w - 330, 11.0, 0.58, th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
+        vg_text_vec(fb, (x + w - 275) as f32, (row_y + 9) as f32,
             comp_task_state_text(task.state), 9.0, 0.6, th.base.acc_r, th.base.acc_g, th.base.acc_b, 255);
+        vg_text_vec(fb, (x + w - 190) as f32, (row_y + 9) as f32,
+            execution_domain_name(task.execution_domain), 8.0, 0.6,
+            th.base.acc2_r, th.base.acc2_g, th.base.acc2_b, 255);
         rayos_paint_u32(fb, (x + w - 115) as f32, (row_y + 8) as f32,
             (task.priority + 8) as i32, 11.0, 0.6, th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
         rayos_paint_u32(fb, (x + w - 62) as f32, (row_y + 8) as f32,
@@ -499,7 +504,9 @@ fn comp_paint_browser(c: *Compositor, fb: *SoftFb, x: i32, y: i32, w: i32, h: i3
         }
         if (node.kind == html_node_text()) {
             let tag: []u8 = comp_browser_parent_tag(c, node);
-            if (html_equal_fold(tag, "script") == 0 && html_equal_fold(tag, "style") == 0) {
+            if (html_equal_fold(tag, "script") == 0 && html_equal_fold(tag, "style") == 0
+                && html_equal_fold(tag, "title") == 0 && html_equal_fold(tag, "textarea") == 0
+                && html_equal_fold(tag, "head") == 0) {
                 let size: f32 = 13.0;
                 let weight: f32 = 0.58;
                 let rr: i32 = th.base.mut_r;
@@ -848,7 +855,7 @@ fn comp_term_date(c: *Compositor) void {
 }
 
 fn comp_term_ps(c: *Compositor) void {
-    comp_term_println(c, "TASK        STATE     PRIO  RUNTIME");
+    comp_term_println(c, "TASK        STATE     DOMAIN   PRIO  RUNTIME");
     let i: i32 = 0;
     while (i < len[RayTask](c.*.scheduler.tasks)) {
         let task: RayTask = get[RayTask](c.*.scheduler.tasks, i);
@@ -856,6 +863,8 @@ fn comp_term_ps(c: *Compositor) void {
         let padn: i32 = 12 - task.name.len;
         while (padn > 0) { line = _zag_str_concat(line, " "); padn = padn - 1; }
         line = _zag_str_concat(line, comp_task_state_text(task.state));
+        line = _zag_str_concat(line, "   ");
+        line = _zag_str_concat(line, execution_domain_name(task.execution_domain));
         line = _zag_str_concat(line, "   ");
         line = _zag_str_concat(line, _zag_i64_to_str((task.priority + 8) as i64));
         line = _zag_str_concat(line, "   ");
@@ -1601,6 +1610,84 @@ fn comp_paint_windows_in_rect(c: *Compositor, x0: i32, y0: i32, x1: i32, y1: i32
         }
         z = z + 1;
     }
+}
+
+
+// ── UI element registry (for rayctl click-by-id / testing) ───────────────────
+//
+// Publishes "name x y w h" lines for the clickable targets on screen so the
+// Flash-native rayctl harness can drive the desktop by element name.
+fn comp_reg_row(out: []u8, name: []u8, x: i32, y: i32, w: i32, h: i32) []u8 {
+    // element names must be single tokens: replace spaces with '_'
+    let safe: *i8 = _zag_malloc(name.len + 1);
+    let si: i32 = 0;
+    while (si < name.len) {
+        if (name[si] == (' ' as u8)) { safe[si] = 95 as i8; } else { safe[si] = name[si] as i8; }
+        si = si + 1;
+    }
+    let safeu: *u8 = safe as *u8;
+    let r: []u8 = _zag_str_concat(out, safeu[0..name.len]);
+    r = _zag_str_concat(r, " ");
+    r = _zag_str_concat(r, _zag_i64_to_str(x as i64));
+    r = _zag_str_concat(r, " ");
+    r = _zag_str_concat(r, _zag_i64_to_str(y as i64));
+    r = _zag_str_concat(r, " ");
+    r = _zag_str_concat(r, _zag_i64_to_str(w as i64));
+    r = _zag_str_concat(r, " ");
+    r = _zag_str_concat(r, _zag_i64_to_str(h as i64));
+    return _zag_str_concat(r, "\n");
+}
+
+fn comp_registry_string(c: *Compositor) []u8 {
+    let th: RayOsTheme = c.*.wm.theme;
+    let tby: i32 = c.*.desktop_h - th.taskbar_h;
+    let out: []u8 = "";
+    // taskbar
+    out = comp_reg_row(out, "logo", 10, tby + 8, 28, 32);
+    out = comp_reg_row(out, "start", 52, tby + 8, 88, 32);
+    // desktop icons
+    out = comp_reg_row(out, "icon:home", 24, 24, 64, 80);
+    out = comp_reg_row(out, "icon:files", 24, 104, 64, 80);
+    out = comp_reg_row(out, "icon:trash", 24, 184, 64, 80);
+    // launcher tiles (when open)
+    if (c.*.launcher.slide > 0.9) {
+        let px: i32 = c.*.launcher.anchor_x;
+        let py: i32 = launcher_panel_y(c.*.launcher, th) as i32;
+        out = comp_reg_row(out, "domain:ternary", px + 16, py + 98, 140, 28);
+        out = comp_reg_row(out, "domain:binary", px + 164, py + 98, 140, 28);
+        let shown: i32 = launcher_filtered_count(&c.*.launcher);
+        let i: i32 = 0;
+        let col: i32 = 0;
+        let row: i32 = 0;
+        while (i < shown) {
+            let app: LauncherApp = launcher_filtered_at(&c.*.launcher, i);
+            let tx: i32 = px + 16 + col * 96;
+            let ty: i32 = py + 154 + row * 108;
+            out = comp_reg_row(out, _zag_str_concat("app:", launcher_app_title(app.id)), tx, ty, 88, 88);
+            col = col + 1;
+            if (col >= 3) { col = 0; row = row + 1; }
+            i = i + 1;
+        }
+    }
+    // window traffic lights
+    let wi: i32 = 0;
+    while (wi < len[RayWindow](c.*.wm.windows)) {
+        let win: RayWindow = get[RayWindow](c.*.wm.windows, wi);
+        if (win.minimized == 0) {
+            let ids: []u8 = _zag_i64_to_str(win.id as i64);
+            let cy: i32 = win.y + th.titlebar_h / 2 - 9;
+            out = comp_reg_row(out, _zag_str_concat("win:close:", ids), win.x + 5, cy, 18, 18);
+            out = comp_reg_row(out, _zag_str_concat("win:min:", ids), win.x + 23, cy, 18, 18);
+            out = comp_reg_row(out, _zag_str_concat("win:max:", ids), win.x + 41, cy, 18, 18);
+            out = comp_reg_row(out, _zag_str_concat("win:title:", ids), win.x + 68, win.y, win.w - 70, th.titlebar_h);
+        }
+        wi = wi + 1;
+    }
+    return out;
+}
+
+fn comp_publish_registry(c: *Compositor) void {
+    let _rc: i32 = _zag_write_file("/tmp/rayos_ui.registry", comp_registry_string(c));
 }
 
 fn comp_render_full(c: *Compositor) void {

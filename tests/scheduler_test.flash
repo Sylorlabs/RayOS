@@ -16,8 +16,24 @@ fn main() i32 {
     let ui: t27 = scheduler_spawn(&sched, 0, "compositor", 6);
     let io: t27 = scheduler_spawn(&sched, 0, "filesystem", 3);
     let bg: t27 = scheduler_spawn(&sched, 0, "indexer", 0 - 6);
+    let guest: t27 = scheduler_spawn_domain(
+        &sched, 0, "binary-guest", 0, execution_domain_binary(),
+    );
     scheduler_expect(ui > 0 && io > 0 && bg > 0, "spawn ids");
-    scheduler_expect(scheduler_runnable_count(&sched) == 3, "three runnable");
+    scheduler_expect(guest > 0, "binary compatibility spawn");
+    scheduler_expect(scheduler_runnable_count(&sched) == 4, "four runnable");
+    scheduler_expect(
+        scheduler_task(&sched, ui).execution_domain == execution_domain_ternary(),
+        "native spawn defaults ternary",
+    );
+    scheduler_expect(
+        scheduler_task(&sched, guest).execution_domain == execution_domain_binary(),
+        "explicit binary domain retained",
+    );
+    scheduler_expect(
+        scheduler_spawn_domain(&sched, 0, "invalid", 0, execution_domain_unspecified()) == scheduler_no_task(),
+        "unspecified scheduler domain rejected",
+    );
 
     let first: t27 = scheduler_tick(&sched, 0);
     scheduler_expect(first == ui, "priority deadline selects compositor");

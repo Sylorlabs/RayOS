@@ -1,0 +1,23 @@
+@import("../../flash/flash/ui/text.flash")
+fn main() i32 {
+    _zag_println("text_test: running");
+    let fb: SoftFb = softgpu_new(200, 200);
+    // width fits 8 chars at size 14 (advance 13 -> 104px)
+    let endy: i32 = text_paint(&fb, 0, 0, "one two three", 14.0, 0.6, 255,255,255,255, 104, TEXT_LEFT(), 20);
+    // expect 2 lines -> endy = 0 + 2*20 = 40
+    if (endy != 40) {
+        _zag_print("text_test: FAIL wrap lines, endy="); _zag_println(_zag_i64_to_str(endy as i64)); return 1;
+    }
+    if (text_width("hello", 14.0) < 60.0 || text_width("hello", 14.0) > 70.0) {
+        _zag_println("text_test: FAIL width"); return 1;
+    }
+    // rich flow runs without crashing and advances y
+    let runs: *TextRun = _zag_malloc(2 * @sizeOf[TextRun]()) as *TextRun;
+    runs[0] = text_run("bold", 13.0, 1.6, 255,255,255,255);
+    runs[1] = text_run(" tail", 13.0, 0.6, 200,200,200,255);
+    let fy: i32 = text_flow(&fb, 0, 0, 300, runs, 2, 18);
+    if (fy != 18) { _zag_print("text_test: FAIL flow y="); _zag_println(_zag_i64_to_str(fy as i64)); return 1; }
+    _zag_println("text_test: wrap + width + rich flow ok");
+    _zag_println("text_test: ok");
+    return 0;
+}

@@ -1,0 +1,56 @@
+@import("../desktop/launcher_policy.flash")
+@import("../core/scheduler.flash")
+
+fn dual_policy_fail(msg: []u8) void {
+    _zag_print("dual_execution_policy_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn dual_policy_expect(ok: i32, msg: []u8) void {
+    if (ok == 0) { dual_policy_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("dual_execution_policy_test: running");
+
+    let selected: t9 = launcher_policy_default_domain();
+    dual_policy_expect(selected == execution_domain_ternary(), "launcher default is ternary");
+    dual_policy_expect(
+        launcher_app_resolve_domain(launcher_app_files(), selected) == execution_domain_ternary(),
+        "native app accepts ternary",
+    );
+    dual_policy_expect(
+        launcher_app_resolve_domain(launcher_app_linux(), selected) == execution_domain_unspecified(),
+        "binary guest does not auto-launch",
+    );
+
+    selected = launcher_policy_toggle(selected);
+    dual_policy_expect(selected == execution_domain_binary(), "user can select binary");
+    dual_policy_expect(
+        launcher_app_resolve_domain(launcher_app_terminal(), selected) == execution_domain_unspecified(),
+        "native-only app denied in binary mode",
+    );
+    dual_policy_expect(
+        launcher_app_resolve_domain(launcher_app_linux(), selected) == execution_domain_binary(),
+        "binary guest accepts explicit binary choice",
+    );
+    dual_policy_expect(
+        launcher_policy_select(execution_domain_unspecified()) == execution_domain_unspecified(),
+        "invalid selection rejected",
+    );
+
+    let scheduler: RayScheduler = scheduler_new();
+    let binary_task: t27 = scheduler_spawn_domain(
+        &scheduler, 0, "Linux Guest", 3, selected,
+    );
+    dual_policy_expect(binary_task > 0, "binary task spawned");
+    dual_policy_expect(
+        scheduler_task(&scheduler, binary_task).execution_domain == execution_domain_binary(),
+        "scheduler records binary domain",
+    );
+    scheduler_free(&scheduler);
+
+    _zag_println("dual_execution_policy_test: ok");
+    return 0;
+}

@@ -1,0 +1,176 @@
+// tools/rayctl.flash — Flash-native desktop control + test harness.
+//
+// Drives the running RayOS desktop through the shared MMIO chambers: inject
+// pointer moves/clicks, keystrokes, and capture screenshots — no Python
+// bridge. Also clicks named UI targets by id via the compositor's element
+// registry (/tmp/rayos_ui.registry, one "name x y w h" line per element).
+//
+//   rayctl move 640 400
+//   rayctl click 96 776          # button down+up at a pixel
+//   rayctl key 10                # send a keycode (10 = Enter)
+//   rayctl type hello            # send a string of keystrokes
+//   rayctl clickid start         # click the centre of a named element
+//   rayctl shot /tmp/shot.ppm    # copy the live frame to a file
+//   rayctl ids                   # list clickable element ids
+
+@import("../driver/input_chamber.flash")
+
+fn RAYCTL_FRAME() []u8 { return "/tmp/rayos_live_frame.ppm"; }
+fn RAYCTL_REGISTRY() []u8 { return "/tmp/rayos_ui.registry"; }
+
+fn rayctl_atoi(s: []u8) i32 {
+    return _zag_str_to_i64(s) as i32;
+}
+
+fn rayctl_move(x: i32, y: i32) void {
+    input_chamber_inject_ev(INPUT_KIND_MOVE(), x, y, 0);
+}
+
+fn rayctl_click(x: i32, y: i32) void {
+    input_chamber_inject_ev(INPUT_KIND_BUTTON(), x, y, 1);
+    input_chamber_inject_ev(INPUT_KIND_BUTTON(), x, y, 0);
+}
+
+fn rayctl_key(code: i32) void {
+    input_chamber_inject_ev(INPUT_KIND_KEY(), code, 0, 1);
+}
+
+fn rayctl_type(s: []u8) void {
+    let i: i32 = 0;
+    while (i < s.len) {
+        input_chamber_inject_ev(INPUT_KIND_KEY(), s[i] as i32, 0, 1);
+        i = i + 1;
+    }
+}
+
+fn rayctl_shot(path: []u8) i32 {
+    let frame: []u8 = _zag_read_file(RAYCTL_FRAME());
+    if (frame.len < 1) {
+        _zag_println("rayctl: no live frame (is the desktop running?)");
+        return 1;
+    }
+    let rc: i32 = _zag_write_file(path, frame);
+    _zag_print("rayctl: wrote "); _zag_print(_zag_i64_to_str(frame.len as i64));
+    _zag_print(" bytes to "); _zag_println(path);
+    return rc;
+}
+
+// ── UI element registry ──────────────────────────────────────────────────────
+
+// field `idx` of a space-separated registry line
+fn rayctl_field(line: []u8, idx: i32) []u8 {
+    let f: i32 = 0;
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i <= line.len) {
+        if (i == line.len || line[i] == (' ' as u8)) {
+            if (f == idx) { return line[start..i]; }
+            f = f + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn rayctl_line_at(blob: []u8, idx: i32) []u8 {
+    let line: i32 = 0;
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i <= blob.len) {
+        if (i == blob.len || blob[i] == ('\n' as u8)) {
+            if (line == idx) { return blob[start..i]; }
+            line = line + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn rayctl_line_count(blob: []u8) i32 {
+    if (blob.len < 1) { return 0; }
+    let n: i32 = 1;
+    let i: i32 = 0;
+    while (i < blob.len) { if (blob[i] == ('\n' as u8)) { n = n + 1; } i = i + 1; }
+    return n;
+}
+
+fn rayctl_clickid(name: []u8) i32 {
+    let reg: []u8 = _zag_read_file(RAYCTL_REGISTRY());
+    if (reg.len < 1) {
+        _zag_println("rayctl: no element registry (desktop not publishing?)");
+        return 1;
+    }
+    let n: i32 = rayctl_line_count(reg);
+    let i: i32 = 0;
+    while (i < n) {
+        let line: []u8 = rayctl_line_at(reg, i);
+        if (line.len > 0 && _zag_strcmp(rayctl_field(line, 0), name) == 1) {
+            let x: i32 = rayctl_atoi(rayctl_field(line, 1));
+            let y: i32 = rayctl_atoi(rayctl_field(line, 2));
+            let w: i32 = rayctl_atoi(rayctl_field(line, 3));
+            let h: i32 = rayctl_atoi(rayctl_field(line, 4));
+            let cx: i32 = x + w / 2;
+            let cy: i32 = y + h / 2;
+            rayctl_click(cx, cy);
+            _zag_print("rayctl: clicked '"); _zag_print(name);
+            _zag_print("' at "); _zag_print(_zag_i64_to_str(cx as i64));
+            _zag_print(","); _zag_println(_zag_i64_to_str(cy as i64));
+            return 0;
+        }
+        i = i + 1;
+    }
+    _zag_print("rayctl: no element named '"); _zag_print(name); _zag_println("'");
+    return 1;
+}
+
+fn rayctl_ids() void {
+    let reg: []u8 = _zag_read_file(RAYCTL_REGISTRY());
+    if (reg.len < 1) { _zag_println("(no registry)"); return; }
+    let n: i32 = rayctl_line_count(reg);
+    let i: i32 = 0;
+    while (i < n) {
+        let line: []u8 = rayctl_line_at(reg, i);
+        if (line.len > 0) { _zag_println(line); }
+        i = i + 1;
+    }
+}
+
+fn main() i32 {
+    let argc: i32 = _zag_argc();
+    if (argc < 2) {
+        _zag_println("usage: rayctl move|click|down|up X Y | key CODE | type STR | clickid NAME | shot PATH | ids");
+        return 1;
+    }
+    let cmd: []u8 = _zag_arg(1);
+    if (_zag_strcmp(cmd, "move") == 1 && argc >= 4) {
+        rayctl_move(rayctl_atoi(_zag_arg(2)), rayctl_atoi(_zag_arg(3))); return 0;
+    }
+    if (_zag_strcmp(cmd, "click") == 1 && argc >= 4) {
+        rayctl_click(rayctl_atoi(_zag_arg(2)), rayctl_atoi(_zag_arg(3))); return 0;
+    }
+    if (_zag_strcmp(cmd, "down") == 1 && argc >= 4) {
+        input_chamber_inject_ev(INPUT_KIND_BUTTON(), rayctl_atoi(_zag_arg(2)), rayctl_atoi(_zag_arg(3)), 1); return 0;
+    }
+    if (_zag_strcmp(cmd, "up") == 1 && argc >= 4) {
+        input_chamber_inject_ev(INPUT_KIND_BUTTON(), rayctl_atoi(_zag_arg(2)), rayctl_atoi(_zag_arg(3)), 0); return 0;
+    }
+    if (_zag_strcmp(cmd, "key") == 1 && argc >= 3) {
+        rayctl_key(rayctl_atoi(_zag_arg(2))); return 0;
+    }
+    if (_zag_strcmp(cmd, "type") == 1 && argc >= 3) {
+        rayctl_type(_zag_arg(2)); return 0;
+    }
+    if (_zag_strcmp(cmd, "clickid") == 1 && argc >= 3) {
+        return rayctl_clickid(_zag_arg(2));
+    }
+    if (_zag_strcmp(cmd, "shot") == 1 && argc >= 3) {
+        return rayctl_shot(_zag_arg(2));
+    }
+    if (_zag_strcmp(cmd, "ids") == 1) {
+        rayctl_ids(); return 0;
+    }
+    _zag_println("rayctl: unknown command");
+    return 1;
+}

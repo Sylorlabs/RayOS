@@ -1,0 +1,149 @@
+// core/execution_domain.flash — RayOS dual-execution policy.
+//
+// Balanced ternary is the native and default execution domain. Binary code is
+// admitted only through an explicit compatibility chamber. Domain selection is
+// never an implicit fallback: an unsupported user request fails closed.
+
+fn execution_domain_binary() t9 { return 0 - 1; }
+fn execution_domain_unspecified() t9 { return 0; }
+fn execution_domain_ternary() t9 { return 1; }
+
+fn execution_domain_valid(domain: t9) i32 {
+    if (domain == execution_domain_ternary()) { return 1; }
+    if (domain == execution_domain_binary()) { return 1; }
+    return 0;
+}
+
+fn execution_domain_name(domain: t9) []u8 {
+    if (domain == execution_domain_ternary()) { return "TERNARY"; }
+    if (domain == execution_domain_binary()) { return "BINARY"; }
+    return "UNSPECIFIED";
+}
+
+struct ExecutionSupport {
+    ternary: t9,
+    binary: t9,
+}
+
+struct ExecutionManifest {
+    name: []u8,
+    support: ExecutionSupport,
+    ternary_entry: []u8,
+    binary_entry: []u8,
+}
+
+fn execution_manifest(
+    name: []u8,
+    ternary_entry: []u8,
+    binary_entry: []u8,
+) ExecutionManifest {
+    let has_ternary: t9 = 0;
+    let has_binary: t9 = 0;
+    if (ternary_entry.len > 0) { has_ternary = 1; }
+    if (binary_entry.len > 0) { has_binary = 1; }
+    return ExecutionManifest{
+        .name = name,
+        .support = ExecutionSupport{ .ternary = has_ternary, .binary = has_binary },
+        .ternary_entry = ternary_entry,
+        .binary_entry = binary_entry,
+    };
+}
+
+fn execution_manifest_valid(manifest: ExecutionManifest) i32 {
+    if (manifest.name.len < 1 || manifest.name.len > 81) { return 0; }
+    if (manifest.support.ternary != 1 && manifest.support.binary != 1) { return 0; }
+    if (manifest.support.ternary == 1 && manifest.ternary_entry.len < 1) { return 0; }
+    if (manifest.support.binary == 1 && manifest.binary_entry.len < 1) { return 0; }
+    return 1;
+}
+
+fn execution_manifest_entry(manifest: ExecutionManifest, requested: t9) []u8 {
+    let domain: t9 = execution_resolve(requested, manifest.support);
+    if (domain == execution_domain_ternary()) { return manifest.ternary_entry; }
+    if (domain == execution_domain_binary()) { return manifest.binary_entry; }
+    return "";
+}
+
+fn execution_support(ternary: t9, binary: t9) ExecutionSupport {
+    let t: t9 = 0;
+    let b: t9 = 0;
+    if (ternary == 1) { t = 1; }
+    if (binary == 1) { b = 1; }
+    return ExecutionSupport{ .ternary = t, .binary = b };
+}
+
+fn execution_supports(support: ExecutionSupport, domain: t9) i32 {
+    if (domain == execution_domain_ternary() && support.ternary == 1) { return 1; }
+    if (domain == execution_domain_binary() && support.binary == 1) { return 1; }
+    return 0;
+}
+
+// Unspecified means the RayOS default, not "choose whatever happens to run".
+// A binary-only package therefore still requires an explicit binary request.
+fn execution_resolve(requested: t9, support: ExecutionSupport) t9 {
+    let domain: t9 = requested;
+    if (domain == execution_domain_unspecified()) {
+        domain = execution_domain_ternary();
+    }
+    if (execution_supports(support, domain) == 1) { return domain; }
+    return execution_domain_unspecified();
+}
+
+fn execution_is_compatibility(domain: t9) i32 {
+    if (domain == execution_domain_binary()) { return 1; }
+    return 0;
+}
+
+// Binary chambers receive mediated service capabilities. Direct access to the
+// native ternary address space and photonic control plane is never grantable.
+struct ExecutionCapabilities {
+    display_proxy: t9,
+    input_proxy: t9,
+    filesystem_proxy: t9,
+    network_proxy: t9,
+    native_memory: t9,
+    fabric_control: t9,
+}
+
+fn execution_native_capabilities() ExecutionCapabilities {
+    return ExecutionCapabilities{
+        .display_proxy = 1,
+        .input_proxy = 1,
+        .filesystem_proxy = 1,
+        .network_proxy = 1,
+        .native_memory = 1,
+        .fabric_control = 1,
+    };
+}
+
+fn execution_binary_capabilities() ExecutionCapabilities {
+    return ExecutionCapabilities{
+        .display_proxy = 1,
+        .input_proxy = 1,
+        .filesystem_proxy = 1,
+        .network_proxy = 1,
+        .native_memory = 0,
+        .fabric_control = 0,
+    };
+}
+
+fn execution_denied_capabilities() ExecutionCapabilities {
+    return ExecutionCapabilities{
+        .display_proxy = 0,
+        .input_proxy = 0,
+        .filesystem_proxy = 0,
+        .network_proxy = 0,
+        .native_memory = 0,
+        .fabric_control = 0,
+    };
+}
+
+fn execution_capabilities_for(domain: t9) ExecutionCapabilities {
+    if (domain == execution_domain_binary()) {
+        return execution_binary_capabilities();
+    }
+    if (domain == execution_domain_ternary()) {
+        return execution_native_capabilities();
+    }
+    return execution_denied_capabilities();
+}

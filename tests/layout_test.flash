@@ -1,0 +1,65 @@
+@import("../../flash/flash/ui/layout.flash")
+
+fn expect(tag: []u8, got: i32, want: i32) i32 {
+    if (got != want) {
+        _zag_print("FAIL "); _zag_print(tag);
+        _zag_print(" got="); _zag_print(_zag_i64_to_str(got as i64));
+        _zag_print(" want="); _zag_println(_zag_i64_to_str(want as i64));
+        return 1;
+    }
+    return 0;
+}
+
+fn main() i32 {
+    _zag_println("layout_test: running");
+    let L: Layout = layout_new();
+    // column 400x300, pad 16, gap 8: header(fixed 40) / body(grow) / footer(fixed 30)
+    let root: i32 = layout_root(&L, 1, LAYOUT_COL(), 400, 300);
+    layout_set_pad(&L, root, 16, 16, 16, 16);
+    layout_set_gap(&L, root, 8);
+    layout_set_flow(&L, root, LAYOUT_START(), LAYOUT_STRETCH());
+
+    let header: i32 = layout_add(&L, root, 10, LAYOUT_ROW());
+    layout_set_size(&L, header, LAYOUT_GROW(), 0, LAYOUT_FIXED(), 40);
+    let body: i32 = layout_add(&L, root, 20, LAYOUT_COL());
+    layout_set_size(&L, body, LAYOUT_GROW(), 0, LAYOUT_GROW(), 0);
+    let footer: i32 = layout_add(&L, root, 30, LAYOUT_ROW());
+    layout_set_size(&L, footer, LAYOUT_GROW(), 0, LAYOUT_FIXED(), 30);
+    let _b: i32 = body; let _h: i32 = header; let _f: i32 = footer;
+
+    layout_solve(&L, root, 0, 0);
+    let rc: i32 = 0;
+    let rh: LayoutRect = layout_rect(&L, 10);
+    let rb: LayoutRect = layout_rect(&L, 20);
+    let rf: LayoutRect = layout_rect(&L, 30);
+    // inner: x16 y16 w368 h268; gaps: 268-40-30-16 = 182 body height
+    rc = rc + expect("header.x", rh.x, 16);
+    rc = rc + expect("header.y", rh.y, 16);
+    rc = rc + expect("header.w", rh.w, 368);
+    rc = rc + expect("header.h", rh.h, 40);
+    rc = rc + expect("body.y", rb.y, 64);           // 16 + 40 + 8
+    rc = rc + expect("body.h", rb.h, 182);          // 268 - 40 - 30 - 16
+    rc = rc + expect("footer.y", rf.y, 254);        // 16 + 40 + 8 + 182 + 8
+    rc = rc + expect("footer.h", rf.h, 30);
+
+    // hit-testing by pixel -> id
+    rc = rc + expect("hit body", layout_hit(&L, 200, 150), 20);
+    rc = rc + expect("hit footer", layout_hit(&L, 200, 260), 30);
+
+    // row with 3 equal-grow items and gap 10 in a 320-wide row (pad 0)
+    let L2: Layout = layout_new();
+    let r2: i32 = layout_root(&L2, 1, LAYOUT_ROW(), 320, 50);
+    layout_set_gap(&L2, r2, 10);
+    let a: i32 = layout_add(&L2, r2, 100, LAYOUT_ROW()); layout_set_size(&L2, a, LAYOUT_GROW(),0,LAYOUT_GROW(),0);
+    let b2: i32 = layout_add(&L2, r2, 101, LAYOUT_ROW()); layout_set_size(&L2, b2, LAYOUT_GROW(),0,LAYOUT_GROW(),0);
+    let cc: i32 = layout_add(&L2, r2, 102, LAYOUT_ROW()); layout_set_size(&L2, cc, LAYOUT_GROW(),0,LAYOUT_GROW(),0);
+    let _x: i32 = a + b2 + cc;
+    layout_solve(&L2, r2, 0, 0);
+    // free = 320 - 0 - 20 gaps = 300 / 3 = 100 each
+    rc = rc + expect("3col a.w", layout_rect(&L2,100).w, 100);
+    rc = rc + expect("3col b.x", layout_rect(&L2,101).x, 110);
+    rc = rc + expect("3col c.x", layout_rect(&L2,102).x, 220);
+
+    if (rc == 0) { _zag_println("layout_test: flexbox rows/cols/grow/gap/pad/hit ok"); _zag_println("layout_test: ok"); return 0; }
+    _zag_println("layout_test: FAILURES"); return 1;
+}

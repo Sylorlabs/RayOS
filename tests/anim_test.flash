@@ -1,0 +1,29 @@
+@import("../../flash/flash/ui/anim.flash")
+fn approx(a: f32, b: f32) i32 { let d: f32 = a - b; if (d < 0.0) { d = 0.0 - d; } if (d < 0.5) { return 1; } return 0; }
+fn main() i32 {
+    _zag_println("anim_test: running");
+    // endpoints for every easing
+    let k: i32 = 0;
+    while (k <= 6) {
+        if (approx(ease(k, 0.0), 0.0) == 0) { _zag_print("FAIL ease start k="); _zag_println(_zag_i64_to_str(k as i64)); return 1; }
+        if (approx(ease(k, 1.0), 1.0) == 0) { _zag_print("FAIL ease end k="); _zag_println(_zag_i64_to_str(k as i64)); return 1; }
+        k = k + 1;
+    }
+    // tween 0->100 over 1s, tick to completion
+    let t: Tween = tween_new(0.0, 100.0, 1.0, EASE_OUT_CUBIC());
+    if (approx(tween_value(&t), 0.0) == 0) { _zag_println("FAIL tween start"); return 1; }
+    tween_tick(&t, 0.5);
+    let mid: f32 = tween_value(&t);
+    if (mid <= 40.0 || mid >= 100.0) { _zag_println("FAIL tween mid (ease-out should be past halfway)"); return 1; }
+    tween_tick(&t, 0.6);
+    if (approx(tween_value(&t), 100.0) == 0) { _zag_println("FAIL tween end"); return 1; }
+    if (tween_done(&t) != 1) { _zag_println("FAIL tween done"); return 1; }
+    // retarget mid-flight
+    let t2: Tween = tween_new(0.0, 100.0, 1.0, EASE_LINEAR());
+    tween_tick(&t2, 0.5);   // value 50
+    tween_to(&t2, 0.0);     // now animate 50 -> 0
+    if (approx(tween_value(&t2), 50.0) == 0) { _zag_println("FAIL retarget start"); return 1; }
+    _zag_println("anim_test: easing + tween + retarget ok");
+    _zag_println("anim_test: ok");
+    return 0;
+}

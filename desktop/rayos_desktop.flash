@@ -64,7 +64,11 @@ fn rayos_desktop_spawn_guest_window_at(
     if (guest_id != 1) {
         guest_fb_fill(comp.*.guest_pool, off, gw, gh, r, g, b);
     }
-    return wm_add_window(
+    let task_id: t27 = scheduler_spawn_domain(
+        &comp.*.scheduler, 0, title, 0, execution_domain_binary(),
+    );
+    if (task_id == scheduler_no_task()) { return 0 - 1; }
+    let win_id: i32 = wm_add_window_domain(
         &comp.*.wm,
         title,
         x,
@@ -74,7 +78,13 @@ fn rayos_desktop_spawn_guest_window_at(
         wm_content_guest(),
         guest_id,
         off,
+        task_id,
+        execution_domain_binary(),
     );
+    if (win_id < 0) {
+        let _exit: i32 = scheduler_exit(&comp.*.scheduler, task_id, 0 - 1);
+    }
+    return win_id;
 }
 
 fn rayos_desktop_spawn_guest_window(comp: *Compositor) i32 {
@@ -101,7 +111,11 @@ fn rayos_desktop_spawn_native_window(
     w: i32,
     h: i32,
 ) i32 {
-    return wm_add_window(
+    let task_id: t27 = scheduler_spawn_domain(
+        &comp.*.scheduler, 0, title, 0, execution_domain_ternary(),
+    );
+    if (task_id == scheduler_no_task()) { return 0 - 1; }
+    let win_id: i32 = wm_add_window_domain(
         &comp.*.wm,
         title,
         x,
@@ -111,14 +125,23 @@ fn rayos_desktop_spawn_native_window(
         content_kind,
         0,
         0,
+        task_id,
+        execution_domain_ternary(),
     );
+    if (win_id < 0) {
+        let _exit: i32 = scheduler_exit(&comp.*.scheduler, task_id, 0 - 1);
+    }
+    return win_id;
 }
 
-fn rayos_desktop_spawn_launcher_app(comp: *Compositor, app_id: i32) void {
-    if (app_id < 0) { return; }
+fn rayos_desktop_spawn_launcher_app(comp: *Compositor, app_id: i32, requested: t9) i32 {
+    if (app_id < 0) { return 0 - 1; }
+    let resolved: t9 = launcher_app_resolve_domain(app_id, requested);
+    if (resolved == execution_domain_unspecified()) { return 0 - 2; }
     let title: []u8 = launcher_app_title(app_id);
     let kind: i32 = launcher_app_content_kind(app_id);
     if (kind == wm_content_guest()) {
+        if (resolved != execution_domain_binary()) { return 0 - 3; }
         let gid: i32 = launcher_app_guest_id(app_id);
         let rr: i32 = 48;
         let rg: i32 = 180;
@@ -141,14 +164,16 @@ fn rayos_desktop_spawn_launcher_app(comp: *Compositor, app_id: i32) void {
             rb,
         );
         comp_set_guest_vms(comp, wm_count_visible(&comp.*.wm));
-        return;
+        return _id;
     }
+    if (resolved != execution_domain_ternary()) { return 0 - 3; }
     let win_w: i32 = 520;
     let win_h: i32 = 360;
     if (kind == wm_content_tasks()) { win_w = 720; win_h = 460; }
     if (kind == wm_content_files()) { win_w = 680; win_h = 440; }
     if (kind == wm_content_browser()) { win_w = 820; win_h = 560; }
     let _id2: i32 = rayos_desktop_spawn_native_window(comp, title, kind, 200, 120, win_w, win_h);
+    return _id2;
 }
 
 fn rayos_desktop_spawn_desktop_icon(comp: *Compositor, icon_id: i32) void {
@@ -185,7 +210,7 @@ fn rayos_desktop_handle_shell(
 }
 
 fn rayos_desktop_handle_launcher(comp: *Compositor, mx: i32, my: i32, btn: i32) i32 {
-    if (launcher_is_open(comp.*.launcher) == 0 && comp.*.launcher.slide <= 0.001) {
+    if (launcher_is_open(comp.*.launcher) == 0 && comp.*.launcher.slide <= 0.5) {
         return 0;
     }
     let hit: i32 = launcher_hit_test(&comp.*.launcher, &comp.*.wm, mx, my);
@@ -197,9 +222,20 @@ fn rayos_desktop_handle_launcher(comp: *Compositor, mx: i32, my: i32, btn: i32) 
         if (hit == launcher_hit_search()) {
             return 1;
         }
+        if (hit == launcher_hit_ternary()) {
+            let _t: i32 = launcher_select_domain(&comp.*.launcher, execution_domain_ternary());
+            return 1;
+        }
+        if (hit == launcher_hit_binary()) {
+            let _b: i32 = launcher_select_domain(&comp.*.launcher, execution_domain_binary());
+            return 1;
+        }
         if (hit >= 0) {
-            rayos_desktop_spawn_launcher_app(comp, hit);
-            comp_launcher_close(comp);
+            let domain: t9 = launcher_prepare_launch(&comp.*.launcher, hit);
+            if (domain != execution_domain_unspecified()) {
+                let launched: i32 = rayos_desktop_spawn_launcher_app(comp, hit, domain);
+                if (launched >= 0) { comp_launcher_close(comp); }
+            }
             return 1;
         }
     }
@@ -227,6 +263,10 @@ fn rayos_desktop_handle_window_press(
     if (win_id < 0) { return; }
 
     if (hit == wm_hit_close()) {
+        let victim: RayWindow = wm_get(&comp.*.wm, win_id);
+        if (victim.task_id != scheduler_no_task()) {
+            let _exit: i32 = scheduler_exit(&comp.*.scheduler, victim.task_id, 0);
+        }
         wm_close(&comp.*.wm, win_id);
         drag.*.active = 0;
         drag.*.win_id = -1;
@@ -263,9 +303,12 @@ fn rayos_desktop_handle_key(comp: *Compositor, code: i32) void {
         if (rc == 2) {
             let app: LauncherApp = launcher_filtered_at(&comp.*.launcher, 0);
             if (app.id >= 0) {
-                rayos_desktop_spawn_launcher_app(comp, app.id);
+                let domain: t9 = launcher_prepare_launch(&comp.*.launcher, app.id);
+                if (domain != execution_domain_unspecified()) {
+                    let launched: i32 = rayos_desktop_spawn_launcher_app(comp, app.id, domain);
+                    if (launched >= 0) { comp_launcher_close(comp); }
+                }
             }
-            comp_launcher_close(comp);
             return;
         }
         if (rc == 3) {
@@ -541,6 +584,7 @@ fn rayos_desktop_run_live(max_frames: i32) i32 {
             comp_set_guest_vms(&comp, vms);
             comp_set_network(&comp, 0);
             comp_render_full(&comp);
+            comp_publish_registry(&comp);
             let _blit: i32 = scanout_blit(&comp.fb);
             let _pres: i32 = scanout_present();
             let _live: i32 = scanout_live_present_once(live_path);

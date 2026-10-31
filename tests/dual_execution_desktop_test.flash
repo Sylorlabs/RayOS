@@ -1,0 +1,71 @@
+@import("../desktop/rayos_desktop.flash")
+
+fn dual_test_fail(msg: []u8) void {
+    _zag_print("dual_execution_desktop_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn dual_expect(ok: i32, msg: []u8) void {
+    if (ok == 0) { dual_test_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("dual_execution_desktop_test: running");
+    let comp: Compositor = comp_new(800, 600);
+
+    dual_expect(
+        comp.launcher.execution_domain == execution_domain_ternary(),
+        "launcher defaults to balanced ternary",
+    );
+    dual_expect(
+        launcher_prepare_launch(&comp.launcher, launcher_app_files()) == execution_domain_ternary(),
+        "native app accepts ternary choice",
+    );
+    dual_expect(
+        launcher_prepare_launch(&comp.launcher, launcher_app_linux()) == execution_domain_unspecified(),
+        "binary guest denied without explicit binary choice",
+    );
+
+    dual_expect(
+        launcher_select_domain(&comp.launcher, execution_domain_binary()) == 1,
+        "binary selection",
+    );
+    dual_expect(
+        launcher_prepare_launch(&comp.launcher, launcher_app_terminal()) == execution_domain_unspecified(),
+        "native app denied in binary mode without binary package",
+    );
+    let binary_domain: t9 = launcher_prepare_launch(&comp.launcher, launcher_app_linux());
+    dual_expect(binary_domain == execution_domain_binary(), "binary guest authorized explicitly");
+    let binary_window: i32 = rayos_desktop_spawn_launcher_app(
+        &comp, launcher_app_linux(), binary_domain,
+    );
+    dual_expect(binary_window > 0, "binary guest window spawned");
+    let binary_win: RayWindow = wm_get(&comp.wm, binary_window);
+    dual_expect(binary_win.execution_domain == execution_domain_binary(), "window records binary domain");
+    dual_expect(binary_win.task_id > 0, "binary window owns task");
+    dual_expect(
+        scheduler_task(&comp.scheduler, binary_win.task_id).execution_domain == execution_domain_binary(),
+        "scheduler records binary domain",
+    );
+
+    dual_expect(
+        launcher_select_domain(&comp.launcher, execution_domain_ternary()) == 1,
+        "ternary selection",
+    );
+    let native_domain: t9 = launcher_prepare_launch(&comp.launcher, launcher_app_files());
+    let native_window: i32 = rayos_desktop_spawn_launcher_app(
+        &comp, launcher_app_files(), native_domain,
+    );
+    dual_expect(native_window > 0, "ternary app window spawned");
+    let native_win: RayWindow = wm_get(&comp.wm, native_window);
+    dual_expect(native_win.execution_domain == execution_domain_ternary(), "window records ternary domain");
+    dual_expect(
+        scheduler_task(&comp.scheduler, native_win.task_id).execution_domain == execution_domain_ternary(),
+        "scheduler records ternary domain",
+    );
+
+    comp_free(&comp);
+    _zag_println("dual_execution_desktop_test: ok");
+    return 0;
+}

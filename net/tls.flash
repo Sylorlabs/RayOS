@@ -5,16 +5,17 @@
 // 1-RTT handshake: ClientHello, key schedule (HKDF), decrypt of the server's
 // encrypted flight, client Finished, then encrypted application data.
 //
-// SECURITY CAVEAT — read this: the server certificate chain and
-// CertificateVerify signature are NOT yet validated. The channel is
-// ENCRYPTED but NOT AUTHENTICATED, so it is not safe against an active
-// man-in-the-middle. This is the "HTTPS transport works" milestone; the cert
-// trust store + RSA/ECDSA signature verification is the next security layer.
-// tls_last_authenticated() reports 0 to make this explicit to callers.
+// SECURITY: the handshake is authenticated. tls_authenticate() verifies the
+// server CertificateVerify signature (proving leaf-key possession), validates
+// the certificate chain to a trusted root (net/certverify.flash), and checks
+// the hostname and validity dates — the handshake ABORTS (fails closed) on any
+// failure, including unsupported key types. Scope: ECDSA P-256/P-384 chains
+// (the modern web); RSA chains are rejected (safe) pending an RSA verifier.
 //
 //   let n: i32 = tls_https_get("example.com", 443, "/", out, cap);
 
 @import("crypto.flash")
+@import("certverify.flash")
 @import("../driver/net_socket.flash")
 
 struct TlsConn {
@@ -34,7 +35,7 @@ struct TlsConn {
 }
 
 fn tls_ok() i32 { return 0; }
-fn tls_last_authenticated() i32 { return 0; }   // cert validation not yet implemented
+fn tls_last_authenticated() i32 { return 1; }   // chain + CertVerify validated
 
 // ── little appenders over a (*i8, pos) cursor ────────────────────────────────
 
@@ -322,6 +323,102 @@ fn tls_parse_server_hello(sh: *i8, shlen: i32, server_pub: *i8) i32 {
     return 0 - 2;
 }
 
+
+// ── certificate authentication (MITM protection) ─────────────────────────────
+//
+// Validates the server's Certificate chain and CertificateVerify signature.
+// `pre` = transcript bytes (ClientHello..EncryptedExtensions boundary already
+// in c.transcript, length preLen) captured BEFORE the server flight; hs is the
+// decrypted handshake flight. Returns 1 iff the server is authenticated for
+// `host`. Fails CLOSED on anything unsupported.
+fn tls_authenticate(c: *TlsConn, hs: *i8, hslen: i32, host: []u8) i32 {
+    // walk handshake messages to locate Certificate (11) and CertVerify (15)
+    let mo: i32 = 0;
+    let cert_msg: i32 = 0 - 1;
+    let cert_end: i32 = 0 - 1;
+    let cv_msg: i32 = 0 - 1;
+    while (mo + 4 <= hslen) {
+        let mtype: i32 = (hs[mo] as u8) as i32;
+        let mlen: i32 = tls_rd24(hs, mo + 1);
+        let mend: i32 = mo + 4 + mlen;
+        if (mtype == 11) { cert_msg = mo; cert_end = mend; }
+        if (mtype == 15) { cv_msg = mo; }
+        mo = mend;
+    }
+    if (cert_msg < 0 || cv_msg < 0) { return 0; }
+
+    // parse the certificate_list into DER cert offsets within hs
+    let body: i32 = cert_msg + 4;
+    let ctx_len: i32 = (hs[body] as u8) as i32;
+    let listp: i32 = body + 1 + ctx_len;
+    let list_len: i32 = tls_rd24(hs, listp);
+    let e: i32 = listp + 3;
+    let list_end: i32 = e + list_len;
+    let cert_off: *i32 = _zag_malloc(16 * 4) as *i32;
+    let count: i32 = 0;
+    while (e + 3 <= list_end && count < 16) {
+        let clen: i32 = tls_rd24(hs, e);
+        cert_off[count] = e + 3;
+        count = count + 1;
+        e = e + 3 + clen;
+        let extlen: i32 = tls_rd16(hs, e);
+        e = e + 2 + extlen;
+    }
+    if (count < 1) { return 0; }
+
+    // leaf public key
+    let leafQx: *i64 = bn_new();
+    let leafQy: *i64 = bn_new();
+    let leafcurve: i32 = x509_pubkey(hs, cert_off[0], leafQx, leafQy);
+    if (leafcurve != X509_CURVE_P256() && leafcurve != X509_CURVE_P384()) { return 0; }
+
+    // CertificateVerify context hash = SHA-256(transcript_before || EE || Certificate)
+    let cvhash: *i8 = _zag_malloc(32);
+    let tmp: *i8 = _zag_malloc(c.*.tlen + cert_end + 16);
+    let n: i32 = 0;
+    let k: i32 = 0;
+    while (k < c.*.tlen) { tmp[n] = c.*.transcript[k]; n = n + 1; k = k + 1; }
+    k = 0;
+    while (k < cert_end) { tmp[n] = hs[k]; n = n + 1; k = k + 1; }
+    sha256(tmp, n, cvhash);
+
+    // build signed content: 64*0x20 || "TLS 1.3, server CertificateVerify" || 0x00 || cvhash
+    let content: *i8 = _zag_malloc(200);
+    let cn: i32 = 0;
+    while (cn < 64) { content[cn] = 32 as i8; cn = cn + 1; }
+    let label: []u8 = "TLS 1.3, server CertificateVerify";
+    let li: i32 = 0;
+    while (li < label.len) { content[cn] = label[li] as i8; cn = cn + 1; li = li + 1; }
+    content[cn] = 0 as i8; cn = cn + 1;
+    let hi: i32 = 0;
+    while (hi < 32) { content[cn] = cvhash[hi] as i8; cn = cn + 1; hi = hi + 1; }
+
+    // CertVerify body: scheme(2) len(2) signature(DER SEQ{r,s})
+    let cvb: i32 = cv_msg + 4;
+    let scheme: i32 = tls_rd16(hs, cvb);
+    let L: i32 = 16;
+    let digest: *i8 = _zag_malloc(64);
+    let dlen: i32 = 0;
+    if (scheme == 1027) { sha256(content, cn, digest); dlen = 32; L = 16; }   // ecdsa_secp256r1_sha256
+    else if (scheme == 1283) { sha384(content, cn, digest); dlen = 48; L = 24; }  // ecdsa_secp384r1_sha384
+    else { return 0; }
+    // signature DER at cvb+4
+    let sigp: i32 = cvb + 4;
+    let rr: *i64 = bn_new();
+    let ss: *i64 = bn_new();
+    x509_sig_rs_at(hs, sigp, rr, ss, L);
+    let z: *i64 = bn_new();
+    cv_digest_bn(digest, dlen, L, z);
+    let cv_ok: i32 = 0;
+    if (scheme == 1027) { cv_ok = ecdsa_verify_p256(leafQx, leafQy, z, rr, ss); }
+    else { cv_ok = ecdsa_verify_p384(leafQx, leafQy, z, rr, ss); }
+    if (cv_ok == 0) { return 0; }
+
+    // chain validation to a trusted root + hostname + dates
+    let now: i64 = _zag_raw_syscall(201, 0, 0, 0, 0, 0, 0);
+    return certverify_chain(hs, cert_off, count, host, now);
+}
+
 // Full handshake + HTTP GET. Writes the decrypted HTTP response into out,
 // returns its length, or a negative TLS error.
 fn tls_https_get(host: []u8, port: i32, path: []u8, out: *i8, cap: i32) i32 {
@@ -391,6 +488,13 @@ fn tls_https_get(host: []u8, port: i32, path: []u8, out: *i8, cap: i32) i32 {
         guard = guard + 1;
     }
     if (saw_finished == 0) { net_tcp_close(fd); return 0 - 16; }
+
+    // authenticate the server BEFORE trusting the channel (MITM protection)
+    if (tls_authenticate(c, hs_stream, hs_len, host) == 0) {
+        net_tcp_close(fd);
+        return 0 - 30;   // certificate validation failed — refuse to continue
+    }
+
     // append the full server handshake flight to the transcript
     tls_transcript_add(c, hs_stream, hs_len);
 

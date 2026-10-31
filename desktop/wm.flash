@@ -6,6 +6,7 @@
 //   let hit: i32 = wm_hit_test(&wm, mx, my);
 
 @import("theme.flash")
+@import("../core/execution_domain.flash")
 
 fn wm_content_native() i32 { return 0; }
 fn wm_content_guest() i32 { return 1; }
@@ -40,6 +41,8 @@ struct RayWindow {
     content_kind: i32,
     guest_id: i32,
     fb_offset: i32,
+    task_id: t27,
+    execution_domain: t9,
     ver: i32,        // bumped on any visual state change (chrome or content)
     cache_fb: i64,   // retained render of this window (*SoftFb), 0 = none
     cache_ver: i32,  // ver the cache was rendered at
@@ -96,6 +99,8 @@ fn wm_get(wm: *WmState, id: i32) RayWindow {
             .content_kind = 0,
             .guest_id = 0,
             .fb_offset = 0,
+            .task_id = 0 - 1,
+            .execution_domain = execution_domain_ternary(),
             .ver = 0,
             .cache_fb = 0,
             .cache_ver = 0,
@@ -124,6 +129,26 @@ fn wm_add_window(
     guest_id: i32,
     fb_offset: i32,
 ) i32 {
+    return wm_add_window_domain(
+        wm, title, x, y, w, h, content_kind, guest_id, fb_offset,
+        0 - 1, execution_domain_ternary(),
+    );
+}
+
+fn wm_add_window_domain(
+    wm: *WmState,
+    title: []u8,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    content_kind: i32,
+    guest_id: i32,
+    fb_offset: i32,
+    task_id: t27,
+    execution_domain: t9,
+) i32 {
+    if (execution_domain_valid(execution_domain) == 0) { return 0 - 1; }
     wm.*.z_top = wm.*.z_top + 1;
     let id: i32 = wm.*.next_id;
     wm.*.next_id = wm.*.next_id + 1;
@@ -145,6 +170,8 @@ fn wm_add_window(
         .content_kind = content_kind,
         .guest_id = guest_id,
         .fb_offset = fb_offset,
+        .task_id = task_id,
+        .execution_domain = execution_domain,
         .ver = 1,
         .cache_fb = 0,
         .cache_ver = 0,

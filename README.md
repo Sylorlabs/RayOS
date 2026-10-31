@@ -9,6 +9,13 @@ foundation with:
 ./build.sh
 ```
 
+Balanced ternary is the native and default execution domain. Users may also
+explicitly select a binary compatibility chamber for packages that provide a
+binary entry point. RayOS never silently falls back from ternary to binary;
+binary guests receive mediated display/input/files/network proxies and cannot
+directly access native ternary memory or the photonic fabric. See
+`docs/EXECUTION_DOMAINS.md` and `docs/RAYOS_MISSION.md`.
+
 The build uses Flash's bundled standalone backend. It no longer requires the
 sibling Zag repository. `tests/pure_flash_tree.sh` blocks C, C++, Rust, Python,
 Zig, or direct foreign-runtime imports from implementation directories.
@@ -36,9 +43,12 @@ Screenshots produced by the gate are `desktop/task-manager.ppm`,
 
 RayOS is not yet a complete general-purpose OS or standards-conformant web
 browser. TriFS currently provides the VFS/transaction core but is not yet
-crash-persistent on ternary media. Ray Browser does not yet implement HTTP,
-URL parsing, CSS, scripting, accessibility trees, TLS, media, or the web
-platform test corpus. Kernel capabilities, users/security domains, IPC,
+crash-persistent on ternary media. Ray Browser has HTTP/1.1 and URL parsing.
+Authenticated TLS 1.3 and ECDSA P-256/P-384 chain verification are in progress
+but are not currently build- or test-verified by the Flash frontend, so they
+are not release capabilities. The browser also does not yet implement CSS,
+scripting, accessibility trees, RSA cert chains, media, or the web platform
+test corpus. Kernel capabilities, users/security domains, IPC,
 network sockets, audio, power management, installation/update recovery, and
 real ternary hardware boot also remain release blockers.
 

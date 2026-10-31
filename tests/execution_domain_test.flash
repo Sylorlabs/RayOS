@@ -1,0 +1,87 @@
+@import("../core/execution_domain.flash")
+
+fn execution_test_fail(msg: []u8) void {
+    _zag_print("execution_domain_test FAIL: ");
+    _zag_println(msg);
+    _zag_exit(1);
+}
+
+fn execution_expect(ok: i32, msg: []u8) void {
+    if (ok == 0) { execution_test_fail(msg); }
+}
+
+fn main() i32 {
+    _zag_println("execution_domain_test: running");
+
+    let native_only: ExecutionSupport = execution_support(1, 0);
+    let binary_only: ExecutionSupport = execution_support(0, 1);
+    let dual: ExecutionSupport = execution_support(1, 1);
+
+    execution_expect(
+        execution_resolve(execution_domain_unspecified(), native_only) == execution_domain_ternary(),
+        "unspecified defaults to balanced ternary",
+    );
+    execution_expect(
+        execution_resolve(execution_domain_unspecified(), binary_only) == execution_domain_unspecified(),
+        "binary-only never launches implicitly",
+    );
+    execution_expect(
+        execution_resolve(execution_domain_binary(), native_only) == execution_domain_unspecified(),
+        "unsupported binary request fails closed",
+    );
+    execution_expect(
+        execution_resolve(execution_domain_ternary(), binary_only) == execution_domain_unspecified(),
+        "unsupported ternary request fails closed",
+    );
+    execution_expect(
+        execution_resolve(execution_domain_binary(), dual) == execution_domain_binary(),
+        "dual package honors explicit binary choice",
+    );
+    execution_expect(
+        execution_resolve(execution_domain_ternary(), dual) == execution_domain_ternary(),
+        "dual package honors explicit ternary choice",
+    );
+
+    let dual_manifest: ExecutionManifest = execution_manifest(
+        "dual-tool", "app/dual-tool.ray", "compat/dual-tool.elf",
+    );
+    execution_expect(execution_manifest_valid(dual_manifest) == 1, "dual manifest valid");
+    execution_expect(
+        execution_manifest_entry(dual_manifest, execution_domain_unspecified()).len > 0,
+        "dual manifest defaults to ternary entry",
+    );
+    execution_expect(
+        execution_manifest_entry(dual_manifest, execution_domain_binary()).len > 0,
+        "dual manifest exposes explicit binary entry",
+    );
+    let binary_manifest: ExecutionManifest = execution_manifest(
+        "foreign-tool", "", "compat/foreign-tool.elf",
+    );
+    execution_expect(execution_manifest_valid(binary_manifest) == 1, "binary manifest valid");
+    execution_expect(
+        execution_manifest_entry(binary_manifest, execution_domain_unspecified()).len == 0,
+        "binary manifest never auto-falls back",
+    );
+
+    let binary_caps: ExecutionCapabilities = execution_capabilities_for(execution_domain_binary());
+    execution_expect(binary_caps.display_proxy == 1, "binary display proxy");
+    execution_expect(binary_caps.filesystem_proxy == 1, "binary filesystem proxy");
+    execution_expect(binary_caps.network_proxy == 1, "binary network proxy");
+    execution_expect(binary_caps.native_memory == 0, "binary native memory denied");
+    execution_expect(binary_caps.fabric_control == 0, "binary fabric control denied");
+
+    let native_caps: ExecutionCapabilities = execution_capabilities_for(execution_domain_ternary());
+    execution_expect(native_caps.native_memory == 1, "ternary native memory");
+    execution_expect(native_caps.fabric_control == 1, "ternary fabric control");
+
+    let invalid_caps: ExecutionCapabilities = execution_capabilities_for(
+        execution_domain_unspecified(),
+    );
+    execution_expect(invalid_caps.display_proxy == 0, "invalid domain display denied");
+    execution_expect(invalid_caps.network_proxy == 0, "invalid domain network denied");
+    execution_expect(invalid_caps.native_memory == 0, "invalid domain native memory denied");
+    execution_expect(invalid_caps.fabric_control == 0, "invalid domain fabric denied");
+
+    _zag_println("execution_domain_test: ok");
+    return 0;
+}

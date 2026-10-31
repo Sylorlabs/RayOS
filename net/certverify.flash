@@ -1,0 +1,168 @@
+// net/certverify.flash — X.509 chain validation to a trusted root store.
+//
+// Given the DER certificates from a TLS Certificate message, validates:
+//   1. each cert's ECDSA signature verifies under the next cert's public key
+//   2. the topmost cert is issued by a root in the trust store (subject-DN
+//      exact match) and its signature verifies under that root's key
+//   3. the leaf's SubjectAltName matches the requested hostname
+//   4. every cert is within its validity window
+// Any failure — including an unsupported (e.g. RSA) key/signature — returns 0,
+// so TLS validation fails CLOSED. This is what makes the channel authenticated
+// and MITM-resistant.
+//
+// Trust store: /etc/ssl/certs/ca-certificates.crt (PEM) on Phase-1 hosts; a
+// provisioned root chamber on native RayOS.
+
+@import("x509.flash")
+@import("crypto.flash")
+
+// ── base64 / PEM ─────────────────────────────────────────────────────────────
+
+fn cv_b64val(c: i32) i32 {
+    if (c >= 65 && c <= 90) { return c - 65; }
+    if (c >= 97 && c <= 122) { return c - 97 + 26; }
+    if (c >= 48 && c <= 57) { return c - 48 + 52; }
+    if (c == 43) { return 62; }
+    if (c == 47) { return 63; }
+    return 0 - 1;
+}
+
+// Decode base64 (skipping whitespace/newlines) from src[off..off+n] into out.
+// Returns DER length.
+fn cv_b64_decode(src: []u8, off: i32, n: i32, out: *i8) i32 {
+    let acc: i32 = 0;
+    let bits: i32 = 0;
+    let w: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let c: i32 = src[off + i] as i32;
+        if (c == 61) { i = n; }   // '=' padding: stop
+        else {
+            let v: i32 = cv_b64val(c);
+            if (v >= 0) {
+                acc = (acc << 6) + v;
+                bits = bits + 6;
+                if (bits >= 8) {
+                    bits = bits - 8;
+                    out[w] = ((acc >> bits) & 255) as i8;
+                    w = w + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    return w;
+}
+
+// ── ECDSA signature check of a cert under an issuer key ───────────────────────
+
+// Load the message digest (hash of `dlen`-byte TBS) as a bignum truncated to
+// the curve order size, per ECDSA.
+fn cv_digest_bn(digest: *i8, digest_len: i32, curveL: i32, out: *i64) void {
+    let curve_bytes: i32 = curveL * 2;
+    let n: i32 = digest_len;
+    if (n > curve_bytes) { n = curve_bytes; }   // leftmost bytes
+    bn_from_be(out, digest, 0, n, curveL);
+}
+
+// Verify cert at `coff` in buffer `b` is signed by (issuer_curve, Qx, Qy).
+fn cv_verify_sig(b: *i8, coff: i32, issuer_curve: i32, Qx: *i64, Qy: *i64) i32 {
+    let hashid: i32 = x509_sig_hash(b, coff);
+    if (hashid == 0) { return 0; }
+    // hash the TBSCertificate bytes
+    let tbs: i32 = x509_tbs_pos(b, coff);
+    let tlen: i32 = der_end(b, tbs) - tbs;
+    let digest: *i8 = _zag_malloc(64);
+    let dlen: i32 = 0;
+    if (hashid == X509_HASH_SHA256()) { sha256(((b as i64) + (tbs as i64)) as *i8, tlen, digest); dlen = 32; }
+    else { sha384(((b as i64) + (tbs as i64)) as *i8, tlen, digest); dlen = 48; }
+
+    let L: i32 = 16;
+    if (issuer_curve == X509_CURVE_P384()) { L = 24; }
+    let r: *i64 = bn_new();
+    let s: *i64 = bn_new();
+    x509_sig_rs(b, coff, r, s, L);
+    let z: *i64 = bn_new();
+    cv_digest_bn(digest, dlen, L, z);
+
+    if (issuer_curve == X509_CURVE_P256()) { return ecdsa_verify_p256(Qx, Qy, z, r, s); }
+    if (issuer_curve == X509_CURVE_P384()) { return ecdsa_verify_p384(Qx, Qy, z, r, s); }
+    return 0;
+}
+
+// ── trust store lookup ───────────────────────────────────────────────────────
+//
+// Find a root whose subject DN equals `issuer` (in buffer ib), then verify the
+// top cert (at coff in ib) under that root's key. Returns 1 on success.
+
+fn cv_root_verify(ib: *i8, top_coff: i32) i32 {
+    let issuer: i32 = x509_issuer(ib, top_coff);
+    let pem: []u8 = _zag_read_file("/etc/ssl/certs/ca-certificates.crt");
+    if (pem.len < 1) { return 0; }
+    let der: *i8 = _zag_malloc(8192);
+    let i: i32 = 0;
+    while (i < pem.len) {
+        // find "-----BEGIN CERT"
+        if (i + 15 < pem.len && pem[i] == ('-' as u8) && pem[i + 5] == ('B' as u8)) {
+            // move to end of the BEGIN line
+            while (i < pem.len && pem[i] != ('\n' as u8)) { i = i + 1; }
+            i = i + 1;
+            let b64start: i32 = i;
+            // to "-----END"
+            while (i < pem.len && pem[i] != ('-' as u8)) { i = i + 1; }
+            let dlen: i32 = cv_b64_decode(pem, b64start, i - b64start, der);
+            if (dlen > 0) {
+                let rsubj: i32 = x509_subject(der, 0);
+                if (x509_der_equal(ib, issuer, der, rsubj) == 1) {
+                    // matching root: verify top cert under its key
+                    let rQx: *i64 = bn_new();
+                    let rQy: *i64 = bn_new();
+                    let rcurve: i32 = x509_pubkey(der, 0, rQx, rQy);
+                    if (rcurve == X509_CURVE_NONE()) { return 0; }
+                    return cv_verify_sig(ib, top_coff, rcurve, rQx, rQy);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;   // no trusted root found: fail closed
+}
+
+// ── full chain validation ────────────────────────────────────────────────────
+//
+// certs: buffer `b`, cert_off[] holds `count` DER cert offsets (leaf first).
+// Returns 1 iff the chain is valid and authenticated for `host` at `now`.
+fn certverify_chain(b: *i8, cert_off: *i32, count: i32, host: []u8, now: i64) i32 {
+    if (count < 1) { return 0; }
+    // hostname on the leaf
+    if (x509_hostname_ok(b, cert_off[0], host) == 0) { return 0; }
+    // validity of every cert
+    let i: i32 = 0;
+    while (i < count) {
+        if (x509_valid_at(b, cert_off[i], now) == 0) { return 0; }
+        i = i + 1;
+    }
+    // each cert signed by the next (issuer link)
+    i = 0;
+    while (i < count - 1) {
+        // issuer DN of cert[i] must equal subject DN of cert[i+1]
+        if (x509_der_equal(b, x509_issuer(b, cert_off[i]), b, x509_subject(b, cert_off[i + 1])) == 0) {
+            return 0;
+        }
+        let iQx: *i64 = bn_new();
+        let iQy: *i64 = bn_new();
+        let icurve: i32 = x509_pubkey(b, cert_off[i + 1], iQx, iQy);
+        if (icurve == X509_CURVE_NONE()) { return 0; }
+        if (cv_verify_sig(b, cert_off[i], icurve, iQx, iQy) == 0) { return 0; }
+        i = i + 1;
+    }
+    // Anchor: the chain is trusted as soon as ANY cert's issuer is a root in
+    // the store (all links below it are already verified). Handles servers
+    // that send the root explicitly or omit it.
+    let a: i32 = 0;
+    while (a < count) {
+        if (cv_root_verify(b, cert_off[a]) == 1) { return 1; }
+        a = a + 1;
+    }
+    return 0;
+}

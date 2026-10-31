@@ -1,0 +1,51 @@
+// desktop/launcher_policy.flash — renderer-independent launcher domain rules.
+// The visual launcher consumes this module; tests can exercise the exact same
+// package-choice policy without importing compositor paint dependencies.
+
+@import("../core/execution_domain.flash")
+
+fn launcher_app_none() i32     { return -1; }
+fn launcher_app_terminal() i32 { return 0; }
+fn launcher_app_settings() i32 { return 1; }
+fn launcher_app_linux() i32    { return 2; }
+fn launcher_app_windows() i32  { return 3; }
+fn launcher_app_files() i32    { return 4; }
+fn launcher_app_tasks() i32    { return 5; }
+fn launcher_app_browser() i32  { return 6; }
+
+fn launcher_policy_default_domain() t9 {
+    return execution_domain_ternary();
+}
+
+fn launcher_policy_select(domain: t9) t9 {
+    if (execution_domain_valid(domain) == 1) { return domain; }
+    return execution_domain_unspecified();
+}
+
+fn launcher_policy_toggle(domain: t9) t9 {
+    if (domain == execution_domain_ternary()) { return execution_domain_binary(); }
+    if (domain == execution_domain_binary()) { return execution_domain_ternary(); }
+    return execution_domain_unspecified();
+}
+
+fn launcher_app_support(app_id: i32) ExecutionSupport {
+    if (app_id == launcher_app_linux() || app_id == launcher_app_windows()) {
+        return execution_support(0, 1);
+    }
+    if (app_id >= launcher_app_terminal() && app_id <= launcher_app_browser()) {
+        return execution_support(1, 0);
+    }
+    return execution_support(0, 0);
+}
+
+fn launcher_app_resolve_domain(app_id: i32, requested: t9) t9 {
+    return execution_resolve(requested, launcher_app_support(app_id));
+}
+
+fn launcher_app_domain_badge(app_id: i32) []u8 {
+    let support: ExecutionSupport = launcher_app_support(app_id);
+    if (support.ternary == 1 && support.binary == 1) { return "T+B"; }
+    if (support.binary == 1) { return "B"; }
+    if (support.ternary == 1) { return "T"; }
+    return "-";
+}

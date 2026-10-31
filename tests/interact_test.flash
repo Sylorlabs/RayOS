@@ -1,0 +1,47 @@
+@import("../../flash/flash/ui/interact.flash")
+fn ok(tag: []u8, got: i32, want: i32) i32 {
+    if (got != want) { _zag_print("FAIL "); _zag_print(tag); _zag_print(" got="); _zag_print(_zag_i64_to_str(got as i64)); _zag_print(" want="); _zag_println(_zag_i64_to_str(want as i64)); return 1; }
+    return 0;
+}
+fn main() i32 {
+    _zag_println("interact_test: running");
+    // layout: row of two buttons in 200x50
+    let L: Layout = layout_new();
+    let root: i32 = layout_root(&L, 1, LAYOUT_ROW(), 200, 50);
+    let a: i32 = layout_add(&L, root, 10, LAYOUT_ROW()); layout_set_size(&L, a, LAYOUT_GROW(),0,LAYOUT_GROW(),0);
+    let b: i32 = layout_add(&L, root, 20, LAYOUT_ROW()); layout_set_size(&L, b, LAYOUT_GROW(),0,LAYOUT_GROW(),0);
+    let _x: i32 = a + b;
+    layout_solve(&L, root, 0, 0);   // btn 10: x0..100, btn 20: x100..200
+
+    let it: Interact = interact_new();
+    let rc: i32 = 0;
+    interact_hover(&it, &L, 50, 25);
+    rc = rc + ok("hover left", it.hovered, 10);
+    interact_hover(&it, &L, 150, 25);
+    rc = rc + ok("hover right", it.hovered, 20);
+    // press on right, release on right -> click 20
+    interact_press(&it, &L, 150, 25);
+    rc = rc + ok("focus on press", it.focused, 20);
+    interact_hover(&it, &L, 150, 25);
+    rc = rc + ok("release click", interact_release(&it, &L, 150, 25), 20);
+    // press on right, release on left -> no click (drag off)
+    interact_press(&it, &L, 150, 25);
+    interact_hover(&it, &L, 50, 25);
+    rc = rc + ok("drag-off no click", interact_release(&it, &L, 50, 25), 0 - 1);
+    // focus cycling
+    it.focused = 10;
+    interact_focus_next(&it, &L);
+    rc = rc + ok("tab next", it.focused, 20);
+    interact_focus_next(&it, &L);
+    rc = rc + ok("tab wrap to root", it.focused, 1);
+    // scroll clamp
+    rc = rc + ok("scroll clamp hi", interact_scroll(0, 500, 300, 100), 200);
+    rc = rc + ok("scroll clamp lo", interact_scroll(50, 0 - 200, 300, 100), 0);
+    // scrollbar thumb
+    let tt: i32 = 0; let th: i32 = 0;
+    let need: i32 = interact_scrollbar(100, 400, 100, 200, &tt, &th);
+    rc = rc + ok("scrollbar needed", need, 1);
+    rc = rc + ok("thumb height", th, 50);   // 100*200/400
+    if (rc == 0) { _zag_println("interact_test: hover/press/click/drag/focus/scroll ok"); _zag_println("interact_test: ok"); return 0; }
+    return 1;
+}

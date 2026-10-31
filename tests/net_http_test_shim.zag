@@ -1996,6 +1996,391 @@ fn aead_open(key: *i8, nonce: *i8, aad: *i8, aadlen: i32, ct: *i8, ctlen: i32, o
     return 1;
 }
 
+fn IMAX() i64 {
+    return 9223372036854775807;
+}
+
+fn lsr64(x: i64, n: i64) i64 {
+    if ((n == 0)) {
+        return x;
+    }
+    return (((x >> 1) & IMAX()) >> (n - 1));
+}
+
+fn rotr64(x: i64, n: i64) i64 {
+    return (lsr64(x, n) + (x << (64 - n)));
+}
+
+fn sha512_k(i: i32) i64 {
+    if ((i == 0)) {
+        return 4794697086780616226;
+    }
+    if ((i == 1)) {
+        return 8158064640168781261;
+    }
+    if ((i == 2)) {
+        return -5349999486874862801;
+    }
+    if ((i == 3)) {
+        return -1606136188198331460;
+    }
+    if ((i == 4)) {
+        return 4131703408338449720;
+    }
+    if ((i == 5)) {
+        return 6480981068601479193;
+    }
+    if ((i == 6)) {
+        return -7908458776815382629;
+    }
+    if ((i == 7)) {
+        return -6116909921290321640;
+    }
+    if ((i == 8)) {
+        return -2880145864133508542;
+    }
+    if ((i == 9)) {
+        return 1334009975649890238;
+    }
+    if ((i == 10)) {
+        return 2608012711638119052;
+    }
+    if ((i == 11)) {
+        return 6128411473006802146;
+    }
+    if ((i == 12)) {
+        return 8268148722764581231;
+    }
+    if ((i == 13)) {
+        return -9160688886553864527;
+    }
+    if ((i == 14)) {
+        return -7215885187991268811;
+    }
+    if ((i == 15)) {
+        return -4495734319001033068;
+    }
+    if ((i == 16)) {
+        return -1973867731355612462;
+    }
+    if ((i == 17)) {
+        return -1171420211273849373;
+    }
+    if ((i == 18)) {
+        return 1135362057144423861;
+    }
+    if ((i == 19)) {
+        return 2597628984639134821;
+    }
+    if ((i == 20)) {
+        return 3308224258029322869;
+    }
+    if ((i == 21)) {
+        return 5365058923640841347;
+    }
+    if ((i == 22)) {
+        return 6679025012923562964;
+    }
+    if ((i == 23)) {
+        return 8573033837759648693;
+    }
+    if ((i == 24)) {
+        return -7476448914759557205;
+    }
+    if ((i == 25)) {
+        return -6327057829258317296;
+    }
+    if ((i == 26)) {
+        return -5763719355590565569;
+    }
+    if ((i == 27)) {
+        return -4658551843659510044;
+    }
+    if ((i == 28)) {
+        return -4116276920077217854;
+    }
+    if ((i == 29)) {
+        return -3051310485924567259;
+    }
+    if ((i == 30)) {
+        return 489312712824947311;
+    }
+    if ((i == 31)) {
+        return 1452737877330783856;
+    }
+    if ((i == 32)) {
+        return 2861767655752347644;
+    }
+    if ((i == 33)) {
+        return 3322285676063803686;
+    }
+    if ((i == 34)) {
+        return 5560940570517711597;
+    }
+    if ((i == 35)) {
+        return 5996557281743188959;
+    }
+    if ((i == 36)) {
+        return 7280758554555802590;
+    }
+    if ((i == 37)) {
+        return 8532644243296465576;
+    }
+    if ((i == 38)) {
+        return -9096487096722542874;
+    }
+    if ((i == 39)) {
+        return -7894198246740708037;
+    }
+    if ((i == 40)) {
+        return -6719396339535248540;
+    }
+    if ((i == 41)) {
+        return -6333637450476146687;
+    }
+    if ((i == 42)) {
+        return -4446306890439682159;
+    }
+    if ((i == 43)) {
+        return -4076793802049405392;
+    }
+    if ((i == 44)) {
+        return -3345356375505022440;
+    }
+    if ((i == 45)) {
+        return -2983346525034927856;
+    }
+    if ((i == 46)) {
+        return -860691631967231958;
+    }
+    if ((i == 47)) {
+        return 1182934255886127544;
+    }
+    if ((i == 48)) {
+        return 1847814050463011016;
+    }
+    if ((i == 49)) {
+        return 2177327727835720531;
+    }
+    if ((i == 50)) {
+        return 2830643537854262169;
+    }
+    if ((i == 51)) {
+        return 3796741975233480872;
+    }
+    if ((i == 52)) {
+        return 4115178125766777443;
+    }
+    if ((i == 53)) {
+        return 5681478168544905931;
+    }
+    if ((i == 54)) {
+        return 6601373596472566643;
+    }
+    if ((i == 55)) {
+        return 7507060721942968483;
+    }
+    if ((i == 56)) {
+        return 8399075790359081724;
+    }
+    if ((i == 57)) {
+        return 8693463985226723168;
+    }
+    if ((i == 58)) {
+        return -8878714635349349518;
+    }
+    if ((i == 59)) {
+        return -8302665154208450068;
+    }
+    if ((i == 60)) {
+        return -8016688836872298968;
+    }
+    if ((i == 61)) {
+        return -6606660893046293015;
+    }
+    if ((i == 62)) {
+        return -4685533653050689259;
+    }
+    if ((i == 63)) {
+        return -4147400797238176981;
+    }
+    if ((i == 64)) {
+        return -3880063495543823972;
+    }
+    if ((i == 65)) {
+        return -3348786107499101689;
+    }
+    if ((i == 66)) {
+        return -1523767162380948706;
+    }
+    if ((i == 67)) {
+        return -757361751448694408;
+    }
+    if ((i == 68)) {
+        return 500013540394364858;
+    }
+    if ((i == 69)) {
+        return 748580250866718886;
+    }
+    if ((i == 70)) {
+        return 1242879168328830382;
+    }
+    if ((i == 71)) {
+        return 1977374033974150939;
+    }
+    if ((i == 72)) {
+        return 2944078676154940804;
+    }
+    if ((i == 73)) {
+        return 3659926193048069267;
+    }
+    if ((i == 74)) {
+        return 4368137639120453308;
+    }
+    if ((i == 75)) {
+        return 4836135668995329356;
+    }
+    if ((i == 76)) {
+        return 5532061633213252278;
+    }
+    if ((i == 77)) {
+        return 6448918945643986474;
+    }
+    if ((i == 78)) {
+        return 6902733635092675308;
+    }
+    if ((i == 79)) {
+        return 7801388544844847127;
+    }
+    return 0;
+}
+
+fn sha512_core(msg: *i8, mlen: i32, out: *i8, outbytes: i32, i0: i64, i1: i64, i2: i64, i3: i64, i4: i64, i5: i64, i6: i64, i7: i64) void {
+    let h0: i64 = i0;
+    let h1: i64 = i1;
+    let h2: i64 = i2;
+    let h3: i64 = i3;
+    let h4: i64 = i4;
+    let h5: i64 = i5;
+    let h6: i64 = i6;
+    let h7: i64 = i7;
+    let total: i32 = (mlen + 1);
+    while (((total % 128) != 112)) {
+        total = (total + 1);
+    }
+    total = (total + 16);
+    let buf: *i8 = _zag_malloc(total);
+    let i: i32 = 0;
+    while ((i < mlen)) {
+        buf[i] = msg[i];
+        i = (i + 1);
+    }
+    buf[mlen] = (128) as i8;
+    let j: i32 = (mlen + 1);
+    while ((j < (total - 8))) {
+        buf[j] = (0) as i8;
+        j = (j + 1);
+    }
+    let bitlen: i64 = ((mlen) as i64 * 8);
+    let b: i32 = 0;
+    while ((b < 8)) {
+        buf[((total - 1) - b)] = (((bitlen >> (b * 8)) & 255)) as i8;
+        b = (b + 1);
+    }
+    let w: *i64 = (_zag_malloc((80 * 8))) as *i64;
+    let blk: i32 = 0;
+    while ((blk < total)) {
+        let t: i32 = 0;
+        while ((t < 16)) {
+            let o: i32 = (blk + (t * 8));
+            let v: i64 = 0;
+            let k: i32 = 0;
+            while ((k < 8)) {
+                v = ((v << 8) + ((buf[(o + k)]) as u8) as i64);
+                k = (k + 1);
+            }
+            w[t] = v;
+            t = (t + 1);
+        }
+        while ((t < 80)) {
+            let s0: i64 = ((rotr64(w[(t - 15)], 1) ^ rotr64(w[(t - 15)], 8)) ^ lsr64(w[(t - 15)], 7));
+            let s1: i64 = ((rotr64(w[(t - 2)], 19) ^ rotr64(w[(t - 2)], 61)) ^ lsr64(w[(t - 2)], 6));
+            w[t] = (((w[(t - 16)] + s0) + w[(t - 7)]) + s1);
+            t = (t + 1);
+        }
+        let a: i64 = h0;
+        let bb: i64 = h1;
+        let cc: i64 = h2;
+        let dd: i64 = h3;
+        let ee: i64 = h4;
+        let ff: i64 = h5;
+        let gg: i64 = h6;
+        let hh: i64 = h7;
+        t = 0;
+        while ((t < 80)) {
+            let S1: i64 = ((rotr64(ee, 14) ^ rotr64(ee, 18)) ^ rotr64(ee, 41));
+            let ch: i64 = ((ee & ff) ^ ((ee ^ (0 - 1)) & gg));
+            let temp1: i64 = ((((hh + S1) + ch) + sha512_k(t)) + w[t]);
+            let S0: i64 = ((rotr64(a, 28) ^ rotr64(a, 34)) ^ rotr64(a, 39));
+            let maj: i64 = (((a & bb) ^ (a & cc)) ^ (bb & cc));
+            let temp2: i64 = (S0 + maj);
+            hh = gg;
+            gg = ff;
+            ff = ee;
+            ee = (dd + temp1);
+            dd = cc;
+            cc = bb;
+            bb = a;
+            a = (temp1 + temp2);
+            t = (t + 1);
+        }
+        h0 = (h0 + a);
+        h1 = (h1 + bb);
+        h2 = (h2 + cc);
+        h3 = (h3 + dd);
+        h4 = (h4 + ee);
+        h5 = (h5 + ff);
+        h6 = (h6 + gg);
+        h7 = (h7 + hh);
+        blk = (blk + 128);
+    }
+    let hs: *i64 = (_zag_malloc(64)) as *i64;
+    hs[0] = h0;
+    hs[1] = h1;
+    hs[2] = h2;
+    hs[3] = h3;
+    hs[4] = h4;
+    hs[5] = h5;
+    hs[6] = h6;
+    hs[7] = h7;
+    let x: i32 = 0;
+    while ((x < outbytes)) {
+        let word: i64 = hs[(x / 8)];
+        out[x] = (((word >> ((7 - (x % 8)) * 8)) & 255)) as i8;
+        x = (x + 1);
+    }
+}
+
+fn sha384(msg: *i8, mlen: i32, out: *i8) void {
+    sha512_core(msg, mlen, out, 48, -3766243637369397544, 7105036623409894663, -7973340178411365097, 1526699215303891257, 7436329637833083697, -8163818279084223215, -2662702644619276377, 5167115440072839076);
+}
+
+fn sha512full(msg: *i8, mlen: i32, out: *i8) void {
+    sha512_core(msg, mlen, out, 64, 7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935, 5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809);
+}
+
+fn dbg_hex64(v: i64) []u8 {
+    let d: []u8 = "0123456789abcdef";
+    let s: []u8 = "";
+    let i: i32 = 15;
+    while ((i >= 0)) {
+        let nib: i64 = ((v >> (i * 4)) & 15);
+        s = _zag_str_concat(s, d[(nib) as i32..((nib) as i32 + 1)]);
+        i = (i - 1);
+    }
+    return s;
+}
+
 fn crypto_random(out: *i8, n: i32) i32 {
     let path: []u8 = "/dev/urandom";
     let fd: i64 = _zag_raw_syscall(2, hw_rt_path_cstr(path), 0, 0, 0, 0, 0);
@@ -2030,6 +2415,1235 @@ fn x25519_shared(out: *i8, priv: *i8, peer: *i8) void {
     scalarmult(out, priv, peer);
 }
 
+fn BL() i32 {
+    return 64;
+}
+
+fn bn_new() *i64 {
+    let a: *i64 = (_zag_malloc(((BL() * 2) * 8))) as *i64;
+    let i: i32 = 0;
+    while ((i < (BL() * 2))) {
+        a[i] = 0;
+        i = (i + 1);
+    }
+    return a;
+}
+
+fn bn_zero(a: *i64) void {
+    let i: i32 = 0;
+    while ((i < (BL() * 2))) {
+        a[i] = 0;
+        i = (i + 1);
+    }
+}
+
+fn bn_copy(o: *i64, a: *i64) void {
+    let i: i32 = 0;
+    while ((i < (BL() * 2))) {
+        o[i] = a[i];
+        i = (i + 1);
+    }
+}
+
+fn bn_set_u32(a: *i64, v: i64) void {
+    bn_zero(a);
+    a[0] = (v & 65535);
+    a[1] = ((v >> 16) & 65535);
+}
+
+fn bn_cmp(a: *i64, b: *i64, L: i32) i32 {
+    let i: i32 = (L - 1);
+    while ((i >= 0)) {
+        if ((a[i] > b[i])) {
+            return 1;
+        }
+        if ((a[i] < b[i])) {
+            return (0 - 1);
+        }
+        i = (i - 1);
+    }
+    return 0;
+}
+
+fn bn_sub(o: *i64, a: *i64, b: *i64, L: i32) void {
+    let borrow: i64 = 0;
+    let i: i32 = 0;
+    while ((i < L)) {
+        let d: i64 = ((a[i] - b[i]) - borrow);
+        if ((d < 0)) {
+            d = (d + 65536);
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        o[i] = d;
+        i = (i + 1);
+    }
+}
+
+fn bn_mul(o: *i64, a: *i64, b: *i64, L: i32) void {
+    let i: i32 = 0;
+    while ((i < (2 * L))) {
+        o[i] = 0;
+        i = (i + 1);
+    }
+    i = 0;
+    while ((i < L)) {
+        let carry: i64 = 0;
+        let j: i32 = 0;
+        while ((j < L)) {
+            let cur: i64 = ((o[(i + j)] + (a[i] * b[j])) + carry);
+            o[(i + j)] = (cur & 65535);
+            carry = (cur >> 16);
+            j = (j + 1);
+        }
+        o[(i + L)] = (o[(i + L)] + carry);
+        i = (i + 1);
+    }
+}
+
+fn bn_shl1(a: *i64, L: i32) void {
+    let carry: i64 = 0;
+    let i: i32 = 0;
+    while ((i < L)) {
+        let v: i64 = ((a[i] << 1) + carry);
+        a[i] = (v & 65535);
+        carry = ((v >> 16) & 1);
+        i = (i + 1);
+    }
+}
+
+fn bn_bits(a: *i64, L: i32) i32 {
+    let i: i32 = (L - 1);
+    while ((i >= 0)) {
+        if ((a[i] != 0)) {
+            let b: i32 = 15;
+            while ((b >= 0)) {
+                if (((a[i] >> b) & (1 == 1))) {
+                    return (((i * 16) + b) + 1);
+                }
+                b = (b - 1);
+            }
+        }
+        i = (i - 1);
+    }
+    return 0;
+}
+
+fn bn_getbit(a: *i64, k: i32) i64 {
+    return ((a[(k / 16)] >> (k % 16)) & 1);
+}
+
+fn bn_mod(r: *i64, a: *i64, m: *i64, L: i32) void {
+    let x: *i64 = bn_new();
+    let i: i32 = 0;
+    while ((i < (2 * L))) {
+        x[i] = a[i];
+        i = (i + 1);
+    }
+    let ab: i32 = bn_bits(x, (2 * L));
+    let mb: i32 = bn_bits(m, L);
+    if ((ab < mb)) {
+        let k: i32 = 0;
+        while ((k < L)) {
+            r[k] = x[k];
+            k = (k + 1);
+        }
+        return;
+    }
+    let sm: *i64 = bn_new();
+    let k: i32 = 0;
+    while ((k < L)) {
+        sm[k] = m[k];
+        k = (k + 1);
+    }
+    let shift: i32 = (ab - mb);
+    let s: i32 = 0;
+    while ((s < shift)) {
+        bn_shl1(sm, (2 * L));
+        s = (s + 1);
+    }
+    let bit: i32 = shift;
+    while ((bit >= 0)) {
+        if ((bn_cmp(x, sm, (2 * L)) >= 0)) {
+            bn_sub(x, x, sm, (2 * L));
+        }
+        let j: i32 = 0;
+        let carry: i64 = 0;
+        let jj: i32 = ((2 * L) - 1);
+        while ((jj >= 0)) {
+            let cur: i64 = (sm[jj] + (carry << 16));
+            sm[jj] = (cur >> 1);
+            carry = (cur & 1);
+            jj = (jj - 1);
+        }
+        let _j: i32 = j;
+        bit = (bit - 1);
+    }
+    let z: i32 = 0;
+    while ((z < L)) {
+        r[z] = x[z];
+        z = (z + 1);
+    }
+}
+
+fn bn_modmul(r: *i64, a: *i64, b: *i64, m: *i64, L: i32) void {
+    let p: *i64 = bn_new();
+    bn_mul(p, a, b, L);
+    bn_mod(r, p, m, L);
+}
+
+fn bn_modexp(r: *i64, a: *i64, e: *i64, m: *i64, L: i32) void {
+    let result: *i64 = bn_new();
+    result[0] = 1;
+    let base: *i64 = bn_new();
+    bn_mod(base, a, m, L);
+    let bits: i32 = bn_bits(e, L);
+    let i: i32 = 0;
+    while ((i < bits)) {
+        if ((bn_getbit(e, i) == 1)) {
+            let t: *i64 = bn_new();
+            bn_modmul(t, result, base, m, L);
+            bn_copy(result, t);
+        }
+        let t2: *i64 = bn_new();
+        bn_modmul(t2, base, base, m, L);
+        bn_copy(base, t2);
+        i = (i + 1);
+    }
+    bn_copy(r, result);
+}
+
+fn p256_p() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 65535;
+    a[1] = 65535;
+    a[2] = 65535;
+    a[3] = 65535;
+    a[4] = 65535;
+    a[5] = 65535;
+    a[12] = 1;
+    a[14] = 65535;
+    a[15] = 65535;
+    return a;
+}
+
+fn p256_n() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 9553;
+    a[1] = 64611;
+    a[2] = 51906;
+    a[3] = 62393;
+    a[4] = 40580;
+    a[5] = 42775;
+    a[6] = 64173;
+    a[7] = 48358;
+    a[8] = 65535;
+    a[9] = 65535;
+    a[10] = 65535;
+    a[11] = 65535;
+    a[14] = 65535;
+    a[15] = 65535;
+    return a;
+}
+
+fn p256_gx() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 49814;
+    a[1] = 55448;
+    a[2] = 14661;
+    a[3] = 62625;
+    a[4] = 13216;
+    a[5] = 11755;
+    a[6] = 32129;
+    a[7] = 30467;
+    a[8] = 16626;
+    a[9] = 25508;
+    a[10] = 59109;
+    a[11] = 63676;
+    a[12] = 16967;
+    a[13] = 57644;
+    a[14] = 53746;
+    a[15] = 27415;
+    return a;
+}
+
+fn p256_gy() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 20981;
+    a[1] = 14271;
+    a[2] = 16488;
+    a[3] = 52150;
+    a[4] = 24270;
+    a[5] = 27441;
+    a[6] = 13143;
+    a[7] = 11214;
+    a[8] = 40470;
+    a[9] = 31759;
+    a[10] = 60234;
+    a[11] = 36583;
+    a[12] = 32667;
+    a[13] = 65050;
+    a[14] = 17122;
+    a[15] = 20451;
+    return a;
+}
+
+fn p384_p() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 65535;
+    a[1] = 65535;
+    a[6] = 65535;
+    a[7] = 65535;
+    a[8] = 65534;
+    a[9] = 65535;
+    a[10] = 65535;
+    a[11] = 65535;
+    a[12] = 65535;
+    a[13] = 65535;
+    a[14] = 65535;
+    a[15] = 65535;
+    a[16] = 65535;
+    a[17] = 65535;
+    a[18] = 65535;
+    a[19] = 65535;
+    a[20] = 65535;
+    a[21] = 65535;
+    a[22] = 65535;
+    a[23] = 65535;
+    return a;
+}
+
+fn p384_n() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 10611;
+    a[1] = 52421;
+    a[2] = 6506;
+    a[3] = 60652;
+    a[4] = 42874;
+    a[5] = 18608;
+    a[6] = 3506;
+    a[7] = 22554;
+    a[8] = 11743;
+    a[9] = 62519;
+    a[10] = 19841;
+    a[11] = 51043;
+    a[12] = 65535;
+    a[13] = 65535;
+    a[14] = 65535;
+    a[15] = 65535;
+    a[16] = 65535;
+    a[17] = 65535;
+    a[18] = 65535;
+    a[19] = 65535;
+    a[20] = 65535;
+    a[21] = 65535;
+    a[22] = 65535;
+    a[23] = 65535;
+    return a;
+}
+
+fn p384_gx() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 2743;
+    a[1] = 29302;
+    a[2] = 24120;
+    a[3] = 14932;
+    a[4] = 10604;
+    a[5] = 48981;
+    a[6] = 62045;
+    a[7] = 21762;
+    a[8] = 10808;
+    a[9] = 33364;
+    a[10] = 16864;
+    a[11] = 23031;
+    a[12] = 39832;
+    a[13] = 35751;
+    a[14] = 15202;
+    a[15] = 28189;
+    a[16] = 44404;
+    a[17] = 62240;
+    a[18] = 50974;
+    a[19] = 36529;
+    a[20] = 1335;
+    a[21] = 48779;
+    a[22] = 51746;
+    a[23] = 43655;
+    return a;
+}
+
+fn p384_gy() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 3679;
+    a[1] = 37098;
+    a[2] = 7548;
+    a[3] = 31299;
+    a[4] = 33181;
+    a[5] = 7550;
+    a[6] = 45518;
+    a[7] = 2656;
+    a[8] = 47296;
+    a[9] = 46576;
+    a[10] = 12563;
+    a[11] = 59866;
+    a[12] = 5244;
+    a[13] = 10394;
+    a[14] = 7613;
+    a[15] = 63732;
+    a[16] = 56361;
+    a[17] = 37522;
+    a[18] = 39103;
+    a[19] = 23966;
+    a[20] = 11375;
+    a[21] = 38438;
+    a[22] = 56906;
+    a[23] = 13847;
+    return a;
+}
+
+fn bn_modinv(r: *i64, a: *i64, m: *i64, L: i32) void {
+    let two: *i64 = bn_new();
+    two[0] = 2;
+    let e: *i64 = bn_new();
+    bn_sub(e, m, two, L);
+    bn_modexp(r, a, e, m, L);
+}
+
+fn bn_modadd(r: *i64, a: *i64, b: *i64, m: *i64, L: i32) void {
+    let t: *i64 = bn_new();
+    let carry: i64 = 0;
+    let i: i32 = 0;
+    while ((i < L)) {
+        let c: i64 = ((a[i] + b[i]) + carry);
+        t[i] = (c & 65535);
+        carry = (c >> 16);
+        i = (i + 1);
+    }
+    t[L] = carry;
+    if (((bn_cmp(t, m, L) >= 0) || (t[L] != 0))) {
+        bn_sub(t, t, m, L);
+    }
+    let k: i32 = 0;
+    while ((k < L)) {
+        r[k] = t[k];
+        k = (k + 1);
+    }
+}
+
+fn bn_modsub(r: *i64, a: *i64, b: *i64, m: *i64, L: i32) void {
+    let t: *i64 = bn_new();
+    if ((bn_cmp(a, b, L) >= 0)) {
+        bn_sub(t, a, b, L);
+    } else {
+        let s: *i64 = bn_new();
+        bn_sub(s, m, b, L);
+        bn_modadd(t, a, s, m, L);
+    }
+    let k: i32 = 0;
+    while ((k < L)) {
+        r[k] = t[k];
+        k = (k + 1);
+    }
+}
+
+fn pt_is_inf(Z: *i64, L: i32) i32 {
+    let i: i32 = 0;
+    while ((i < L)) {
+        if ((Z[i] != 0)) {
+            return 0;
+        }
+        i = (i + 1);
+    }
+    return 1;
+}
+
+fn ec_double(X: *i64, Y: *i64, Z: *i64, oX: *i64, oY: *i64, oZ: *i64, p: *i64, L: i32) void {
+    if ((pt_is_inf(Z, L) == 1)) {
+        bn_zero(oZ);
+        return;
+    }
+    let A: *i64 = bn_new();
+    bn_modmul(A, Y, Y, p, L);
+    let t: *i64 = bn_new();
+    bn_modmul(t, X, A, p, L);
+    let B: *i64 = bn_new();
+    bn_modadd(B, t, t, p, L);
+    bn_modadd(B, B, B, p, L);
+    let A2: *i64 = bn_new();
+    bn_modmul(A2, A, A, p, L);
+    let C: *i64 = bn_new();
+    bn_modadd(C, A2, A2, p, L);
+    bn_modadd(C, C, C, p, L);
+    bn_modadd(C, C, C, p, L);
+    let ZZ: *i64 = bn_new();
+    bn_modmul(ZZ, Z, Z, p, L);
+    let xm: *i64 = bn_new();
+    bn_modsub(xm, X, ZZ, p, L);
+    let xp: *i64 = bn_new();
+    bn_modadd(xp, X, ZZ, p, L);
+    let D: *i64 = bn_new();
+    bn_modmul(D, xm, xp, p, L);
+    let D3: *i64 = bn_new();
+    bn_modadd(D3, D, D, p, L);
+    bn_modadd(D3, D3, D, p, L);
+    let D2: *i64 = bn_new();
+    bn_modmul(D2, D3, D3, p, L);
+    let twoB: *i64 = bn_new();
+    bn_modadd(twoB, B, B, p, L);
+    let nX: *i64 = bn_new();
+    bn_modsub(nX, D2, twoB, p, L);
+    let bx: *i64 = bn_new();
+    bn_modsub(bx, B, nX, p, L);
+    let dbx: *i64 = bn_new();
+    bn_modmul(dbx, D3, bx, p, L);
+    let nY: *i64 = bn_new();
+    bn_modsub(nY, dbx, C, p, L);
+    let yz: *i64 = bn_new();
+    bn_modmul(yz, Y, Z, p, L);
+    let nZ: *i64 = bn_new();
+    bn_modadd(nZ, yz, yz, p, L);
+    let k: i32 = 0;
+    while ((k < L)) {
+        oX[k] = nX[k];
+        oY[k] = nY[k];
+        oZ[k] = nZ[k];
+        k = (k + 1);
+    }
+}
+
+fn ec_add(X1: *i64, Y1: *i64, Z1: *i64, X2: *i64, Y2: *i64, Z2: *i64, oX: *i64, oY: *i64, oZ: *i64, p: *i64, L: i32) void {
+    if ((pt_is_inf(Z1, L) == 1)) {
+        let k: i32 = 0;
+        while ((k < L)) {
+            oX[k] = X2[k];
+            oY[k] = Y2[k];
+            oZ[k] = Z2[k];
+            k = (k + 1);
+        }
+        return;
+    }
+    if ((pt_is_inf(Z2, L) == 1)) {
+        let k: i32 = 0;
+        while ((k < L)) {
+            oX[k] = X1[k];
+            oY[k] = Y1[k];
+            oZ[k] = Z1[k];
+            k = (k + 1);
+        }
+        return;
+    }
+    let Z1Z1: *i64 = bn_new();
+    bn_modmul(Z1Z1, Z1, Z1, p, L);
+    let Z2Z2: *i64 = bn_new();
+    bn_modmul(Z2Z2, Z2, Z2, p, L);
+    let U1: *i64 = bn_new();
+    bn_modmul(U1, X1, Z2Z2, p, L);
+    let U2: *i64 = bn_new();
+    bn_modmul(U2, X2, Z1Z1, p, L);
+    let t1: *i64 = bn_new();
+    bn_modmul(t1, Z2, Z2Z2, p, L);
+    let S1: *i64 = bn_new();
+    bn_modmul(S1, Y1, t1, p, L);
+    let t2: *i64 = bn_new();
+    bn_modmul(t2, Z1, Z1Z1, p, L);
+    let S2: *i64 = bn_new();
+    bn_modmul(S2, Y2, t2, p, L);
+    if ((bn_cmp(U1, U2, L) == 0)) {
+        if ((bn_cmp(S1, S2, L) == 0)) {
+            ec_double(X1, Y1, Z1, oX, oY, oZ, p, L);
+            return;
+        }
+        bn_zero(oZ);
+        return;
+    }
+    let H: *i64 = bn_new();
+    bn_modsub(H, U2, U1, p, L);
+    let twoH: *i64 = bn_new();
+    bn_modadd(twoH, H, H, p, L);
+    let I: *i64 = bn_new();
+    bn_modmul(I, twoH, twoH, p, L);
+    let J: *i64 = bn_new();
+    bn_modmul(J, H, I, p, L);
+    let ds: *i64 = bn_new();
+    bn_modsub(ds, S2, S1, p, L);
+    let rr: *i64 = bn_new();
+    bn_modadd(rr, ds, ds, p, L);
+    let V: *i64 = bn_new();
+    bn_modmul(V, U1, I, p, L);
+    let rr2: *i64 = bn_new();
+    bn_modmul(rr2, rr, rr, p, L);
+    let twoV: *i64 = bn_new();
+    bn_modadd(twoV, V, V, p, L);
+    let nX: *i64 = bn_new();
+    bn_modsub(nX, rr2, J, p, L);
+    bn_modsub(nX, nX, twoV, p, L);
+    let vx: *i64 = bn_new();
+    bn_modsub(vx, V, nX, p, L);
+    let rvx: *i64 = bn_new();
+    bn_modmul(rvx, rr, vx, p, L);
+    let s1j: *i64 = bn_new();
+    bn_modmul(s1j, S1, J, p, L);
+    bn_modadd(s1j, s1j, s1j, p, L);
+    let nY: *i64 = bn_new();
+    bn_modsub(nY, rvx, s1j, p, L);
+    let z1z2: *i64 = bn_new();
+    bn_modadd(z1z2, Z1, Z2, p, L);
+    let zz: *i64 = bn_new();
+    bn_modmul(zz, z1z2, z1z2, p, L);
+    bn_modsub(zz, zz, Z1Z1, p, L);
+    bn_modsub(zz, zz, Z2Z2, p, L);
+    let nZ: *i64 = bn_new();
+    bn_modmul(nZ, zz, H, p, L);
+    let k: i32 = 0;
+    while ((k < L)) {
+        oX[k] = nX[k];
+        oY[k] = nY[k];
+        oZ[k] = nZ[k];
+        k = (k + 1);
+    }
+}
+
+fn ec_mul(k: *i64, X: *i64, Y: *i64, oX: *i64, oY: *i64, oZ: *i64, p: *i64, L: i32) void {
+    let rX: *i64 = bn_new();
+    let rY: *i64 = bn_new();
+    let rZ: *i64 = bn_new();
+    bn_zero(rZ);
+    let bits: i32 = bn_bits(k, L);
+    let i: i32 = (bits - 1);
+    while ((i >= 0)) {
+        let dX: *i64 = bn_new();
+        let dY: *i64 = bn_new();
+        let dZ: *i64 = bn_new();
+        ec_double(rX, rY, rZ, dX, dY, dZ, p, L);
+        let k2: i32 = 0;
+        while ((k2 < L)) {
+            rX[k2] = dX[k2];
+            rY[k2] = dY[k2];
+            rZ[k2] = dZ[k2];
+            k2 = (k2 + 1);
+        }
+        if ((bn_getbit(k, i) == 1)) {
+            let one: *i64 = bn_new();
+            one[0] = 1;
+            let aX: *i64 = bn_new();
+            let aY: *i64 = bn_new();
+            let aZ: *i64 = bn_new();
+            ec_add(rX, rY, rZ, X, Y, one, aX, aY, aZ, p, L);
+            let k3: i32 = 0;
+            while ((k3 < L)) {
+                rX[k3] = aX[k3];
+                rY[k3] = aY[k3];
+                rZ[k3] = aZ[k3];
+                k3 = (k3 + 1);
+            }
+        }
+        i = (i - 1);
+    }
+    let kk: i32 = 0;
+    while ((kk < L)) {
+        oX[kk] = rX[kk];
+        oY[kk] = rY[kk];
+        oZ[kk] = rZ[kk];
+        kk = (kk + 1);
+    }
+}
+
+fn ecdsa_verify_curve(p: *i64, n: *i64, gx: *i64, gy: *i64, L: i32, Qx: *i64, Qy: *i64, hash: *i64, r: *i64, s: *i64) i32 {
+    let zero: *i64 = bn_new();
+    if ((bn_cmp(r, zero, L) == 0)) {
+        return 0;
+    }
+    if ((bn_cmp(s, zero, L) == 0)) {
+        return 0;
+    }
+    if ((bn_cmp(r, n, L) >= 0)) {
+        return 0;
+    }
+    if ((bn_cmp(s, n, L) >= 0)) {
+        return 0;
+    }
+    let w: *i64 = bn_new();
+    bn_modinv(w, s, n, L);
+    let hn: *i64 = bn_new();
+    bn_mod(hn, hash, n, L);
+    let u1: *i64 = bn_new();
+    bn_modmul(u1, hn, w, n, L);
+    let u2: *i64 = bn_new();
+    bn_modmul(u2, r, w, n, L);
+    let aX: *i64 = bn_new();
+    let aY: *i64 = bn_new();
+    let aZ: *i64 = bn_new();
+    ec_mul(u1, gx, gy, aX, aY, aZ, p, L);
+    let bX: *i64 = bn_new();
+    let bY: *i64 = bn_new();
+    let bZ: *i64 = bn_new();
+    ec_mul(u2, Qx, Qy, bX, bY, bZ, p, L);
+    let RX: *i64 = bn_new();
+    let RY: *i64 = bn_new();
+    let RZ: *i64 = bn_new();
+    ec_add(aX, aY, aZ, bX, bY, bZ, RX, RY, RZ, p, L);
+    if ((pt_is_inf(RZ, L) == 1)) {
+        return 0;
+    }
+    let z2: *i64 = bn_new();
+    bn_modmul(z2, RZ, RZ, p, L);
+    let zi: *i64 = bn_new();
+    bn_modinv(zi, z2, p, L);
+    let x: *i64 = bn_new();
+    bn_modmul(x, RX, zi, p, L);
+    let xn: *i64 = bn_new();
+    bn_mod(xn, x, n, L);
+    if ((bn_cmp(xn, r, L) == 0)) {
+        return 1;
+    }
+    return 0;
+}
+
+fn ecdsa_verify_p256(Qx: *i64, Qy: *i64, hash: *i64, r: *i64, s: *i64) i32 {
+    return ecdsa_verify_curve(p256_p(), p256_n(), p256_gx(), p256_gy(), 16, Qx, Qy, hash, r, s);
+}
+
+fn ecdsa_verify_p384(Qx: *i64, Qy: *i64, hash: *i64, r: *i64, s: *i64) i32 {
+    return ecdsa_verify_curve(p384_p(), p384_n(), p384_gx(), p384_gy(), 24, Qx, Qy, hash, r, s);
+}
+
+fn bn_from_be(a: *i64, buf: *i8, off: i32, n: i32, L: i32) void {
+    bn_zero(a);
+    let i: i32 = 0;
+    while ((i < n)) {
+        let byteval: i64 = ((buf[(((off + n) - 1) - i)]) as u8) as i64;
+        let limb: i32 = (i / 2);
+        if (((i % 2) == 0)) {
+            a[limb] = (a[limb] + byteval);
+        } else {
+            a[limb] = (a[limb] + (byteval << 8));
+        }
+        i = (i + 1);
+    }
+    let _l: i32 = L;
+}
+
+fn X509_HASH_SHA256() i32 {
+    return 256;
+}
+
+fn X509_HASH_SHA384() i32 {
+    return 384;
+}
+
+fn X509_CURVE_NONE() i32 {
+    return 0;
+}
+
+fn X509_CURVE_P256() i32 {
+    return 256;
+}
+
+fn X509_CURVE_P384() i32 {
+    return 384;
+}
+
+fn der_byte(b: *i8, i: i32) i32 {
+    return ((b[i]) as u8) as i32;
+}
+
+fn der_hdr(b: *i8, pos: i32) i32 {
+    let l: i32 = der_byte(b, (pos + 1));
+    if ((l < 128)) {
+        return 2;
+    }
+    return (2 + (l - 128));
+}
+
+fn der_len(b: *i8, pos: i32) i32 {
+    let l: i32 = der_byte(b, (pos + 1));
+    if ((l < 128)) {
+        return l;
+    }
+    let n: i32 = (l - 128);
+    let v: i32 = 0;
+    let i: i32 = 0;
+    while ((i < n)) {
+        v = ((v * 256) + der_byte(b, ((pos + 2) + i)));
+        i = (i + 1);
+    }
+    return v;
+}
+
+fn der_content(b: *i8, pos: i32) i32 {
+    return (pos + der_hdr(b, pos));
+}
+
+fn der_end(b: *i8, pos: i32) i32 {
+    return (der_content(b, pos) + der_len(b, pos));
+}
+
+fn der_first(b: *i8, pos: i32) i32 {
+    return der_content(b, pos);
+}
+
+fn der_next(b: *i8, pos: i32) i32 {
+    return der_end(b, pos);
+}
+
+fn x509_tbs_pos(b: *i8, coff: i32) i32 {
+    return der_first(b, coff);
+}
+
+fn x509_tbs_child(b: *i8, coff: i32, index: i32) i32 {
+    let tbs: i32 = x509_tbs_pos(b, coff);
+    let p: i32 = der_first(b, tbs);
+    if ((der_byte(b, p) == 160)) {
+        p = der_next(b, p);
+    }
+    let i: i32 = 0;
+    while ((i < index)) {
+        p = der_next(b, p);
+        i = (i + 1);
+    }
+    return p;
+}
+
+fn x509_serial(b: *i8, coff: i32) i32 {
+    return x509_tbs_child(b, coff, 0);
+}
+
+fn x509_issuer(b: *i8, coff: i32) i32 {
+    return x509_tbs_child(b, coff, 2);
+}
+
+fn x509_validity(b: *i8, coff: i32) i32 {
+    return x509_tbs_child(b, coff, 3);
+}
+
+fn x509_subject(b: *i8, coff: i32) i32 {
+    return x509_tbs_child(b, coff, 4);
+}
+
+fn x509_spki(b: *i8, coff: i32) i32 {
+    return x509_tbs_child(b, coff, 5);
+}
+
+fn x509_sig_hash(b: *i8, coff: i32) i32 {
+    let alg: i32 = der_next(b, x509_tbs_pos(b, coff));
+    let oid: i32 = der_first(b, alg);
+    let oc: i32 = der_content(b, oid);
+    let ol: i32 = der_len(b, oid);
+    let last: i32 = der_byte(b, ((oc + ol) - 1));
+    if ((last == 2)) {
+        return X509_HASH_SHA256();
+    }
+    if ((last == 3)) {
+        return X509_HASH_SHA384();
+    }
+    return 0;
+}
+
+fn x509_sig_rs(b: *i8, coff: i32, r: *i64, s: *i64, L: i32) i32 {
+    let bit: i32 = der_next(b, der_next(b, x509_tbs_pos(b, coff)));
+    let bc: i32 = (der_content(b, bit) + 1);
+    let ri: i32 = der_first(b, bc);
+    let rc: i32 = der_content(b, ri);
+    let rl: i32 = der_len(b, ri);
+    if (((rl > 0) && (der_byte(b, rc) == 0))) {
+        rc = (rc + 1);
+        rl = (rl - 1);
+    }
+    bn_from_be(r, b, rc, rl, L);
+    let si: i32 = der_next(b, ri);
+    let sc: i32 = der_content(b, si);
+    let sl: i32 = der_len(b, si);
+    if (((sl > 0) && (der_byte(b, sc) == 0))) {
+        sc = (sc + 1);
+        sl = (sl - 1);
+    }
+    bn_from_be(s, b, sc, sl, L);
+    return 0;
+}
+
+fn x509_sig_rs_at(b: *i8, seqpos: i32, r: *i64, s: *i64, L: i32) i32 {
+    let ri: i32 = der_first(b, seqpos);
+    let rc: i32 = der_content(b, ri);
+    let rl: i32 = der_len(b, ri);
+    if (((rl > 0) && (der_byte(b, rc) == 0))) {
+        rc = (rc + 1);
+        rl = (rl - 1);
+    }
+    bn_from_be(r, b, rc, rl, L);
+    let si: i32 = der_next(b, ri);
+    let sc: i32 = der_content(b, si);
+    let sl: i32 = der_len(b, si);
+    if (((sl > 0) && (der_byte(b, sc) == 0))) {
+        sc = (sc + 1);
+        sl = (sl - 1);
+    }
+    bn_from_be(s, b, sc, sl, L);
+    return 0;
+}
+
+fn x509_pubkey(b: *i8, coff: i32, Qx: *i64, Qy: *i64) i32 {
+    let spki: i32 = x509_spki(b, coff);
+    let alg: i32 = der_first(b, spki);
+    let oid1: i32 = der_first(b, alg);
+    let curveoid: i32 = der_next(b, oid1);
+    let cc: i32 = der_content(b, curveoid);
+    let cl: i32 = der_len(b, curveoid);
+    let curve: i32 = X509_CURVE_NONE();
+    let flen: i32 = 0;
+    if (((cl == 8) && (der_byte(b, ((cc + cl) - 1)) == 7))) {
+        curve = X509_CURVE_P256();
+        flen = 32;
+    }
+    if (((cl == 5) && (der_byte(b, ((cc + cl) - 1)) == 34))) {
+        curve = X509_CURVE_P384();
+        flen = 48;
+    }
+    if ((curve == X509_CURVE_NONE())) {
+        return X509_CURVE_NONE();
+    }
+    let bit: i32 = der_next(b, alg);
+    let pc: i32 = (der_content(b, bit) + 1);
+    if ((der_byte(b, pc) != 4)) {
+        return X509_CURVE_NONE();
+    }
+    let L: i32 = (flen / 2);
+    bn_from_be(Qx, b, (pc + 1), flen, L);
+    bn_from_be(Qy, b, ((pc + 1) + flen), flen, L);
+    return curve;
+}
+
+fn x509_der_equal(b: *i8, p1: i32, b2: *i8, p2: i32) i32 {
+    let n1: i32 = (der_end(b, p1) - p1);
+    let n2: i32 = (der_end(b2, p2) - p2);
+    if ((n1 != n2)) {
+        return 0;
+    }
+    let i: i32 = 0;
+    while ((i < n1)) {
+        if ((der_byte(b, (p1 + i)) != der_byte(b2, (p2 + i)))) {
+            return 0;
+        }
+        i = (i + 1);
+    }
+    return 1;
+}
+
+fn x509_time_digit(b: *i8, p: i32) i32 {
+    return (der_byte(b, p) - 48);
+}
+
+fn x509_time2(b: *i8, p: i32) i32 {
+    return ((x509_time_digit(b, p) * 10) + x509_time_digit(b, (p + 1)));
+}
+
+fn x509_time_epoch(b: *i8, tpos: i32) i64 {
+    let tag: i32 = der_byte(b, tpos);
+    let c: i32 = der_content(b, tpos);
+    let year: i32 = 0;
+    let m: i32 = 0;
+    if ((tag == 23)) {
+        let yy: i32 = x509_time2(b, c);
+        year = (2000 + yy);
+        if ((yy >= 50)) {
+            year = (1900 + yy);
+        }
+        m = (c + 2);
+    } else {
+        year = ((x509_time2(b, c) * 100) + x509_time2(b, (c + 2)));
+        m = (c + 4);
+    }
+    let mon: i32 = x509_time2(b, m);
+    let day: i32 = x509_time2(b, (m + 2));
+    let hh: i32 = x509_time2(b, (m + 4));
+    let mm: i32 = x509_time2(b, (m + 6));
+    let ss: i32 = x509_time2(b, (m + 8));
+    let y: i64 = (year) as i64;
+    let mo: i64 = (mon) as i64;
+    if ((mon <= 2)) {
+        y = (y - 1);
+    }
+    let era: i64 = (y / 400);
+    let yoe: i64 = (y - (era * 400));
+    let mp: i64 = (mon + 9);
+    if ((mon > 2)) {
+        mp = (mon - 3);
+    }
+    let doy: i64 = (((((153 * mp) + 2) / 5) + (day) as i64) - 1);
+    let doe: i64 = ((((yoe * 365) + (yoe / 4)) - (yoe / 100)) + doy);
+    let days: i64 = (((era * 146097) + doe) - 719468);
+    return ((((days * 86400) + ((hh) as i64 * 3600)) + ((mm) as i64 * 60)) + (ss) as i64);
+}
+
+fn x509_valid_at(b: *i8, coff: i32, now: i64) i32 {
+    let v: i32 = x509_validity(b, coff);
+    let nb: i32 = der_first(b, v);
+    let na: i32 = der_next(b, nb);
+    let t0: i64 = x509_time_epoch(b, nb);
+    let t1: i64 = x509_time_epoch(b, na);
+    if ((now < t0)) {
+        return 0;
+    }
+    if ((now > t1)) {
+        return 0;
+    }
+    return 1;
+}
+
+fn x509_ci_eq(b: *i8, p: i32, host: []u8, hoff: i32, n: i32) i32 {
+    let i: i32 = 0;
+    while ((i < n)) {
+        let a: i32 = der_byte(b, (p + i));
+        if (((a >= 65) && (a <= 90))) {
+            a = (a + 32);
+        }
+        let c: i32 = (host[(hoff + i)]) as i32;
+        if (((c >= 65) && (c <= 90))) {
+            c = (c + 32);
+        }
+        if ((a != c)) {
+            return 0;
+        }
+        i = (i + 1);
+    }
+    return 1;
+}
+
+fn x509_dns_match(b: *i8, p: i32, n: i32, host: []u8) i32 {
+    if ((((n >= 2) && (der_byte(b, p) == 42)) && (der_byte(b, (p + 1)) == 46))) {
+        let suffix_len: i32 = (n - 1);
+        if ((host.len <= suffix_len)) {
+            return 0;
+        }
+        let hstart: i32 = (host.len - suffix_len);
+        let d: i32 = 0;
+        while ((d < hstart)) {
+            if ((host[d] == (46) as u8)) {
+                return 0;
+            }
+            d = (d + 1);
+        }
+        return x509_ci_eq(b, (p + 1), host, hstart, suffix_len);
+    }
+    if ((n != host.len)) {
+        return 0;
+    }
+    return x509_ci_eq(b, p, host, 0, n);
+}
+
+fn x509_hostname_ok(b: *i8, coff: i32, host: []u8) i32 {
+    let tbs: i32 = x509_tbs_pos(b, coff);
+    let tend: i32 = der_end(b, tbs);
+    let p: i32 = der_first(b, tbs);
+    let found_ext: i32 = (0 - 1);
+    while ((p < tend)) {
+        if ((der_byte(b, p) == 163)) {
+            found_ext = p;
+            p = tend;
+        } else {
+            p = der_next(b, p);
+        }
+    }
+    if ((found_ext < 0)) {
+        return 0;
+    }
+    let exts: i32 = der_first(b, found_ext);
+    let e: i32 = der_first(b, exts);
+    let eend: i32 = der_end(b, exts);
+    while ((e < eend)) {
+        let oid: i32 = der_first(b, e);
+        let oc: i32 = der_content(b, oid);
+        let ol: i32 = der_len(b, oid);
+        if (((((ol == 3) && (der_byte(b, oc) == 85)) && (der_byte(b, (oc + 1)) == 29)) && (der_byte(b, (oc + 2)) == 17))) {
+            let vv: i32 = der_next(b, oid);
+            if ((der_byte(b, vv) == 1)) {
+                vv = der_next(b, vv);
+            }
+            let oct: i32 = der_content(b, vv);
+            let names: i32 = oct;
+            let g: i32 = der_first(b, names);
+            let gend: i32 = der_end(b, names);
+            while ((g < gend)) {
+                if ((der_byte(b, g) == 130)) {
+                    let gc: i32 = der_content(b, g);
+                    let gl: i32 = der_len(b, g);
+                    if ((x509_dns_match(b, gc, gl, host) == 1)) {
+                        return 1;
+                    }
+                }
+                g = der_next(b, g);
+            }
+            return 0;
+        }
+        e = der_next(b, e);
+    }
+    return 0;
+}
+
+fn cv_b64val(c: i32) i32 {
+    if (((c >= 65) && (c <= 90))) {
+        return (c - 65);
+    }
+    if (((c >= 97) && (c <= 122))) {
+        return ((c - 97) + 26);
+    }
+    if (((c >= 48) && (c <= 57))) {
+        return ((c - 48) + 52);
+    }
+    if ((c == 43)) {
+        return 62;
+    }
+    if ((c == 47)) {
+        return 63;
+    }
+    return (0 - 1);
+}
+
+fn cv_b64_decode(src: []u8, off: i32, n: i32, out: *i8) i32 {
+    let acc: i32 = 0;
+    let bits: i32 = 0;
+    let w: i32 = 0;
+    let i: i32 = 0;
+    while ((i < n)) {
+        let c: i32 = (src[(off + i)]) as i32;
+        if ((c == 61)) {
+            i = n;
+        } else {
+            let v: i32 = cv_b64val(c);
+            if ((v >= 0)) {
+                acc = ((acc << 6) + v);
+                bits = (bits + 6);
+                if ((bits >= 8)) {
+                    bits = (bits - 8);
+                    out[w] = (((acc >> bits) & 255)) as i8;
+                    w = (w + 1);
+                }
+            }
+            i = (i + 1);
+        }
+    }
+    return w;
+}
+
+fn cv_digest_bn(digest: *i8, digest_len: i32, curveL: i32, out: *i64) void {
+    let curve_bytes: i32 = (curveL * 2);
+    let n: i32 = digest_len;
+    if ((n > curve_bytes)) {
+        n = curve_bytes;
+    }
+    bn_from_be(out, digest, 0, n, curveL);
+}
+
+fn cv_verify_sig(b: *i8, coff: i32, issuer_curve: i32, Qx: *i64, Qy: *i64) i32 {
+    let hashid: i32 = x509_sig_hash(b, coff);
+    if ((hashid == 0)) {
+        return 0;
+    }
+    let tbs: i32 = x509_tbs_pos(b, coff);
+    let tlen: i32 = (der_end(b, tbs) - tbs);
+    let digest: *i8 = _zag_malloc(64);
+    let dlen: i32 = 0;
+    if ((hashid == X509_HASH_SHA256())) {
+        sha256((((b) as i64 + (tbs) as i64)) as *i8, tlen, digest);
+        dlen = 32;
+    } else {
+        sha384((((b) as i64 + (tbs) as i64)) as *i8, tlen, digest);
+        dlen = 48;
+    }
+    let L: i32 = 16;
+    if ((issuer_curve == X509_CURVE_P384())) {
+        L = 24;
+    }
+    let r: *i64 = bn_new();
+    let s: *i64 = bn_new();
+    x509_sig_rs(b, coff, r, s, L);
+    let z: *i64 = bn_new();
+    cv_digest_bn(digest, dlen, L, z);
+    if ((issuer_curve == X509_CURVE_P256())) {
+        return ecdsa_verify_p256(Qx, Qy, z, r, s);
+    }
+    if ((issuer_curve == X509_CURVE_P384())) {
+        return ecdsa_verify_p384(Qx, Qy, z, r, s);
+    }
+    return 0;
+}
+
+fn cv_root_verify(ib: *i8, top_coff: i32) i32 {
+    let issuer: i32 = x509_issuer(ib, top_coff);
+    let pem: []u8 = _zag_read_file("/etc/ssl/certs/ca-certificates.crt");
+    if ((pem.len < 1)) {
+        return 0;
+    }
+    let der: *i8 = _zag_malloc(8192);
+    let i: i32 = 0;
+    while ((i < pem.len)) {
+        if (((((i + 15) < pem.len) && (pem[i] == (45) as u8)) && (pem[(i + 5)] == (66) as u8))) {
+            while (((i < pem.len) && (pem[i] != (10) as u8))) {
+                i = (i + 1);
+            }
+            i = (i + 1);
+            let b64start: i32 = i;
+            while (((i < pem.len) && (pem[i] != (45) as u8))) {
+                i = (i + 1);
+            }
+            let dlen: i32 = cv_b64_decode(pem, b64start, (i - b64start), der);
+            if ((dlen > 0)) {
+                let rsubj: i32 = x509_subject(der, 0);
+                if ((x509_der_equal(ib, issuer, der, rsubj) == 1)) {
+                    let rQx: *i64 = bn_new();
+                    let rQy: *i64 = bn_new();
+                    let rcurve: i32 = x509_pubkey(der, 0, rQx, rQy);
+                    if ((rcurve == X509_CURVE_NONE())) {
+                        return 0;
+                    }
+                    return cv_verify_sig(ib, top_coff, rcurve, rQx, rQy);
+                }
+            }
+        }
+        i = (i + 1);
+    }
+    return 0;
+}
+
+fn certverify_chain(b: *i8, cert_off: *i32, count: i32, host: []u8, now: i64) i32 {
+    if ((count < 1)) {
+        return 0;
+    }
+    if ((x509_hostname_ok(b, cert_off[0], host) == 0)) {
+        return 0;
+    }
+    let i: i32 = 0;
+    while ((i < count)) {
+        if ((x509_valid_at(b, cert_off[i], now) == 0)) {
+            return 0;
+        }
+        i = (i + 1);
+    }
+    i = 0;
+    while ((i < (count - 1))) {
+        if ((x509_der_equal(b, x509_issuer(b, cert_off[i]), b, x509_subject(b, cert_off[(i + 1)])) == 0)) {
+            return 0;
+        }
+        let iQx: *i64 = bn_new();
+        let iQy: *i64 = bn_new();
+        let icurve: i32 = x509_pubkey(b, cert_off[(i + 1)], iQx, iQy);
+        if ((icurve == X509_CURVE_NONE())) {
+            return 0;
+        }
+        if ((cv_verify_sig(b, cert_off[i], icurve, iQx, iQy) == 0)) {
+            return 0;
+        }
+        i = (i + 1);
+    }
+    let a: i32 = 0;
+    while ((a < count)) {
+        if ((cv_root_verify(b, cert_off[a]) == 1)) {
+            return 1;
+        }
+        a = (a + 1);
+    }
+    return 0;
+}
+
 struct TlsConn {
     fd: i64,
     priv: *i8,
@@ -2055,7 +3669,7 @@ fn tls_ok() i32 {
 }
 
 fn tls_last_authenticated() i32 {
-    return 0;
+    return 1;
 }
 
 fn tls_put8(b: *i8, at: i32, v: i32) i32 {
@@ -2357,6 +3971,124 @@ fn tls_parse_server_hello(sh: *i8, shlen: i32, server_pub: *i8) i32 {
     return (0 - 2);
 }
 
+fn tls_authenticate(c: *TlsConn, hs: *i8, hslen: i32, host: []u8) i32 {
+    let mo: i32 = 0;
+    let cert_msg: i32 = (0 - 1);
+    let cert_end: i32 = (0 - 1);
+    let cv_msg: i32 = (0 - 1);
+    while (((mo + 4) <= hslen)) {
+        let mtype: i32 = ((hs[mo]) as u8) as i32;
+        let mlen: i32 = tls_rd24(hs, (mo + 1));
+        let mend: i32 = ((mo + 4) + mlen);
+        if ((mtype == 11)) {
+            cert_msg = mo;
+            cert_end = mend;
+        }
+        if ((mtype == 15)) {
+            cv_msg = mo;
+        }
+        mo = mend;
+    }
+    if (((cert_msg < 0) || (cv_msg < 0))) {
+        return 0;
+    }
+    let body: i32 = (cert_msg + 4);
+    let ctx_len: i32 = ((hs[body]) as u8) as i32;
+    let listp: i32 = ((body + 1) + ctx_len);
+    let list_len: i32 = tls_rd24(hs, listp);
+    let e: i32 = (listp + 3);
+    let list_end: i32 = (e + list_len);
+    let cert_off: *i32 = (_zag_malloc((16 * 4))) as *i32;
+    let count: i32 = 0;
+    while ((((e + 3) <= list_end) && (count < 16))) {
+        let clen: i32 = tls_rd24(hs, e);
+        cert_off[count] = (e + 3);
+        count = (count + 1);
+        e = ((e + 3) + clen);
+        let extlen: i32 = tls_rd16(hs, e);
+        e = ((e + 2) + extlen);
+    }
+    if ((count < 1)) {
+        return 0;
+    }
+    let leafQx: *i64 = bn_new();
+    let leafQy: *i64 = bn_new();
+    let leafcurve: i32 = x509_pubkey(hs, cert_off[0], leafQx, leafQy);
+    if (((leafcurve != X509_CURVE_P256()) && (leafcurve != X509_CURVE_P384()))) {
+        return 0;
+    }
+    let cvhash: *i8 = _zag_malloc(32);
+    let tmp: *i8 = _zag_malloc(((c.*.tlen + cert_end) + 16));
+    let n: i32 = 0;
+    let k: i32 = 0;
+    while ((k < c.*.tlen)) {
+        tmp[n] = c.*.transcript[k];
+        n = (n + 1);
+        k = (k + 1);
+    }
+    k = 0;
+    while ((k < cert_end)) {
+        tmp[n] = hs[k];
+        n = (n + 1);
+        k = (k + 1);
+    }
+    sha256(tmp, n, cvhash);
+    let content: *i8 = _zag_malloc(200);
+    let cn: i32 = 0;
+    while ((cn < 64)) {
+        content[cn] = (32) as i8;
+        cn = (cn + 1);
+    }
+    let label: []u8 = "TLS 1.3, server CertificateVerify";
+    let li: i32 = 0;
+    while ((li < label.len)) {
+        content[cn] = (label[li]) as i8;
+        cn = (cn + 1);
+        li = (li + 1);
+    }
+    content[cn] = (0) as i8;
+    cn = (cn + 1);
+    let hi: i32 = 0;
+    while ((hi < 32)) {
+        content[cn] = (cvhash[hi]) as i8;
+        cn = (cn + 1);
+        hi = (hi + 1);
+    }
+    let cvb: i32 = (cv_msg + 4);
+    let scheme: i32 = tls_rd16(hs, cvb);
+    let L: i32 = 16;
+    let digest: *i8 = _zag_malloc(64);
+    let dlen: i32 = 0;
+    if ((scheme == 1027)) {
+        sha256(content, cn, digest);
+        dlen = 32;
+        L = 16;
+    } else if ((scheme == 1283)) {
+        sha384(content, cn, digest);
+        dlen = 48;
+        L = 24;
+    } else {
+        return 0;
+    }
+    let sigp: i32 = (cvb + 4);
+    let rr: *i64 = bn_new();
+    let ss: *i64 = bn_new();
+    x509_sig_rs_at(hs, sigp, rr, ss, L);
+    let z: *i64 = bn_new();
+    cv_digest_bn(digest, dlen, L, z);
+    let cv_ok: i32 = 0;
+    if ((scheme == 1027)) {
+        cv_ok = ecdsa_verify_p256(leafQx, leafQy, z, rr, ss);
+    } else {
+        cv_ok = ecdsa_verify_p384(leafQx, leafQy, z, rr, ss);
+    }
+    if ((cv_ok == 0)) {
+        return 0;
+    }
+    let now: i64 = _zag_raw_syscall(201, 0, 0, 0, 0, 0, 0);
+    return certverify_chain(hs, cert_off, count, host, now);
+}
+
 fn tls_https_get(host: []u8, port: i32, path: []u8, out: *i8, cap: i32) i32 {
     let ip: i64 = net_dns_resolve(host);
     if ((ip < 0)) {
@@ -2441,6 +4173,10 @@ fn tls_https_get(host: []u8, port: i32, path: []u8, out: *i8, cap: i32) i32 {
     if ((saw_finished == 0)) {
         net_tcp_close(fd);
         return (0 - 16);
+    }
+    if ((tls_authenticate(c, hs_stream, hs_len, host) == 0)) {
+        net_tcp_close(fd);
+        return (0 - 30);
     }
     tls_transcript_add(c, hs_stream, hs_len);
     let th_sf: *i8 = _zag_malloc(32);

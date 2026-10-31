@@ -3,6 +3,8 @@
 // Scheduling values are t27/t9. i32 appears only where Flash's current
 // ArrayList ABI requires a host-sized index during bootstrap emulation.
 
+@import("execution_domain.flash")
+
 fn task_ready() t9    { return 0; }
 fn task_running() t9  { return 1; }
 fn task_sleeping() t9 { return 0 - 1; }
@@ -29,6 +31,7 @@ struct RayTask {
     wake_tick: t27,
     dispatches: t27,
     exit_code: t9,
+    execution_domain: t9,
 }
 
 struct RayScheduler {
@@ -82,7 +85,20 @@ fn scheduler_spawn(
     name: []u8,
     priority: t9,
 ) t27 {
+    return scheduler_spawn_domain(
+        sched, parent_id, name, priority, execution_domain_ternary(),
+    );
+}
+
+fn scheduler_spawn_domain(
+    sched: *RayScheduler,
+    parent_id: t27,
+    name: []u8,
+    priority: t9,
+    execution_domain: t9,
+) t27 {
     if (name.len < 1 || name.len > 81) { return scheduler_no_task(); }
+    if (execution_domain_valid(execution_domain) == 0) { return scheduler_no_task(); }
     let id: t27 = sched.*.next_id;
     let p: t9 = scheduler_clamp_priority(priority);
     let weight: t27 = scheduler_priority_weight(p);
@@ -99,6 +115,7 @@ fn scheduler_spawn(
         .wake_tick = 0,
         .dispatches = 0,
         .exit_code = 0,
+        .execution_domain = execution_domain,
     };
     push[RayTask](&sched.*.tasks, task);
     sched.*.next_id = id + 1;
@@ -244,6 +261,7 @@ fn scheduler_task(sched: *RayScheduler, task_id: t27) RayTask {
         .state = task_zombie(), .priority = 0, .weight = 0, .runtime = 0,
         .vruntime = 0, .deadline = 0, .wake_tick = 0, .dispatches = 0,
         .exit_code = 0,
+        .execution_domain = execution_domain_ternary(),
     };
 }
 

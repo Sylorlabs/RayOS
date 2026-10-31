@@ -22,6 +22,20 @@ fn main() i32 {
     if (len[HtmlNode](malformed.nodes) < 3) { html_test_fail("recovered DOM"); }
     html_document_free(&malformed);
 
+    // entity decoding
+    if (_zag_strcmp(html_decode("Fish &amp; Chips"), "Fish & Chips") == 0) { html_test_fail("entity amp"); }
+    if (_zag_strcmp(html_decode("5 &lt; 7 &gt; 3"), "5 < 7 > 3") == 0) { html_test_fail("entity lt/gt"); }
+    if (_zag_strcmp(html_decode("caf&#233; &copy;"), "cafe C") == 0) { html_test_fail("entity numeric/copy fold"); }
+    if (_zag_strcmp(html_decode("na&iuml;ve &szlig;"), "naive s") == 0) { html_test_fail("named latin1 fold"); }
+
+    // raw-text: '<' and '>' inside <script>/<style> must NOT create elements
+    let rt: HtmlDocument = html_parse("<body><style>.a{x<y}</style><script>if(a<b&&c>d)f();</script><p>ok</p></body>");
+    if (rt.errors != 0) { html_test_fail("rawtext spurious tags"); }
+    // body has: style, script, p elements (+ body) = 4 elements
+    if (html_count_kind(&rt, html_node_element()) != 4) { html_test_fail("rawtext element count"); }
+    html_document_free(&rt);
+
+    _zag_println("html_parser_test: entities + rawtext + fold verified");
     _zag_println("html_parser_test: ok");
     return 0;
 }

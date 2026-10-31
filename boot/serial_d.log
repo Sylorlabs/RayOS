@@ -1,0 +1,11 @@
+
+[RayOS/stage2] real mode entry
+[RayOS/stage2] VBE linear framebuffer set
+[RayOS/stage2] payload + kernel loaded from disk
+[RayOS/stage2] entering long mode
+[RayOS] 64-bit kernel up. mbinfo=0x0000000000005100
+[RayOS] module @0x0000000000800000
+[RayOS] seg va=0x0000000000400000 filesz=1307530 memsz=1307530
+[RayOS] seg va=0x0000000004000000 filesz=16564 memsz=16564
+[RayOS] entering guest @0x00000000004000b0 (interrupts on)
+RayOS Desktop Live: starting

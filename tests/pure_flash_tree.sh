@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 bad="$(find \
     "$ROOT/browser" "$ROOT/core" "$ROOT/desktop" "$ROOT/driver" "$ROOT/fabric" \
-    "$ROOT/hypervisor" "$ROOT/math" "$ROOT/memory" "$ROOT/storage" \
+    "$ROOT/hypervisor" "$ROOT/math" "$ROOT/memory" "$ROOT/net" "$ROOT/storage" \
     "$ROOT/testing" \
     -type f \( -name '*.c' -o -name '*.h' -o -name '*.cc' -o -name '*.cpp' \
                    -o -name '*.py' -o -name '*.rs' -o -name '*.zig' \) \

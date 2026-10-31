@@ -21,7 +21,7 @@ fn html_no_parent() i64 {
 }
 
 fn html_max_nodes() i64 {
-    return 729;
+    return 19683;
 }
 
 fn html_max_depth() i64 {
@@ -112,6 +112,516 @@ fn html_is_void(tag: []u8) i32 {
     return 0;
 }
 
+fn html_is_rawtext(tag: []u8) i32 {
+    if ((html_equal_fold(tag, "script") == 1)) {
+        return 1;
+    }
+    if ((html_equal_fold(tag, "style") == 1)) {
+        return 1;
+    }
+    if ((html_equal_fold(tag, "textarea") == 1)) {
+        return 1;
+    }
+    if ((html_equal_fold(tag, "title") == 1)) {
+        return 1;
+    }
+    return 0;
+}
+
+fn html_find_close(source: []u8, start: i32, tag: []u8) i32 {
+    let i: i32 = start;
+    while ((((i + 2) + tag.len) <= source.len)) {
+        if (((source[i] == 60) && (source[(i + 1)] == 47))) {
+            let match: i32 = 1;
+            let j: i32 = 0;
+            while ((j < tag.len)) {
+                if ((html_ascii_lower(source[((i + 2) + j)]) != html_ascii_lower(tag[j]))) {
+                    match = 0;
+                    j = tag.len;
+                } else {
+                    j = (j + 1);
+                }
+            }
+            if ((match == 1)) {
+                return i;
+            }
+        }
+        i = (i + 1);
+    }
+    return (0 - 1);
+}
+
+fn html_entity_named(name: []u8) i32 {
+    if ((_zag_strcmp(name, "amp") == 1)) {
+        return 38;
+    }
+    if ((_zag_strcmp(name, "lt") == 1)) {
+        return 60;
+    }
+    if ((_zag_strcmp(name, "gt") == 1)) {
+        return 62;
+    }
+    if ((_zag_strcmp(name, "quot") == 1)) {
+        return 34;
+    }
+    if ((_zag_strcmp(name, "apos") == 1)) {
+        return 39;
+    }
+    if ((_zag_strcmp(name, "nbsp") == 1)) {
+        return 32;
+    }
+    if ((_zag_strcmp(name, "copy") == 1)) {
+        return 169;
+    }
+    if ((_zag_strcmp(name, "reg") == 1)) {
+        return 174;
+    }
+    if ((_zag_strcmp(name, "trade") == 1)) {
+        return 153;
+    }
+    if ((_zag_strcmp(name, "mdash") == 1)) {
+        return 45;
+    }
+    if ((_zag_strcmp(name, "ndash") == 1)) {
+        return 45;
+    }
+    if ((_zag_strcmp(name, "hellip") == 1)) {
+        return 46;
+    }
+    if ((_zag_strcmp(name, "middot") == 1)) {
+        return 183;
+    }
+    if ((_zag_strcmp(name, "rsquo") == 1)) {
+        return 39;
+    }
+    if ((_zag_strcmp(name, "lsquo") == 1)) {
+        return 39;
+    }
+    if ((_zag_strcmp(name, "rdquo") == 1)) {
+        return 34;
+    }
+    if ((_zag_strcmp(name, "ldquo") == 1)) {
+        return 34;
+    }
+    if ((_zag_strcmp(name, "Agrave") == 1)) {
+        return 192;
+    }
+    if ((_zag_strcmp(name, "Aacute") == 1)) {
+        return 193;
+    }
+    if ((_zag_strcmp(name, "Acirc") == 1)) {
+        return 194;
+    }
+    if ((_zag_strcmp(name, "Atilde") == 1)) {
+        return 195;
+    }
+    if ((_zag_strcmp(name, "Auml") == 1)) {
+        return 196;
+    }
+    if ((_zag_strcmp(name, "Aring") == 1)) {
+        return 197;
+    }
+    if ((_zag_strcmp(name, "AElig") == 1)) {
+        return 198;
+    }
+    if ((_zag_strcmp(name, "Ccedil") == 1)) {
+        return 199;
+    }
+    if ((_zag_strcmp(name, "Egrave") == 1)) {
+        return 200;
+    }
+    if ((_zag_strcmp(name, "Eacute") == 1)) {
+        return 201;
+    }
+    if ((_zag_strcmp(name, "Ecirc") == 1)) {
+        return 202;
+    }
+    if ((_zag_strcmp(name, "Euml") == 1)) {
+        return 203;
+    }
+    if ((_zag_strcmp(name, "Igrave") == 1)) {
+        return 204;
+    }
+    if ((_zag_strcmp(name, "Iacute") == 1)) {
+        return 205;
+    }
+    if ((_zag_strcmp(name, "Icirc") == 1)) {
+        return 206;
+    }
+    if ((_zag_strcmp(name, "Iuml") == 1)) {
+        return 207;
+    }
+    if ((_zag_strcmp(name, "Ntilde") == 1)) {
+        return 209;
+    }
+    if ((_zag_strcmp(name, "Ograve") == 1)) {
+        return 210;
+    }
+    if ((_zag_strcmp(name, "Oacute") == 1)) {
+        return 211;
+    }
+    if ((_zag_strcmp(name, "Ocirc") == 1)) {
+        return 212;
+    }
+    if ((_zag_strcmp(name, "Otilde") == 1)) {
+        return 213;
+    }
+    if ((_zag_strcmp(name, "Ouml") == 1)) {
+        return 214;
+    }
+    if ((_zag_strcmp(name, "Oslash") == 1)) {
+        return 216;
+    }
+    if ((_zag_strcmp(name, "Ugrave") == 1)) {
+        return 217;
+    }
+    if ((_zag_strcmp(name, "Uacute") == 1)) {
+        return 218;
+    }
+    if ((_zag_strcmp(name, "Ucirc") == 1)) {
+        return 219;
+    }
+    if ((_zag_strcmp(name, "Uuml") == 1)) {
+        return 220;
+    }
+    if ((_zag_strcmp(name, "Yacute") == 1)) {
+        return 221;
+    }
+    if ((_zag_strcmp(name, "szlig") == 1)) {
+        return 223;
+    }
+    if ((_zag_strcmp(name, "agrave") == 1)) {
+        return 224;
+    }
+    if ((_zag_strcmp(name, "aacute") == 1)) {
+        return 225;
+    }
+    if ((_zag_strcmp(name, "acirc") == 1)) {
+        return 226;
+    }
+    if ((_zag_strcmp(name, "atilde") == 1)) {
+        return 227;
+    }
+    if ((_zag_strcmp(name, "auml") == 1)) {
+        return 228;
+    }
+    if ((_zag_strcmp(name, "aring") == 1)) {
+        return 229;
+    }
+    if ((_zag_strcmp(name, "aelig") == 1)) {
+        return 230;
+    }
+    if ((_zag_strcmp(name, "ccedil") == 1)) {
+        return 231;
+    }
+    if ((_zag_strcmp(name, "egrave") == 1)) {
+        return 232;
+    }
+    if ((_zag_strcmp(name, "eacute") == 1)) {
+        return 233;
+    }
+    if ((_zag_strcmp(name, "ecirc") == 1)) {
+        return 234;
+    }
+    if ((_zag_strcmp(name, "euml") == 1)) {
+        return 235;
+    }
+    if ((_zag_strcmp(name, "igrave") == 1)) {
+        return 236;
+    }
+    if ((_zag_strcmp(name, "iacute") == 1)) {
+        return 237;
+    }
+    if ((_zag_strcmp(name, "icirc") == 1)) {
+        return 238;
+    }
+    if ((_zag_strcmp(name, "iuml") == 1)) {
+        return 239;
+    }
+    if ((_zag_strcmp(name, "ntilde") == 1)) {
+        return 241;
+    }
+    if ((_zag_strcmp(name, "ograve") == 1)) {
+        return 242;
+    }
+    if ((_zag_strcmp(name, "oacute") == 1)) {
+        return 243;
+    }
+    if ((_zag_strcmp(name, "ocirc") == 1)) {
+        return 244;
+    }
+    if ((_zag_strcmp(name, "otilde") == 1)) {
+        return 245;
+    }
+    if ((_zag_strcmp(name, "ouml") == 1)) {
+        return 246;
+    }
+    if ((_zag_strcmp(name, "oslash") == 1)) {
+        return 248;
+    }
+    if ((_zag_strcmp(name, "ugrave") == 1)) {
+        return 249;
+    }
+    if ((_zag_strcmp(name, "uacute") == 1)) {
+        return 250;
+    }
+    if ((_zag_strcmp(name, "ucirc") == 1)) {
+        return 251;
+    }
+    if ((_zag_strcmp(name, "uuml") == 1)) {
+        return 252;
+    }
+    if ((_zag_strcmp(name, "yacute") == 1)) {
+        return 253;
+    }
+    if ((_zag_strcmp(name, "yuml") == 1)) {
+        return 255;
+    }
+    if ((_zag_strcmp(name, "laquo") == 1)) {
+        return 60;
+    }
+    if ((_zag_strcmp(name, "raquo") == 1)) {
+        return 62;
+    }
+    if ((_zag_strcmp(name, "deg") == 1)) {
+        return 111;
+    }
+    if ((_zag_strcmp(name, "plusmn") == 1)) {
+        return 43;
+    }
+    if ((_zag_strcmp(name, "times") == 1)) {
+        return 42;
+    }
+    if ((_zag_strcmp(name, "divide") == 1)) {
+        return 47;
+    }
+    if ((_zag_strcmp(name, "frac12") == 1)) {
+        return 47;
+    }
+    if ((_zag_strcmp(name, "frac14") == 1)) {
+        return 47;
+    }
+    if ((_zag_strcmp(name, "sup2") == 1)) {
+        return 50;
+    }
+    if ((_zag_strcmp(name, "sup3") == 1)) {
+        return 51;
+    }
+    if ((_zag_strcmp(name, "bull") == 1)) {
+        return 8226;
+    }
+    if ((_zag_strcmp(name, "dagger") == 1)) {
+        return 43;
+    }
+    if ((_zag_strcmp(name, "euro") == 1)) {
+        return 69;
+    }
+    if ((_zag_strcmp(name, "pound") == 1)) {
+        return 76;
+    }
+    if ((_zag_strcmp(name, "cent") == 1)) {
+        return 99;
+    }
+    if ((_zag_strcmp(name, "yen") == 1)) {
+        return 89;
+    }
+    if ((_zag_strcmp(name, "sect") == 1)) {
+        return 83;
+    }
+    if ((_zag_strcmp(name, "para") == 1)) {
+        return 80;
+    }
+    return (0 - 1);
+}
+
+fn html_cp_ascii(cp: i32) i32 {
+    if ((cp == 160)) {
+        return 32;
+    }
+    if (((cp >= 192) && (cp <= 198))) {
+        return 65;
+    }
+    if ((cp == 199)) {
+        return 67;
+    }
+    if (((cp >= 200) && (cp <= 203))) {
+        return 69;
+    }
+    if (((cp >= 204) && (cp <= 207))) {
+        return 73;
+    }
+    if ((cp == 209)) {
+        return 78;
+    }
+    if (((cp >= 210) && (cp <= 214))) {
+        return 79;
+    }
+    if ((cp == 216)) {
+        return 79;
+    }
+    if (((cp >= 217) && (cp <= 220))) {
+        return 85;
+    }
+    if (((cp >= 224) && (cp <= 230))) {
+        return 97;
+    }
+    if ((cp == 231)) {
+        return 99;
+    }
+    if (((cp >= 232) && (cp <= 235))) {
+        return 101;
+    }
+    if (((cp >= 236) && (cp <= 239))) {
+        return 105;
+    }
+    if ((cp == 241)) {
+        return 110;
+    }
+    if ((cp == 223)) {
+        return 115;
+    }
+    if ((((cp == 221) || (cp == 253)) || (cp == 255))) {
+        return 121;
+    }
+    if (((cp >= 242) && (cp <= 246))) {
+        return 111;
+    }
+    if ((cp == 248)) {
+        return 111;
+    }
+    if (((cp >= 249) && (cp <= 252))) {
+        return 117;
+    }
+    if (((cp == 8211) || (cp == 8212))) {
+        return 45;
+    }
+    if (((cp == 8216) || (cp == 8217))) {
+        return 39;
+    }
+    if (((cp == 8220) || (cp == 8221))) {
+        return 34;
+    }
+    if ((cp == 8230)) {
+        return 46;
+    }
+    if (((cp == 8226) || (cp == 183))) {
+        return 42;
+    }
+    if ((cp == 169)) {
+        return 67;
+    }
+    if ((cp == 174)) {
+        return 82;
+    }
+    if ((cp == 8482)) {
+        return 84;
+    }
+    return (0 - 1);
+}
+
+fn html_decode(src: []u8) []u8 {
+    let out: *i8 = _zag_malloc((src.len + 1));
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while ((i < src.len)) {
+        if ((src[i] == 38)) {
+            let semi: i32 = (i + 1);
+            while ((((semi < src.len) && (semi < (i + 12))) && (src[semi] != 59))) {
+                semi = (semi + 1);
+            }
+            let decoded: i32 = (0 - 1);
+            if (((semi < src.len) && (src[semi] == 59))) {
+                if ((src[(i + 1)] == 35)) {
+                    let cp: i32 = 0;
+                    if ((((i + 2) < src.len) && ((src[(i + 2)] == 120) || (src[(i + 2)] == 88)))) {
+                        let h: i32 = (i + 3);
+                        while ((h < semi)) {
+                            let c: i32 = (src[h]) as i32;
+                            let v: i32 = (0 - 1);
+                            if (((c >= 48) && (c <= 57))) {
+                                v = (c - 48);
+                            } else if (((c >= 97) && (c <= 102))) {
+                                v = ((c - 97) + 10);
+                            } else if (((c >= 65) && (c <= 70))) {
+                                v = ((c - 65) + 10);
+                            }
+                            if ((v >= 0)) {
+                                cp = ((cp * 16) + v);
+                            }
+                            h = (h + 1);
+                        }
+                    } else {
+                        let d: i32 = (i + 2);
+                        while ((d < semi)) {
+                            if (((src[d] >= 48) && (src[d] <= 57))) {
+                                cp = ((cp * 10) + ((src[d]) as i32 - 48));
+                            }
+                            d = (d + 1);
+                        }
+                    }
+                    decoded = cp;
+                } else {
+                    decoded = html_entity_named(src[(i + 1)..semi]);
+                }
+            }
+            if ((decoded >= 0)) {
+                if ((decoded < 128)) {
+                    out[n] = (decoded) as i8;
+                    n = (n + 1);
+                } else {
+                    let fold: i32 = html_cp_ascii(decoded);
+                    if ((fold > 0)) {
+                        out[n] = (fold) as i8;
+                        n = (n + 1);
+                    } else if ((fold < 0)) {
+                        out[n] = (63) as i8;
+                        n = (n + 1);
+                    }
+                }
+                i = (semi + 1);
+            } else {
+                out[n] = (src[i]) as i8;
+                n = (n + 1);
+                i = (i + 1);
+            }
+        } else if ((src[i] >= 194)) {
+            let lead: i32 = (src[i]) as i32;
+            let cp: i32 = 0;
+            let extra: i32 = 0;
+            if ((lead < 224)) {
+                cp = (lead - 192);
+                extra = 1;
+            } else if ((lead < 240)) {
+                cp = (lead - 224);
+                extra = 2;
+            } else {
+                cp = (lead - 240);
+                extra = 3;
+            }
+            let k: i32 = 0;
+            while (((k < extra) && (((i + 1) + k) < src.len))) {
+                cp = ((cp << 6) + ((src[((i + 1) + k)]) as i32 & 63));
+                k = (k + 1);
+            }
+            let fold: i32 = html_cp_ascii(cp);
+            if ((fold > 0)) {
+                out[n] = (fold) as i8;
+                n = (n + 1);
+            } else if ((fold < 0)) {
+                out[n] = (63) as i8;
+                n = (n + 1);
+            }
+            i = ((i + 1) + extra);
+        } else {
+            out[n] = (src[i]) as i8;
+            n = (n + 1);
+            i = (i + 1);
+        }
+    }
+    let ou: *u8 = (out) as *u8;
+    return ou[0..n];
+}
+
 fn html_find_sequence(source: []u8, start: i32, needle: []u8) i32 {
     if ((needle.len < 1)) {
         return start;
@@ -200,8 +710,9 @@ fn html_parse(source: []u8) HtmlDocument {
             while (((end < source.len) && (source[end] != 60))) {
                 end = (end + 1);
             }
-            let text: []u8 = html_trim(source, at, end);
-            if ((text.len > 0)) {
+            let raw: []u8 = html_trim(source, at, end);
+            if ((raw.len > 0)) {
+                let text: []u8 = html_decode(raw);
                 let depth: i64 = ((len[i64](stack) - 1)) as i64;
                 let _text_index: i64 = html_push_node(&doc, HtmlNode{ .kind = html_node_text(), .parent = html_parent(&stack), .depth = depth, .tag = "#text", .text = text });
             }
@@ -260,21 +771,40 @@ fn html_parse(source: []u8) HtmlDocument {
             if (((tag.len < 1) || (p >= source.len))) {
                 doc.errors = (doc.errors + 1);
                 at = (at + 1);
+            } else if ((closing == 1)) {
+                html_close_tag(&doc, &stack, tag);
+                at = (p + 1);
             } else {
-                if ((closing == 1)) {
-                    html_close_tag(&doc, &stack, tag);
-                } else {
-                    let depth2: i64 = ((len[i64](stack) - 1)) as i64;
-                    let index: i64 = html_push_node(&doc, HtmlNode{ .kind = html_node_element(), .parent = html_parent(&stack), .depth = depth2, .tag = tag, .text = "" });
-                    if ((((index >= 0) && (self_close == 0)) && (html_is_void(tag) == 0))) {
-                        if ((depth2 < html_max_depth())) {
-                            push[i64](&stack, index);
-                        } else {
-                            doc.errors = (doc.errors + 1);
+                let depth2: i64 = ((len[i64](stack) - 1)) as i64;
+                let index: i64 = html_push_node(&doc, HtmlNode{ .kind = html_node_element(), .parent = html_parent(&stack), .depth = depth2, .tag = tag, .text = "" });
+                at = (p + 1);
+                if ((((index >= 0) && (self_close == 0)) && (html_is_void(tag) == 0))) {
+                    if ((html_is_rawtext(tag) == 1)) {
+                        let cpos: i32 = html_find_close(source, at, tag);
+                        let cend: i32 = source.len;
+                        if ((cpos >= 0)) {
+                            cend = cpos;
                         }
+                        let inner: []u8 = html_trim(source, at, cend);
+                        if ((inner.len > 0)) {
+                            let _ri: i64 = html_push_node(&doc, HtmlNode{ .kind = html_node_text(), .parent = index, .depth = ((depth2 + 1)) as i64, .tag = "#text", .text = inner });
+                        }
+                        if ((cpos >= 0)) {
+                            let gt: i32 = html_find_sequence(source, cpos, ">");
+                            if ((gt >= 0)) {
+                                at = (gt + 1);
+                            } else {
+                                at = source.len;
+                            }
+                        } else {
+                            at = source.len;
+                        }
+                    } else if ((depth2 < html_max_depth())) {
+                        push[i64](&stack, index);
+                    } else {
+                        doc.errors = (doc.errors + 1);
                     }
                 }
-                at = (p + 1);
             }
         }
     }
@@ -324,6 +854,27 @@ fn main() i32 {
         html_test_fail("recovered DOM");
     }
     html_document_free(&malformed);
+    if ((_zag_strcmp(html_decode("Fish &amp; Chips"), "Fish & Chips") == 0)) {
+        html_test_fail("entity amp");
+    }
+    if ((_zag_strcmp(html_decode("5 &lt; 7 &gt; 3"), "5 < 7 > 3") == 0)) {
+        html_test_fail("entity lt/gt");
+    }
+    if ((_zag_strcmp(html_decode("caf&#233; &copy;"), "cafe C") == 0)) {
+        html_test_fail("entity numeric/copy fold");
+    }
+    if ((_zag_strcmp(html_decode("na&iuml;ve &szlig;"), "naive s") == 0)) {
+        html_test_fail("named latin1 fold");
+    }
+    let rt: HtmlDocument = html_parse("<body><style>.a{x<y}</style><script>if(a<b&&c>d)f();</script><p>ok</p></body>");
+    if ((rt.errors != 0)) {
+        html_test_fail("rawtext spurious tags");
+    }
+    if ((html_count_kind(&rt, html_node_element()) != 4)) {
+        html_test_fail("rawtext element count");
+    }
+    html_document_free(&rt);
+    _zag_println("html_parser_test: entities + rawtext + fold verified");
     _zag_println("html_parser_test: ok");
     return 0;
 }

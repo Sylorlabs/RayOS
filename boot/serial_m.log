@@ -1,0 +1,11 @@
+
+[RayOS] multiboot entry, 32-bit protected mode.
+[RayOS] VGA at 00:2.0 id=0x11111234 BAR0=0xfd000000
+[RayOS] VBE set 1280x800x32 LFB=0xfd000000
+[RayOS] 32-bit framebuffer drawn; entering long mode...
+[RayOS] 64-bit kernel up. mbinfo=0x0000000000009500
+[RayOS] module @0x0000000000204000
+[RayOS] seg va=0x0000000000400000 filesz=1307530 memsz=1307530
+[RayOS] seg va=0x0000000004000000 filesz=16564 memsz=16564
+[RayOS] entering guest @0x00000000004000b0 (interrupts on)
+RayOS Desktop Live: starting

@@ -1,0 +1,289 @@
+// net/x509.flash — minimal DER / X.509 parser for TLS certificate validation.
+//
+// Extracts the fields path-validation needs from a DER certificate: the
+// TBSCertificate byte range (for hashing), the signature algorithm hash,
+// the ECDSA signature (r,s), the EC public key (curve + point), the raw
+// issuer/subject DN ranges (for chain linking by exact-encoding match),
+// validity dates, and SubjectAltName dNSNames (for hostname checks).
+//
+// Scope: ECDSA P-256/P-384 certificates only (the modern web). RSA and other
+// key types are reported as unsupported so validation fails CLOSED — safe.
+
+@import("../core/constants.flash")
+@import("../driver/hw_rt.flash")
+@import("ecc.flash")
+
+fn X509_HASH_SHA256() i32 { return 256; }
+fn X509_HASH_SHA384() i32 { return 384; }
+fn X509_CURVE_NONE() i32 { return 0; }
+fn X509_CURVE_P256() i32 { return 256; }
+fn X509_CURVE_P384() i32 { return 384; }
+
+// ── DER primitives ───────────────────────────────────────────────────────────
+
+fn der_byte(b: *i8, i: i32) i32 { return (b[i] as u8) as i32; }
+
+// header length (tag byte + length bytes) at pos
+fn der_hdr(b: *i8, pos: i32) i32 {
+    let l: i32 = der_byte(b, pos + 1);
+    if (l < 128) { return 2; }
+    return 2 + (l - 128);
+}
+
+// content length at pos
+fn der_len(b: *i8, pos: i32) i32 {
+    let l: i32 = der_byte(b, pos + 1);
+    if (l < 128) { return l; }
+    let n: i32 = l - 128;
+    let v: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) { v = v * 256 + der_byte(b, pos + 2 + i); i = i + 1; }
+    return v;
+}
+
+fn der_content(b: *i8, pos: i32) i32 { return pos + der_hdr(b, pos); }
+fn der_end(b: *i8, pos: i32) i32 { return der_content(b, pos) + der_len(b, pos); }
+
+// first child of a constructed element at pos
+fn der_first(b: *i8, pos: i32) i32 { return der_content(b, pos); }
+// next sibling after element at pos
+fn der_next(b: *i8, pos: i32) i32 { return der_end(b, pos); }
+
+// ── certificate structure navigation ─────────────────────────────────────────
+//
+// Certificate ::= SEQ { tbsCertificate SEQ, signatureAlgorithm SEQ,
+//                       signatureValue BIT STRING }
+
+fn x509_tbs_pos(b: *i8, coff: i32) i32 { return der_first(b, coff); }
+
+// tbs fields in order: [0]version?, serial, sigAlg, issuer, validity,
+// subject, spki, [3]extensions?
+fn x509_tbs_child(b: *i8, coff: i32, index: i32) i32 {
+    let tbs: i32 = x509_tbs_pos(b, coff);
+    let p: i32 = der_first(b, tbs);
+    // skip optional version [0] (tag 0xA0)
+    if (der_byte(b, p) == 160) { p = der_next(b, p); }
+    let i: i32 = 0;
+    while (i < index) { p = der_next(b, p); i = i + 1; }
+    return p;
+}
+
+fn x509_serial(b: *i8, coff: i32) i32 { return x509_tbs_child(b, coff, 0); }
+fn x509_issuer(b: *i8, coff: i32) i32 { return x509_tbs_child(b, coff, 2); }
+fn x509_validity(b: *i8, coff: i32) i32 { return x509_tbs_child(b, coff, 3); }
+fn x509_subject(b: *i8, coff: i32) i32 { return x509_tbs_child(b, coff, 4); }
+fn x509_spki(b: *i8, coff: i32) i32 { return x509_tbs_child(b, coff, 5); }
+
+// The outer signatureAlgorithm (2nd top-level child): identifies the hash.
+fn x509_sig_hash(b: *i8, coff: i32) i32 {
+    let alg: i32 = der_next(b, x509_tbs_pos(b, coff));   // 2nd child of cert
+    // alg = SEQ { OID }. OID content last byte: ...04 03 02 (256) / 03 (384)
+    let oid: i32 = der_first(b, alg);
+    let oc: i32 = der_content(b, oid);
+    let ol: i32 = der_len(b, oid);
+    let last: i32 = der_byte(b, oc + ol - 1);
+    if (last == 2) { return X509_HASH_SHA256(); }
+    if (last == 3) { return X509_HASH_SHA384(); }
+    return 0;
+}
+
+// signatureValue BIT STRING → SEQ { INTEGER r, INTEGER s }. Loads r,s (L limbs).
+fn x509_sig_rs(b: *i8, coff: i32, r: *i64, s: *i64, L: i32) i32 {
+    let bit: i32 = der_next(b, der_next(b, x509_tbs_pos(b, coff)));  // 3rd child
+    let bc: i32 = der_content(b, bit) + 1;   // skip unused-bits byte
+    // bc points at SEQ { INTEGER r, INTEGER s }
+    let ri: i32 = der_first(b, bc);
+    let rc: i32 = der_content(b, ri);
+    let rl: i32 = der_len(b, ri);
+    // strip a leading 0x00 sign byte
+    if (rl > 0 && der_byte(b, rc) == 0) { rc = rc + 1; rl = rl - 1; }
+    bn_from_be(r, b, rc, rl, L);
+    let si: i32 = der_next(b, ri);
+    let sc: i32 = der_content(b, si);
+    let sl: i32 = der_len(b, si);
+    if (sl > 0 && der_byte(b, sc) == 0) { sc = sc + 1; sl = sl - 1; }
+    bn_from_be(s, b, sc, sl, L);
+    return 0;
+}
+
+
+// Parse a bare DER ECDSA signature SEQ{ INTEGER r, INTEGER s } at `seqpos`.
+fn x509_sig_rs_at(b: *i8, seqpos: i32, r: *i64, s: *i64, L: i32) i32 {
+    let ri: i32 = der_first(b, seqpos);
+    let rc: i32 = der_content(b, ri);
+    let rl: i32 = der_len(b, ri);
+    if (rl > 0 && der_byte(b, rc) == 0) { rc = rc + 1; rl = rl - 1; }
+    bn_from_be(r, b, rc, rl, L);
+    let si: i32 = der_next(b, ri);
+    let sc: i32 = der_content(b, si);
+    let sl: i32 = der_len(b, si);
+    if (sl > 0 && der_byte(b, sc) == 0) { sc = sc + 1; sl = sl - 1; }
+    bn_from_be(s, b, sc, sl, L);
+    return 0;
+}
+
+// SubjectPublicKeyInfo → curve + EC point. Returns curve id (P256/P384/none).
+fn x509_pubkey(b: *i8, coff: i32, Qx: *i64, Qy: *i64) i32 {
+    let spki: i32 = x509_spki(b, coff);
+    let alg: i32 = der_first(b, spki);          // AlgorithmIdentifier SEQ
+    let oid1: i32 = der_first(b, alg);          // id-ecPublicKey OID
+    let curveoid: i32 = der_next(b, oid1);      // named curve OID
+    let cc: i32 = der_content(b, curveoid);
+    let cl: i32 = der_len(b, curveoid);
+    let curve: i32 = X509_CURVE_NONE();
+    let flen: i32 = 0;
+    // P-256 = 1.2.840.10045.3.1.7 (last byte 07, len 8); P-384 = 1.3.132.0.34
+    if (cl == 8 && der_byte(b, cc + cl - 1) == 7) { curve = X509_CURVE_P256(); flen = 32; }
+    if (cl == 5 && der_byte(b, cc + cl - 1) == 34) { curve = X509_CURVE_P384(); flen = 48; }
+    if (curve == X509_CURVE_NONE()) { return X509_CURVE_NONE(); }
+    let bit: i32 = der_next(b, alg);            // subjectPublicKey BIT STRING
+    let pc: i32 = der_content(b, bit) + 1;      // skip unused bits
+    if (der_byte(b, pc) != 4) { return X509_CURVE_NONE(); }   // want uncompressed 0x04
+    let L: i32 = flen / 2;
+    bn_from_be(Qx, b, pc + 1, flen, L);
+    bn_from_be(Qy, b, pc + 1 + flen, flen, L);
+    return curve;
+}
+
+// ── DN comparison (chain linking) ────────────────────────────────────────────
+
+// exact-encoding equality of two DER elements (tag..content)
+fn x509_der_equal(b: *i8, p1: i32, b2: *i8, p2: i32) i32 {
+    let n1: i32 = der_end(b, p1) - p1;
+    let n2: i32 = der_end(b2, p2) - p2;
+    if (n1 != n2) { return 0; }
+    let i: i32 = 0;
+    while (i < n1) {
+        if (der_byte(b, p1 + i) != der_byte(b2, p2 + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ── validity dates ───────────────────────────────────────────────────────────
+
+fn x509_time_digit(b: *i8, p: i32) i32 { return der_byte(b, p) - 48; }
+fn x509_time2(b: *i8, p: i32) i32 { return x509_time_digit(b, p) * 10 + x509_time_digit(b, p + 1); }
+
+// Convert a Time element to a rough epoch (seconds). UTCTime=YY (20YY if <50),
+// GeneralizedTime=YYYY. Comparison-grade (assumes Z).
+fn x509_time_epoch(b: *i8, tpos: i32) i64 {
+    let tag: i32 = der_byte(b, tpos);
+    let c: i32 = der_content(b, tpos);
+    let year: i32 = 0;
+    let m: i32 = 0;
+    if (tag == 23) {           // UTCTime YYMMDDHHMMSSZ
+        let yy: i32 = x509_time2(b, c);
+        year = 2000 + yy;
+        if (yy >= 50) { year = 1900 + yy; }
+        m = c + 2;
+    } else {                   // GeneralizedTime YYYYMMDDHHMMSSZ
+        year = x509_time2(b, c) * 100 + x509_time2(b, c + 2);
+        m = c + 4;
+    }
+    let mon: i32 = x509_time2(b, m);
+    let day: i32 = x509_time2(b, m + 2);
+    let hh: i32 = x509_time2(b, m + 4);
+    let mm: i32 = x509_time2(b, m + 6);
+    let ss: i32 = x509_time2(b, m + 8);
+    // days since 1970 via civil calc
+    let y: i64 = year as i64;
+    let mo: i64 = mon as i64;
+    if (mon <= 2) { y = y - 1; }
+    let era: i64 = y / 400;
+    let yoe: i64 = y - era * 400;
+    let mp: i64 = mon + 9;
+    if (mon > 2) { mp = mon - 3; }
+    let doy: i64 = (153 * mp + 2) / 5 + (day as i64) - 1;
+    let doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days: i64 = era * 146097 + doe - 719468;
+    return days * 86400 + (hh as i64) * 3600 + (mm as i64) * 60 + (ss as i64);
+}
+
+// 1 if `now` is within [notBefore, notAfter].
+fn x509_valid_at(b: *i8, coff: i32, now: i64) i32 {
+    let v: i32 = x509_validity(b, coff);
+    let nb: i32 = der_first(b, v);
+    let na: i32 = der_next(b, nb);
+    let t0: i64 = x509_time_epoch(b, nb);
+    let t1: i64 = x509_time_epoch(b, na);
+    if (now < t0) { return 0; }
+    if (now > t1) { return 0; }
+    return 1;
+}
+
+// ── SubjectAltName hostname matching ─────────────────────────────────────────
+
+fn x509_ci_eq(b: *i8, p: i32, host: []u8, hoff: i32, n: i32) i32 {
+    let i: i32 = 0;
+    while (i < n) {
+        let a: i32 = der_byte(b, p + i);
+        if (a >= 65 && a <= 90) { a = a + 32; }
+        let c: i32 = host[hoff + i] as i32;
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        if (a != c) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Match one dNSName (buf[p..p+n]) against host, with leading *. wildcard.
+fn x509_dns_match(b: *i8, p: i32, n: i32, host: []u8) i32 {
+    if (n >= 2 && der_byte(b, p) == 42 && der_byte(b, p + 1) == 46) {
+        // "*.suffix" matches host if host ends with ".suffix" and host has
+        // exactly one extra label
+        let suffix_len: i32 = n - 1;   // includes leading '.'
+        if (host.len <= suffix_len) { return 0; }
+        let hstart: i32 = host.len - suffix_len;
+        // no dot allowed in the wildcard-covered label
+        let d: i32 = 0;
+        while (d < hstart) { if (host[d] == ('.' as u8)) { return 0; } d = d + 1; }
+        return x509_ci_eq(b, p + 1, host, hstart, suffix_len);
+    }
+    if (n != host.len) { return 0; }
+    return x509_ci_eq(b, p, host, 0, n);
+}
+
+// Scan the SubjectAltName extension for a dNSName matching host.
+fn x509_hostname_ok(b: *i8, coff: i32, host: []u8) i32 {
+    // extensions are [3] (tag 0xA3) as the last tbs child
+    let tbs: i32 = x509_tbs_pos(b, coff);
+    let tend: i32 = der_end(b, tbs);
+    let p: i32 = der_first(b, tbs);
+    // walk to the 0xA3 element
+    let found_ext: i32 = 0 - 1;
+    while (p < tend) {
+        if (der_byte(b, p) == 163) { found_ext = p; p = tend; }
+        else { p = der_next(b, p); }
+    }
+    if (found_ext < 0) { return 0; }
+    let exts: i32 = der_first(b, found_ext);       // SEQ of Extension
+    let e: i32 = der_first(b, exts);
+    let eend: i32 = der_end(b, exts);
+    while (e < eend) {
+        let oid: i32 = der_first(b, e);
+        let oc: i32 = der_content(b, oid);
+        let ol: i32 = der_len(b, oid);
+        // SAN OID = 55 1D 11
+        if (ol == 3 && der_byte(b, oc) == 85 && der_byte(b, oc + 1) == 29 && der_byte(b, oc + 2) == 17) {
+            // value OCTET STRING (may follow optional BOOLEAN critical)
+            let vv: i32 = der_next(b, oid);
+            if (der_byte(b, vv) == 1) { vv = der_next(b, vv); }   // skip critical BOOLEAN
+            let oct: i32 = der_content(b, vv);                     // inside OCTET STRING
+            let names: i32 = oct;                                  // SEQ of GeneralName
+            let g: i32 = der_first(b, names);
+            let gend: i32 = der_end(b, names);
+            while (g < gend) {
+                if (der_byte(b, g) == 130) {   // [2] dNSName
+                    let gc: i32 = der_content(b, g);
+                    let gl: i32 = der_len(b, g);
+                    if (x509_dns_match(b, gc, gl, host) == 1) { return 1; }
+                }
+                g = der_next(b, g);
+            }
+            return 0;
+        }
+        e = der_next(b, e);
+    }
+    return 0;
+}

@@ -22,10 +22,10 @@ fn main() i32 {
     // Open Start after frame 0, wait for its retained animation, then select
     // Task Manager. Later open Files from the unobscured desktop icon strip.
     if (rayplay_click(&play, 0, 96, 776) != 0) { rayplay_test_fail("queue start"); }
-    if (rayplay_click(&play, 8, 250, 500) != 0) { rayplay_test_fail("queue tasks"); }
+    if (rayplay_click(&play, 8, 250, 550) != 0) { rayplay_test_fail("queue tasks"); }
     if (rayplay_click(&play, 17, 52, 132) != 0) { rayplay_test_fail("queue files"); }
     if (rayplay_click(&play, 22, 96, 776) != 0) { rayplay_test_fail("queue browser start"); }
-    if (rayplay_click(&play, 31, 52, 600) != 0) { rayplay_test_fail("queue browser"); }
+    if (rayplay_click(&play, 31, 52, 660) != 0) { rayplay_test_fail("queue browser"); }
 
     let task_checksum: i32 = 0;
     let frame: i32 = 0;

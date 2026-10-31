@@ -2,4 +2,7 @@
 *.out
 *.zag.c
 *__shim.zag
+*_shim.zag
+*.fir
+*.ppu32
 desktop/.bin/

@@ -1,0 +1,496 @@
+// net/ecc.flash — bignum + NIST P-256/P-384 ECDSA verification, in Flash.
+//
+// Verified against test vectors (tests/ecc_test.flash). Base-2^16 limb
+// bignum (add/sub/mul/mod/modexp/modinv), Jacobian curve arithmetic for
+// a = -3 curves, generic ECDSA verify parameterised by curve. This is the
+// signature-verification core of TLS certificate authentication.
+//
+// Native RayOS exposes an ECC-verify offload chamber; this is the Phase-1
+// reference and host data plane.
+
+@import("../core/constants.flash")
+@import("../driver/hw_rt.flash")
+
+// bignum: base 2^16, little-endian, fixed L limbs in an i64 array.
+fn BL() i32 { return 64; }   // limbs (1024-bit); products use 2*BL
+
+fn bn_new() *i64 {
+    let a: *i64 = _zag_malloc(BL() * 2 * 8) as *i64;
+    let i: i32 = 0; while (i < BL()*2) { a[i] = 0; i = i + 1; }
+    return a;
+}
+fn bn_zero(a: *i64) void { let i: i32 = 0; while (i < BL()*2) { a[i] = 0; i = i + 1; } }
+fn bn_copy(o: *i64, a: *i64) void { let i: i32 = 0; while (i < BL()*2) { o[i] = a[i]; i = i + 1; } }
+fn bn_set_u32(a: *i64, v: i64) void { bn_zero(a); a[0] = v & 65535; a[1] = (v >> 16) & 65535; }
+
+// compare a,b over L limbs: -1,0,1
+fn bn_cmp(a: *i64, b: *i64, L: i32) i32 {
+    let i: i32 = L - 1;
+    while (i >= 0) {
+        if (a[i] > b[i]) { return 1; }
+        if (a[i] < b[i]) { return 0 - 1; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// o = a - b (assumes a>=b), L limbs
+fn bn_sub(o: *i64, a: *i64, b: *i64, L: i32) void {
+    let borrow: i64 = 0;
+    let i: i32 = 0;
+    while (i < L) {
+        let d: i64 = a[i] - b[i] - borrow;
+        if (d < 0) { d = d + 65536; borrow = 1; } else { borrow = 0; }
+        o[i] = d;
+        i = i + 1;
+    }
+}
+
+// o = a * b  (L limbs each -> up to 2L limbs)
+fn bn_mul(o: *i64, a: *i64, b: *i64, L: i32) void {
+    let i: i32 = 0; while (i < 2*L) { o[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < L) {
+        let carry: i64 = 0;
+        let j: i32 = 0;
+        while (j < L) {
+            let cur: i64 = o[i+j] + a[i] * b[j] + carry;
+            o[i+j] = cur & 65535;
+            carry = cur >> 16;
+            j = j + 1;
+        }
+        o[i + L] = o[i + L] + carry;
+        i = i + 1;
+    }
+}
+
+// shift-left by 1 bit over L limbs
+fn bn_shl1(a: *i64, L: i32) void {
+    let carry: i64 = 0;
+    let i: i32 = 0;
+    while (i < L) {
+        let v: i64 = (a[i] << 1) + carry;
+        a[i] = v & 65535;
+        carry = (v >> 16) & 1;
+        i = i + 1;
+    }
+}
+
+// bit length over L limbs
+fn bn_bits(a: *i64, L: i32) i32 {
+    let i: i32 = L - 1;
+    while (i >= 0) {
+        if (a[i] != 0) {
+            let b: i32 = 15;
+            while (b >= 0) {
+                if ((a[i] >> b) & 1 == 1) { return i * 16 + b + 1; }
+                b = b - 1;
+            }
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn bn_getbit(a: *i64, k: i32) i64 { return (a[k / 16] >> (k % 16)) & 1; }
+
+// r = a mod m, where a has up to 2L limbs, m has L limbs. r sized L.
+fn bn_mod(r: *i64, a: *i64, m: *i64, L: i32) void {
+    // work copy of a (2L limbs)
+    let x: *i64 = bn_new();
+    let i: i32 = 0; while (i < 2*L) { x[i] = a[i]; i = i + 1; }
+    let ab: i32 = bn_bits(x, 2*L);
+    let mb: i32 = bn_bits(m, L);
+    if (ab < mb) { let k: i32 = 0; while (k < L) { r[k] = x[k]; k = k + 1; } return; }
+    // shifted m (2L limbs)
+    let sm: *i64 = bn_new();
+    let k: i32 = 0; while (k < L) { sm[k] = m[k]; k = k + 1; }
+    let shift: i32 = ab - mb;
+    let s: i32 = 0; while (s < shift) { bn_shl1(sm, 2*L); s = s + 1; }
+    let bit: i32 = shift;
+    while (bit >= 0) {
+        if (bn_cmp(x, sm, 2*L) >= 0) { bn_sub(x, x, sm, 2*L); }
+        // sm >>= 1
+        let j: i32 = 0;
+        let carry: i64 = 0;
+        let jj: i32 = 2*L - 1;
+        while (jj >= 0) {
+            let cur: i64 = sm[jj] + (carry << 16);
+            sm[jj] = cur >> 1;
+            carry = cur & 1;
+            jj = jj - 1;
+        }
+        let _j: i32 = j;
+        bit = bit - 1;
+    }
+    let z: i32 = 0; while (z < L) { r[z] = x[z]; z = z + 1; }
+}
+
+// r = (a*b) mod m, L limbs
+fn bn_modmul(r: *i64, a: *i64, b: *i64, m: *i64, L: i32) void {
+    let p: *i64 = bn_new();
+    bn_mul(p, a, b, L);
+    bn_mod(r, p, m, L);
+}
+
+// r = a^e mod m
+fn bn_modexp(r: *i64, a: *i64, e: *i64, m: *i64, L: i32) void {
+    let result: *i64 = bn_new(); result[0] = 1;
+    let base: *i64 = bn_new(); bn_mod(base, a, m, L);
+    let bits: i32 = bn_bits(e, L);
+    let i: i32 = 0;
+    while (i < bits) {
+        if (bn_getbit(e, i) == 1) {
+            let t: *i64 = bn_new();
+            bn_modmul(t, result, base, m, L);
+            bn_copy(result, t);
+        }
+        let t2: *i64 = bn_new();
+        bn_modmul(t2, base, base, m, L);
+        bn_copy(base, t2);
+        i = i + 1;
+    }
+    bn_copy(r, result);
+}
+
+fn p256_p() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 65535;
+    a[1] = 65535;
+    a[2] = 65535;
+    a[3] = 65535;
+    a[4] = 65535;
+    a[5] = 65535;
+    a[12] = 1;
+    a[14] = 65535;
+    a[15] = 65535;
+    return a;
+}
+fn p256_n() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 9553;
+    a[1] = 64611;
+    a[2] = 51906;
+    a[3] = 62393;
+    a[4] = 40580;
+    a[5] = 42775;
+    a[6] = 64173;
+    a[7] = 48358;
+    a[8] = 65535;
+    a[9] = 65535;
+    a[10] = 65535;
+    a[11] = 65535;
+    a[14] = 65535;
+    a[15] = 65535;
+    return a;
+}
+fn p256_gx() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 49814;
+    a[1] = 55448;
+    a[2] = 14661;
+    a[3] = 62625;
+    a[4] = 13216;
+    a[5] = 11755;
+    a[6] = 32129;
+    a[7] = 30467;
+    a[8] = 16626;
+    a[9] = 25508;
+    a[10] = 59109;
+    a[11] = 63676;
+    a[12] = 16967;
+    a[13] = 57644;
+    a[14] = 53746;
+    a[15] = 27415;
+    return a;
+}
+fn p256_gy() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 20981;
+    a[1] = 14271;
+    a[2] = 16488;
+    a[3] = 52150;
+    a[4] = 24270;
+    a[5] = 27441;
+    a[6] = 13143;
+    a[7] = 11214;
+    a[8] = 40470;
+    a[9] = 31759;
+    a[10] = 60234;
+    a[11] = 36583;
+    a[12] = 32667;
+    a[13] = 65050;
+    a[14] = 17122;
+    a[15] = 20451;
+    return a;
+}
+fn p384_p() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 65535;
+    a[1] = 65535;
+    a[6] = 65535;
+    a[7] = 65535;
+    a[8] = 65534;
+    a[9] = 65535;
+    a[10] = 65535;
+    a[11] = 65535;
+    a[12] = 65535;
+    a[13] = 65535;
+    a[14] = 65535;
+    a[15] = 65535;
+    a[16] = 65535;
+    a[17] = 65535;
+    a[18] = 65535;
+    a[19] = 65535;
+    a[20] = 65535;
+    a[21] = 65535;
+    a[22] = 65535;
+    a[23] = 65535;
+    return a;
+}
+fn p384_n() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 10611;
+    a[1] = 52421;
+    a[2] = 6506;
+    a[3] = 60652;
+    a[4] = 42874;
+    a[5] = 18608;
+    a[6] = 3506;
+    a[7] = 22554;
+    a[8] = 11743;
+    a[9] = 62519;
+    a[10] = 19841;
+    a[11] = 51043;
+    a[12] = 65535;
+    a[13] = 65535;
+    a[14] = 65535;
+    a[15] = 65535;
+    a[16] = 65535;
+    a[17] = 65535;
+    a[18] = 65535;
+    a[19] = 65535;
+    a[20] = 65535;
+    a[21] = 65535;
+    a[22] = 65535;
+    a[23] = 65535;
+    return a;
+}
+fn p384_gx() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 2743;
+    a[1] = 29302;
+    a[2] = 24120;
+    a[3] = 14932;
+    a[4] = 10604;
+    a[5] = 48981;
+    a[6] = 62045;
+    a[7] = 21762;
+    a[8] = 10808;
+    a[9] = 33364;
+    a[10] = 16864;
+    a[11] = 23031;
+    a[12] = 39832;
+    a[13] = 35751;
+    a[14] = 15202;
+    a[15] = 28189;
+    a[16] = 44404;
+    a[17] = 62240;
+    a[18] = 50974;
+    a[19] = 36529;
+    a[20] = 1335;
+    a[21] = 48779;
+    a[22] = 51746;
+    a[23] = 43655;
+    return a;
+}
+fn p384_gy() *i64 {
+    let a: *i64 = bn_new();
+    a[0] = 3679;
+    a[1] = 37098;
+    a[2] = 7548;
+    a[3] = 31299;
+    a[4] = 33181;
+    a[5] = 7550;
+    a[6] = 45518;
+    a[7] = 2656;
+    a[8] = 47296;
+    a[9] = 46576;
+    a[10] = 12563;
+    a[11] = 59866;
+    a[12] = 5244;
+    a[13] = 10394;
+    a[14] = 7613;
+    a[15] = 63732;
+    a[16] = 56361;
+    a[17] = 37522;
+    a[18] = 39103;
+    a[19] = 23966;
+    a[20] = 11375;
+    a[21] = 38438;
+    a[22] = 56906;
+    a[23] = 13847;
+    return a;
+}
+// modinv via Fermat: a^(m-2) mod m  (m prime)
+fn bn_modinv(r: *i64, a: *i64, m: *i64, L: i32) void {
+    let two: *i64 = bn_new(); two[0] = 2;
+    let e: *i64 = bn_new();
+    bn_sub(e, m, two, L);
+    bn_modexp(r, a, e, m, L);
+}
+
+// modular add/sub mod m
+fn bn_modadd(r: *i64, a: *i64, b: *i64, m: *i64, L: i32) void {
+    let t: *i64 = bn_new();
+    let carry: i64 = 0; let i: i32 = 0;
+    while (i < L) { let c: i64 = a[i] + b[i] + carry; t[i] = c & 65535; carry = c >> 16; i = i + 1; }
+    t[L] = carry;
+    // reduce
+    if (bn_cmp(t, m, L) >= 0 || t[L] != 0) { bn_sub(t, t, m, L); }
+    let k: i32 = 0; while (k < L) { r[k] = t[k]; k = k + 1; }
+}
+fn bn_modsub(r: *i64, a: *i64, b: *i64, m: *i64, L: i32) void {
+    let t: *i64 = bn_new();
+    if (bn_cmp(a, b, L) >= 0) { bn_sub(t, a, b, L); }
+    else { let s: *i64 = bn_new(); bn_sub(s, m, b, L); bn_modadd(t, a, s, m, L); }
+    let k: i32 = 0; while (k < L) { r[k] = t[k]; k = k + 1; }
+}
+
+// Jacobian point: 3 arrays X,Y,Z each L limbs. Infinity: Z all zero.
+fn pt_is_inf(Z: *i64, L: i32) i32 {
+    let i: i32 = 0; while (i < L) { if (Z[i] != 0) { return 0; } i = i + 1; }
+    return 1;
+}
+
+fn ec_double(X: *i64, Y: *i64, Z: *i64, oX: *i64, oY: *i64, oZ: *i64, p: *i64, L: i32) void {
+    if (pt_is_inf(Z, L) == 1) { bn_zero(oZ); return; }
+    let A: *i64 = bn_new(); bn_modmul(A, Y, Y, p, L);            // Y^2
+    let t: *i64 = bn_new(); bn_modmul(t, X, A, p, L);            // X*A
+    let B: *i64 = bn_new(); bn_modadd(B, t, t, p, L); bn_modadd(B, B, B, p, L);  // 4XA
+    let A2: *i64 = bn_new(); bn_modmul(A2, A, A, p, L);          // A^2
+    let C: *i64 = bn_new(); bn_modadd(C, A2, A2, p, L); bn_modadd(C, C, C, p, L); bn_modadd(C, C, C, p, L); // 8A^2
+    let ZZ: *i64 = bn_new(); bn_modmul(ZZ, Z, Z, p, L);         // Z^2
+    let xm: *i64 = bn_new(); bn_modsub(xm, X, ZZ, p, L);        // X - Z^2
+    let xp: *i64 = bn_new(); bn_modadd(xp, X, ZZ, p, L);        // X + Z^2
+    let D: *i64 = bn_new(); bn_modmul(D, xm, xp, p, L);         // (X-Z^2)(X+Z^2)
+    let D3: *i64 = bn_new(); bn_modadd(D3, D, D, p, L); bn_modadd(D3, D3, D, p, L); // 3*D
+    let D2: *i64 = bn_new(); bn_modmul(D2, D3, D3, p, L);       // D^2
+    let twoB: *i64 = bn_new(); bn_modadd(twoB, B, B, p, L);
+    let nX: *i64 = bn_new(); bn_modsub(nX, D2, twoB, p, L);     // X3
+    let bx: *i64 = bn_new(); bn_modsub(bx, B, nX, p, L);
+    let dbx: *i64 = bn_new(); bn_modmul(dbx, D3, bx, p, L);
+    let nY: *i64 = bn_new(); bn_modsub(nY, dbx, C, p, L);       // Y3
+    let yz: *i64 = bn_new(); bn_modmul(yz, Y, Z, p, L);
+    let nZ: *i64 = bn_new(); bn_modadd(nZ, yz, yz, p, L);       // Z3
+    let k: i32 = 0; while (k < L) { oX[k]=nX[k]; oY[k]=nY[k]; oZ[k]=nZ[k]; k=k+1; }
+}
+
+fn ec_add(X1:*i64,Y1:*i64,Z1:*i64, X2:*i64,Y2:*i64,Z2:*i64, oX:*i64,oY:*i64,oZ:*i64, p:*i64, L:i32) void {
+    if (pt_is_inf(Z1,L)==1) { let k:i32=0; while(k<L){oX[k]=X2[k];oY[k]=Y2[k];oZ[k]=Z2[k];k=k+1;} return; }
+    if (pt_is_inf(Z2,L)==1) { let k:i32=0; while(k<L){oX[k]=X1[k];oY[k]=Y1[k];oZ[k]=Z1[k];k=k+1;} return; }
+    let Z1Z1:*i64=bn_new(); bn_modmul(Z1Z1,Z1,Z1,p,L);
+    let Z2Z2:*i64=bn_new(); bn_modmul(Z2Z2,Z2,Z2,p,L);
+    let U1:*i64=bn_new(); bn_modmul(U1,X1,Z2Z2,p,L);
+    let U2:*i64=bn_new(); bn_modmul(U2,X2,Z1Z1,p,L);
+    let t1:*i64=bn_new(); bn_modmul(t1,Z2,Z2Z2,p,L);
+    let S1:*i64=bn_new(); bn_modmul(S1,Y1,t1,p,L);
+    let t2:*i64=bn_new(); bn_modmul(t2,Z1,Z1Z1,p,L);
+    let S2:*i64=bn_new(); bn_modmul(S2,Y2,t2,p,L);
+    if (bn_cmp(U1,U2,L)==0) {
+        if (bn_cmp(S1,S2,L)==0) { ec_double(X1,Y1,Z1,oX,oY,oZ,p,L); return; }
+        bn_zero(oZ); return;
+    }
+    let H:*i64=bn_new(); bn_modsub(H,U2,U1,p,L);
+    let twoH:*i64=bn_new(); bn_modadd(twoH,H,H,p,L);
+    let I:*i64=bn_new(); bn_modmul(I,twoH,twoH,p,L);
+    let J:*i64=bn_new(); bn_modmul(J,H,I,p,L);
+    let ds:*i64=bn_new(); bn_modsub(ds,S2,S1,p,L);
+    let rr:*i64=bn_new(); bn_modadd(rr,ds,ds,p,L);
+    let V:*i64=bn_new(); bn_modmul(V,U1,I,p,L);
+    let rr2:*i64=bn_new(); bn_modmul(rr2,rr,rr,p,L);
+    let twoV:*i64=bn_new(); bn_modadd(twoV,V,V,p,L);
+    let nX:*i64=bn_new(); bn_modsub(nX,rr2,J,p,L); bn_modsub(nX,nX,twoV,p,L);
+    let vx:*i64=bn_new(); bn_modsub(vx,V,nX,p,L);
+    let rvx:*i64=bn_new(); bn_modmul(rvx,rr,vx,p,L);
+    let s1j:*i64=bn_new(); bn_modmul(s1j,S1,J,p,L); bn_modadd(s1j,s1j,s1j,p,L);
+    let nY:*i64=bn_new(); bn_modsub(nY,rvx,s1j,p,L);
+    let z1z2:*i64=bn_new(); bn_modadd(z1z2,Z1,Z2,p,L);
+    let zz:*i64=bn_new(); bn_modmul(zz,z1z2,z1z2,p,L);
+    bn_modsub(zz,zz,Z1Z1,p,L); bn_modsub(zz,zz,Z2Z2,p,L);
+    let nZ:*i64=bn_new(); bn_modmul(nZ,zz,H,p,L);
+    let k:i32=0; while(k<L){oX[k]=nX[k];oY[k]=nY[k];oZ[k]=nZ[k];k=k+1;}
+}
+
+// scalar * (X,Y,1) -> (oX,oY,oZ) Jacobian
+fn ec_mul(k: *i64, X:*i64,Y:*i64, oX:*i64,oY:*i64,oZ:*i64, p:*i64, L:i32) void {
+    let rX:*i64=bn_new(); let rY:*i64=bn_new(); let rZ:*i64=bn_new(); bn_zero(rZ);  // infinity
+    let bits: i32 = bn_bits(k, L);
+    let i: i32 = bits - 1;
+    while (i >= 0) {
+        let dX:*i64=bn_new(); let dY:*i64=bn_new(); let dZ:*i64=bn_new();
+        ec_double(rX,rY,rZ, dX,dY,dZ, p, L);
+        let k2:i32=0; while(k2<L){rX[k2]=dX[k2];rY[k2]=dY[k2];rZ[k2]=dZ[k2];k2=k2+1;}
+        if (bn_getbit(k, i) == 1) {
+            let one:*i64=bn_new(); one[0]=1;
+            let aX:*i64=bn_new(); let aY:*i64=bn_new(); let aZ:*i64=bn_new();
+            ec_add(rX,rY,rZ, X,Y,one, aX,aY,aZ, p, L);
+            let k3:i32=0; while(k3<L){rX[k3]=aX[k3];rY[k3]=aY[k3];rZ[k3]=aZ[k3];k3=k3+1;}
+        }
+        i = i - 1;
+    }
+    let kk:i32=0; while(kk<L){oX[kk]=rX[kk];oY[kk]=rY[kk];oZ[kk]=rZ[kk];kk=kk+1;}
+}
+
+
+// Generic ECDSA verify over a short-Weierstrass curve with a = -3
+// (true for NIST P-256 and P-384). Curve supplied via p, n, gx, gy and L.
+// hash is the big-endian message digest as a bignum (already truncated to
+// the curve order's bit length by the caller). Returns 1 iff valid.
+fn ecdsa_verify_curve(p:*i64, n:*i64, gx:*i64, gy:*i64, L:i32,
+                      Qx:*i64, Qy:*i64, hash:*i64, r:*i64, s:*i64) i32 {
+    // reject r,s outside [1, n-1]
+    let zero:*i64=bn_new();
+    if (bn_cmp(r, zero, L) == 0) { return 0; }
+    if (bn_cmp(s, zero, L) == 0) { return 0; }
+    if (bn_cmp(r, n, L) >= 0) { return 0; }
+    if (bn_cmp(s, n, L) >= 0) { return 0; }
+    let w:*i64=bn_new(); bn_modinv(w, s, n, L);
+    let hn:*i64=bn_new(); bn_mod(hn, hash, n, L);
+    let u1:*i64=bn_new(); bn_modmul(u1, hn, w, n, L);
+    let u2:*i64=bn_new(); bn_modmul(u2, r, w, n, L);
+    let aX:*i64=bn_new(); let aY:*i64=bn_new(); let aZ:*i64=bn_new();
+    ec_mul(u1, gx, gy, aX,aY,aZ, p, L);
+    let bX:*i64=bn_new(); let bY:*i64=bn_new(); let bZ:*i64=bn_new();
+    ec_mul(u2, Qx, Qy, bX,bY,bZ, p, L);
+    let RX:*i64=bn_new(); let RY:*i64=bn_new(); let RZ:*i64=bn_new();
+    ec_add(aX,aY,aZ, bX,bY,bZ, RX,RY,RZ, p, L);
+    if (pt_is_inf(RZ, L) == 1) { return 0; }
+    let z2:*i64=bn_new(); bn_modmul(z2, RZ, RZ, p, L);
+    let zi:*i64=bn_new(); bn_modinv(zi, z2, p, L);
+    let x:*i64=bn_new(); bn_modmul(x, RX, zi, p, L);
+    let xn:*i64=bn_new(); bn_mod(xn, x, n, L);
+    if (bn_cmp(xn, r, L) == 0) { return 1; }
+    return 0;
+}
+
+fn ecdsa_verify_p256(Qx:*i64,Qy:*i64,hash:*i64,r:*i64,s:*i64) i32 {
+    return ecdsa_verify_curve(p256_p(), p256_n(), p256_gx(), p256_gy(), 16, Qx,Qy,hash,r,s);
+}
+fn ecdsa_verify_p384(Qx:*i64,Qy:*i64,hash:*i64,r:*i64,s:*i64) i32 {
+    return ecdsa_verify_curve(p384_p(), p384_n(), p384_gx(), p384_gy(), 24, Qx,Qy,hash,r,s);
+}
+
+// Load a big-endian byte buffer into a bignum (L limbs, base 2^16).
+fn bn_from_be(a:*i64, buf:*i8, off:i32, n:i32, L:i32) void {
+    bn_zero(a);
+    let i:i32=0;
+    while (i < n) {
+        let byteval:i64 = (buf[off + n - 1 - i] as u8) as i64;
+        let limb:i32 = i / 2;
+        if (i % 2 == 0) { a[limb] = a[limb] + byteval; }
+        else { a[limb] = a[limb] + (byteval << 8); }
+        i = i + 1;
+    }
+    let _l:i32 = L;
+}

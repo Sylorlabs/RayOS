@@ -8,17 +8,12 @@
 
 @import("theme.flash")
 @import("wm.flash")
+@import("launcher_policy.flash")
 
-fn launcher_app_none() i32     { return -1; }
-fn launcher_app_terminal() i32 { return 0; }
-fn launcher_app_settings() i32 { return 1; }
-fn launcher_app_linux() i32    { return 2; }
-fn launcher_app_windows() i32  { return 3; }
-fn launcher_app_files() i32    { return 4; }
-fn launcher_app_tasks() i32    { return 5; }
-fn launcher_app_browser() i32  { return 6; }
 fn launcher_hit_search() i32   { return 100; }
 fn launcher_hit_close() i32    { return 101; }
+fn launcher_hit_ternary() i32  { return 102; }
+fn launcher_hit_binary() i32   { return 103; }
 
 fn launcher_panel_w() i32 { return 320; }
 fn launcher_panel_h() i32 { return 500; }
@@ -34,6 +29,8 @@ struct LauncherState {
     cache_fb: i64,    // retained panel render (*SoftFb), 0 = none
     cache_key: i32,   // state key the cache was rendered with (-1 = stale)
     search: ArrayList[u8],   // live search query
+    execution_domain: t9,   // explicit per-launch user choice
+    status: []u8,
 }
 
 struct LauncherApp {
@@ -54,6 +51,8 @@ fn launcher_new(screen_w: i32, screen_h: i32) LauncherState {
         .cache_fb = 0,
         .cache_key = -1,
         .search = make[u8](16),
+        .execution_domain = launcher_policy_default_domain(),
+        .status = "Balanced ternary is the native default",
     };
 }
 
@@ -74,15 +73,30 @@ fn launcher_is_open(st: LauncherState) i32 {
     return st.open;
 }
 
-fn launcher_tick(st: *LauncherState) void {
-    let delta: f32 = 0.14;
-    if (st.*.slide < st.*.slide_target) {
-        st.*.slide = st.*.slide + delta;
-        if (st.*.slide > st.*.slide_target) { st.*.slide = st.*.slide_target; }
-    } else if (st.*.slide > st.*.slide_target) {
-        st.*.slide = st.*.slide - delta;
-        if (st.*.slide < st.*.slide_target) { st.*.slide = st.*.slide_target; }
+fn launcher_select_domain(st: *LauncherState, domain: t9) i32 {
+    let selected: t9 = launcher_policy_select(domain);
+    if (selected == execution_domain_unspecified()) { return 0; }
+    st.*.execution_domain = selected;
+    if (domain == execution_domain_binary()) {
+        st.*.status = "Binary compatibility chamber selected";
+    } else {
+        st.*.status = "Balanced ternary native selected";
     }
+    st.*.cache_key = -1;
+    return 1;
+}
+
+fn launcher_toggle_domain(st: *LauncherState) void {
+    let next: t9 = launcher_policy_toggle(st.*.execution_domain);
+    let _selected: i32 = launcher_select_domain(st, next);
+}
+
+fn launcher_tick(st: *LauncherState) void {
+    // exponential ease-out toward the target: fast start, gentle settle.
+    let d: f32 = (st.*.slide_target - st.*.slide) * 0.34;
+    st.*.slide = st.*.slide + d;
+    let gap: f32 = st.*.slide_target - st.*.slide;
+    if (gap < 0.002 && gap > 0.0 - 0.002) { st.*.slide = st.*.slide_target; }
 }
 
 fn launcher_panel_y(st: LauncherState, th: RayOsTheme) f32 {
@@ -90,6 +104,13 @@ fn launcher_panel_y(st: LauncherState, th: RayOsTheme) f32 {
     let hidden: f32 = (launcher_panel_h() + 16) as f32;
     let shown: f32 = bar_y - (launcher_panel_h() as f32) - 8.0;
     return shown + (hidden * (1.0 - st.slide));
+}
+
+// Fully-open panel y (slide = 1). Hit-testing uses this so tiles are clickable
+// at their final position throughout the open animation.
+fn launcher_panel_y_open(st: LauncherState, th: RayOsTheme) f32 {
+    let bar_y: f32 = (st.screen_h - th.taskbar_h) as f32;
+    return bar_y - (launcher_panel_h() as f32) - 8.0;
 }
 
 fn launcher_app_count() i32 { return 7; }
@@ -114,6 +135,23 @@ fn launcher_app_at(idx: i32) LauncherApp {
         return LauncherApp{ .id = launcher_app_tasks(), .name = "Task Manager", .icon = wm_icon_settings() };
     }
     return LauncherApp{ .id = launcher_app_browser(), .name = "Ray Browser", .icon = wm_icon_browser() };
+}
+
+fn launcher_prepare_launch(st: *LauncherState, app_id: i32) t9 {
+    let resolved: t9 = launcher_app_resolve_domain(app_id, st.*.execution_domain);
+    if (resolved != execution_domain_unspecified()) {
+        st.*.status = _zag_str_concat(
+            execution_domain_name(resolved), " launch authorized",
+        );
+        return resolved;
+    }
+    if (st.*.execution_domain == execution_domain_binary()) {
+        st.*.status = "No binary package for this app; choose ternary";
+    } else {
+        st.*.status = "Binary guest requires explicit Binary selection";
+    }
+    st.*.cache_key = -1;
+    return execution_domain_unspecified();
 }
 
 fn launcher_lower(c: u8) u8 {
@@ -177,6 +215,7 @@ fn launcher_filtered_at(st: *LauncherState, idx: i32) LauncherApp {
 fn launcher_key(st: *LauncherState, code: i32) i32 {
     if (code == 27) { return 3; }
     if (code == 10) { return 2; }
+    if (code == 9) { launcher_toggle_domain(st); return 1; }
     if (code == 8) {
         if (st.*.search.len > 0) { st.*.search.len = st.*.search.len - 1; }
         return 1;
@@ -222,12 +261,50 @@ fn launcher_paint_tile(st: LauncherState, fb: *SoftFb, app: LauncherApp, x: f32,
     rayos_paint_shadow(fb, x, y, tile, tile + 18.0, 12.0, th);
     softgpu_blend_round_rect(fb, x as i32, y as i32, 88, 88, 12, 255, 255, 255, 200);
     wm_paint_taskbar_icon(fb, app.icon, x + 20.0, y + 16.0, 48.0, th);
-    // dark ink: labels sit on the light frosted panel
-    vg_text_vec(fb, x + 8.0, y + tile + 2.0, app.name, 10.0, 0.55, 44, 46, 66, 255);
+    softgpu_blend_round_rect(fb, (x + 62.0) as i32, (y + 6.0) as i32, 20, 18, 8,
+        th.base.acc2_r, th.base.acc2_g, th.base.acc2_b, 210);
+    vg_text_vec(fb, x + 68.0, y + 10.0, launcher_app_domain_badge(app.id), 8.0, 0.7,
+        255, 255, 255, 255);
+    // dark ink, truncated to the tile width so long names do not overflow
+    rayos_paint_text_trunc(fb, x + 4.0, y + tile + 2.0, app.name, 84, 10.0, 0.55, 44, 46, 66, 255);
+}
+
+fn launcher_paint_domain_chip(
+    st: LauncherState,
+    fb: *SoftFb,
+    x: i32,
+    y: i32,
+    w: i32,
+    domain: t9,
+    label: []u8,
+    th: RayOsTheme,
+) void {
+    let selected: i32 = 0;
+    if (st.execution_domain == domain) { selected = 1; }
+    let alpha: i32 = 32;
+    if (selected == 1) { alpha = 205; }
+    softgpu_blend_round_rect(fb, x, y, w, 28, 9,
+        th.base.acc2_r, th.base.acc2_g, th.base.acc2_b, alpha);
+    let rr: i32 = th.base.ink_r;
+    let gg: i32 = th.base.ink_g;
+    let bb: i32 = th.base.ink_b;
+    if (selected == 1) { rr = 255; gg = 255; bb = 255; }
+    vg_text_vec(fb, (x + 12) as f32, (y + 8) as f32, label, 10.0, 0.65, rr, gg, bb, 255);
+}
+
+fn launcher_paint_domain_controls(st: LauncherState, fb: *SoftFb, th: RayOsTheme) void {
+    launcher_paint_domain_chip(
+        st, fb, 16, 98, 140, execution_domain_ternary(), "Balanced Ternary", th,
+    );
+    launcher_paint_domain_chip(
+        st, fb, 164, 98, 140, execution_domain_binary(), "Binary Compat", th,
+    );
+    rayos_paint_text_trunc(fb, 18.0, 132.0, st.status, 282, 8.5, 0.55,
+        th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
 }
 
 fn launcher_cache_state_key(st: *LauncherState) i32 {
-    let key: i32 = 1 + st.*.search_focus;
+    let key: i32 = 17 + st.*.search_focus + (st.*.execution_domain as i32) * 7 + st.*.status.len;
     let i: i32 = 0;
     while (i < st.*.search.len) {
         key = key * 131 + (get[u8](st.*.search, i) as i32);
@@ -263,11 +340,12 @@ fn launcher_build_cache(st: *LauncherState, screen_fb: *SoftFb, wm: *WmState) i6
 
     rayos_paint_orb(fb, 28.0, 28.0, 12.0, th);
     vg_text_vec(fb, 48.0, 16.0, "RayOS", 16.0, 0.7, th.base.ink_r, th.base.ink_g, th.base.ink_b, 255);
-    vg_text_vec(fb, 48.0, 34.0, "Photon Desktop", 10.0, 0.5, th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
+    vg_text_vec(fb, 48.0, 34.0, "Balanced ternary priority", 10.0, 0.5, th.base.mut_r, th.base.mut_g, th.base.mut_b, 255);
     launcher_paint_search(st.*, fb, 16.0, 56.0, (w - 32) as f32, th);
+    launcher_paint_domain_controls(st.*, fb, th);
 
     let gx: f32 = 16.0;
-    let gy: f32 = 104.0;
+    let gy: f32 = 154.0;
     let col: i32 = 0;
     let row: i32 = 0;
     let i: i32 = 0;
@@ -307,7 +385,7 @@ fn launcher_hit_test(st: *LauncherState, wm: *WmState, x: i32, y: i32) i32 {
     if (st.*.slide <= 0.01) { return launcher_app_none(); }
     let th: RayOsTheme = wm.*.theme;
     let px: f32 = st.*.anchor_x as f32;
-    let py: f32 = launcher_panel_y(st.*, th);
+    let py: f32 = launcher_panel_y_open(st.*, th);
     let pw: f32 = launcher_panel_w() as f32;
     let ph: f32 = launcher_panel_h() as f32;
     if ((x as f32) < px || (y as f32) < py) { return launcher_hit_close(); }
@@ -319,8 +397,12 @@ fn launcher_hit_test(st: *LauncherState, wm: *WmState, x: i32, y: i32) i32 {
     if ((x as f32) >= sx && (x as f32) < sx + sw && (y as f32) >= sy && (y as f32) < sy + sh) {
         return launcher_hit_search();
     }
+    if (y >= (py as i32) + 98 && y < (py as i32) + 126) {
+        if (x >= (px as i32) + 16 && x < (px as i32) + 156) { return launcher_hit_ternary(); }
+        if (x >= (px as i32) + 164 && x < (px as i32) + 304) { return launcher_hit_binary(); }
+    }
     let gx: f32 = px + 16.0;
-    let gy: f32 = py + 104.0;
+    let gy: f32 = py + 154.0;
     let shown: i32 = launcher_filtered_count(st);
     let i: i32 = 0;
     let col: i32 = 0;

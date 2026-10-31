@@ -57,7 +57,13 @@ fn main() i32 {
     if (ok != 1) { _zag_println("crypto_test: FAIL aead open"); return 1; }
     let ou: *u8 = opened as *u8;
     if (_zag_strcmp(ou[0..pt.len], pt) == 0) { _zag_println("crypto_test: FAIL aead roundtrip"); return 1; }
-    _zag_println("crypto_test: sha256 + x25519 ecdh + chacha20poly1305 verified");
+    // SHA-384("abc")
+    let o384: *i8 = _zag_malloc(48);
+    sha384(m, 3, o384);
+    if (_zag_strcmp(ct_hex(o384,48), "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7") == 0) {
+        _zag_println("crypto_test: FAIL sha384"); return 1;
+    }
+    _zag_println("crypto_test: sha256 + sha384 + x25519 ecdh + chacha20poly1305 verified");
     _zag_println("crypto_test: ok");
     return 0;
 }
